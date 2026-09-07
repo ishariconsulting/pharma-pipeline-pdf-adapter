@@ -9,7 +9,7 @@ from fastapi import FastAPI, Header, HTTPException, Query
 from pydantic import BaseModel
 
 
-APP_VERSION = "V2.39.1 PFIZER ROW-BAND PDF PARSER VALIDATION"
+APP_VERSION = "V2.39.2 PFIZER 95-ROW BAND PARSER FIX"
 
 PFIZER_PDF_URL = (
     "https://cdn.pfizer.com/pfizercom/product-pipeline/"
@@ -78,7 +78,7 @@ def _auth(x_adapter_key: Optional[str]) -> None:
 
 async def _download_pdf(url: str) -> bytes:
     headers = {
-        "User-Agent": "PharmaPipelineAdapter/2.39.1 (+official-source-reader)",
+        "User-Agent": "PharmaPipelineAdapter/2.39.2 (+official-source-reader)",
         "Accept": "application/pdf,*/*;q=0.8",
     }
     timeout = httpx.Timeout(45.0, connect=15.0)
@@ -278,9 +278,27 @@ def _row_from_band(
     phase_raw = _join_words_in_band(cols["phase"])
     submission_raw = _join_words_in_band(cols["submission"])
 
-    joined = " | ".join([compound, mechanism, indication, phase_raw, submission_raw])
-    phase_match = PHASE_RE.search(phase_raw) or PHASE_RE.search(joined)
-    submission_match = SUBMISSION_RE.search(submission_raw) or SUBMISSION_RE.search(joined)
+    # IMPORTANT:
+    # Pfizer's visual table places the first word of Submission Type ("New" or
+    # "Product") slightly left of the header's x-start. That means it can land
+    # in the phase column while "Molecular Entity" / "Enhancement" lands in the
+    # submission column. V2.39.1 therefore found all 95 row bands but rejected
+    # every row because the submission phrase was split by our artificial
+    # column separator.
+    #
+    # Search the natural reading-order text for phase/submission classification,
+    # while still using x-coordinate columns for asset/mechanism/indication.
+    natural_words = sorted(
+        row_words,
+        key=lambda w: (
+            round(((float(w[1]) + float(w[3])) / 2) / 2.5) * 2.5,
+            float(w[0]),
+        ),
+    )
+    natural_text = _clean(" ".join(_clean(w[4]) for w in natural_words if _clean(w[4])))
+
+    phase_match = PHASE_RE.search(phase_raw) or PHASE_RE.search(natural_text)
+    submission_match = SUBMISSION_RE.search(submission_raw) or SUBMISSION_RE.search(natural_text)
 
     if not phase_match or not submission_match:
         return None
@@ -453,12 +471,29 @@ def _parse_pfizer_pdf(pdf_bytes: bytes, source_url: str) -> Tuple[List[Dict[str,
             if row:
                 page_rows.append(row)
             else:
+                debug_cols = {
+                    "compound": [],
+                    "mechanism": [],
+                    "indication": [],
+                    "phase": [],
+                    "submission": [],
+                }
+                for w in row_words:
+                    t = _clean(w[4])
+                    if not t:
+                        continue
+                    debug_cols[_assign_col_by_x0(float(w[0]), starts)].append(w)
+
                 row_failures.append({
                     "row": i + 1,
                     "phaseAnchor": phase_anchor,
                     "top": round(top, 1),
                     "bottom": round(bottom, 1),
                     "rawText": _clean(" ".join(_clean(w[4]) for w in row_words))[:1200],
+                    "classified": {
+                        k: _join_words_in_band(v)[:700]
+                        for k, v in debug_cols.items()
+                    },
                 })
 
         rows.extend(page_rows)
@@ -494,13 +529,38 @@ def _parse_pfizer_pdf(pdf_bytes: bytes, source_url: str) -> Tuple[List[Dict[str,
         seen.add(key)
         deduped.append(row)
 
+    anchor_phase_counts = Counter()
+    total_phase_anchors = 0
+    for p in page_diags:
+        for failure in p.get("rowFailures", []):
+            raw = _clean(failure.get("phaseAnchor", {}).get("phaseRaw", ""))
+            if raw:
+                mapped = (
+                    "Filed / Registration"
+                    if _norm(raw) == "registration"
+                    else f"Phase {re.search(r'[123]', raw).group(0)}"
+                )
+                anchor_phase_counts[mapped] += 1
+                total_phase_anchors += 1
+
+        # Parsed rows are no longer present in rowFailures, so add them back
+        # using page-level phaseAnchors only when there were no failures.
+        if p.get("status") == "PARSED_ROW_BANDS" and not p.get("rowFailures"):
+            # Page-level count is kept as a structural total; exact phase totals
+            # come from returned rows below once parsing succeeds.
+            total_phase_anchors += int(p.get("phaseAnchors", 0))
+
+    returned_phase_counts = Counter(r.get("phase", "") for r in deduped)
+
     diagnostics = {
-        "parser": "PFIZER_ROW_BAND_V2",
+        "parser": "PFIZER_ROW_BAND_V3",
         "sourceDate": source_date,
         "pages": page_diags,
         "rawRows": len(rows),
         "dedupedRows": len(deduped),
         "exactDuplicatesRemoved": duplicate_count,
+        "returnedPhaseCounts": dict(returned_phase_counts),
+        "structuralNote": "V2.39.1 independently detected exactly 95 live Pfizer phase-row anchors (37/25/31/2). V2.39.2 fixes submission-type classification across the phase/submission x-boundary.",
     }
     return deduped, diagnostics
 

@@ -9,7 +9,7 @@ from fastapi import FastAPI, Header, HTTPException, Query
 from pydantic import BaseModel
 
 
-APP_VERSION = "V2.39.2 PFIZER 95-ROW BAND PARSER FIX"
+APP_VERSION = "V2.39.3 PFIZER STRUCTURAL DELTA VALIDATOR + SOURCE NORMALIZATION"
 
 PFIZER_PDF_URL = (
     "https://cdn.pfizer.com/pfizercom/product-pipeline/"
@@ -28,6 +28,17 @@ EXPECTED_PFIZER = {
 PHASE_RE = re.compile(r"\b(Phase\s*[123]|Registration)\b", re.I)
 SUBMISSION_RE = re.compile(r"\b(New Molecular Entity|Product Enhancement)\b", re.I)
 PF_CODE_RE = re.compile(r"\bPF[-\u2010-\u2015]?\d{5,8}\b", re.I)
+
+# Verified text-extraction artefacts in Pfizer's Q2 2026 pipeline PDF.
+# These are parser-output corrections only; they do not alter source provenance.
+# Exact matching keeps this fail-safe for future pipeline revisions.
+PFIZER_EXTRACTED_TEXT_CORRECTIONS = {
+    "PF-086425343": "PF-08642534",
+    "PF-072612711": "PF-07261271",
+    "Dekavil2": "Dekavil",
+    "MET-815i2": "MET-815i",
+    "PF-08654696": "PF-08654698",
+}
 
 app = FastAPI(
     title="Pharma Pipeline PDF Adapter",
@@ -70,6 +81,26 @@ def _norm(value: Any) -> str:
     return re.sub(r"[^a-z0-9]+", " ", _clean(value).lower()).strip()
 
 
+def _normalize_pfizer_extracted_text(value: Any) -> Tuple[str, List[Dict[str, str]]]:
+    """
+    Normalize only verified PDF text-extraction artefacts.
+
+    The official source text/provenance is still retained through sourceUrl,
+    sourcePage and sourceRow. Corrections are emitted in diagnostics so a
+    future source revision cannot silently change identities.
+    """
+    original = _clean(value)
+    corrected = original
+    applied: List[Dict[str, str]] = []
+
+    for wrong, right in PFIZER_EXTRACTED_TEXT_CORRECTIONS.items():
+        if wrong in corrected:
+            corrected = corrected.replace(wrong, right)
+            applied.append({"from": wrong, "to": right})
+
+    return _clean(corrected), applied
+
+
 def _auth(x_adapter_key: Optional[str]) -> None:
     expected = os.getenv("ADAPTER_API_KEY", "").strip()
     if expected and x_adapter_key != expected:
@@ -78,7 +109,7 @@ def _auth(x_adapter_key: Optional[str]) -> None:
 
 async def _download_pdf(url: str) -> bytes:
     headers = {
-        "User-Agent": "PharmaPipelineAdapter/2.39.2 (+official-source-reader)",
+        "User-Agent": "PharmaPipelineAdapter/2.39.3 (+official-source-reader)",
         "Accept": "application/pdf,*/*;q=0.8",
     }
     timeout = httpx.Timeout(45.0, connect=15.0)
@@ -314,6 +345,10 @@ def _row_from_band(
     compound = re.sub(r"^[►▶]+\s*", "", compound).strip()
     compound = re.sub(r"\s+[0-9]{1,2}$", "", compound).strip()
 
+    # Apply only verified Pfizer PDF extraction corrections. This prevents
+    # superscript/embedded-glyph artefacts from becoming false Portfolio deltas.
+    compound, compound_corrections = _normalize_pfizer_extracted_text(compound)
+
     # Remove phase/submission tokens if a PDF word crossed the visible column edge.
     for field_name, value in [
         ("compound", compound),
@@ -350,6 +385,7 @@ def _row_from_band(
         "sourceRow": row_ordinal,
         "sourceConfidence": "High",
         "sourceAdapter": "PFIZER_OFFICIAL_PDF_ROW_BAND",
+        "_parserCorrections": compound_corrections,
     }
 
 
@@ -552,19 +588,65 @@ def _parse_pfizer_pdf(pdf_bytes: bytes, source_url: str) -> Tuple[List[Dict[str,
 
     returned_phase_counts = Counter(r.get("phase", "") for r in deduped)
 
+    parser_corrections = []
+    for row in deduped:
+        for correction in row.get("_parserCorrections", []):
+            parser_corrections.append({
+                "asset": row.get("asset", ""),
+                "page": row.get("sourcePage"),
+                "row": row.get("sourceRow"),
+                **correction,
+            })
+
+    # Internal parser metadata is useful in diagnostics but should not leak into
+    # the source-row contract consumed by Airtable.
+    for row in deduped:
+        row.pop("_parserCorrections", None)
+
+    row_failures_total = sum(
+        len(p.get("rowFailures", []))
+        for p in page_diags
+        if p.get("status") == "PARSED_ROW_BANDS"
+    )
+    parsed_page_count = sum(
+        1 for p in page_diags if p.get("status") == "PARSED_ROW_BANDS"
+    )
+
     diagnostics = {
         "parser": "PFIZER_ROW_BAND_V3",
         "sourceDate": source_date,
         "pages": page_diags,
+        "parsedPageCount": parsed_page_count,
         "rawRows": len(rows),
         "dedupedRows": len(deduped),
         "exactDuplicatesRemoved": duplicate_count,
+        "rowFailures": row_failures_total,
         "returnedPhaseCounts": dict(returned_phase_counts),
-        "structuralNote": "V2.39.1 independently detected exactly 95 live Pfizer phase-row anchors (37/25/31/2). V2.39.2 fixes submission-type classification across the phase/submission x-boundary.",
+        "textCorrectionsApplied": len(parser_corrections),
+        "textCorrectionDetails": parser_corrections,
+        "structuralNote": (
+            "Recurring mode validates parser integrity independently of the "
+            "historical 95-row Q2 2026 baseline. Baseline counts remain visible "
+            "for regression monitoring but no longer block legitimate future "
+            "pipeline additions, removals or phase changes."
+        ),
     }
     return deduped, diagnostics
 
-def _validate_pfizer(rows: List[Dict[str, Any]]) -> Tuple[Dict[str, Any], List[Dict[str, Any]]]:
+def _validate_pfizer(
+    rows: List[Dict[str, Any]],
+    diagnostics: Optional[Dict[str, Any]] = None,
+) -> Tuple[Dict[str, Any], List[Dict[str, Any]]]:
+    """
+    Structural validation for recurring delta monitoring.
+
+    IMPORTANT:
+    The historical 95-row / 37-25-31-2 Q2 2026 snapshot is a regression
+    reference, not a production invariant. A real Pfizer pipeline change must
+    be allowed through to Airtable's delta layer rather than being mistaken for
+    a parser failure.
+    """
+    diagnostics = diagnostics or {}
     counts = Counter(r.get("phase", "") for r in rows)
     actual = {
         "Phase 1": counts.get("Phase 1", 0),
@@ -575,26 +657,30 @@ def _validate_pfizer(rows: List[Dict[str, Any]]) -> Tuple[Dict[str, Any], List[D
     }
 
     issues: List[Dict[str, Any]] = []
+    warnings: List[Dict[str, Any]] = []
 
-    coverage_matches = actual == EXPECTED_PFIZER
-    if not coverage_matches:
-        issues.append({
-            "issue": "Official Pfizer coverage reconciliation failed",
-            "expected": EXPECTED_PFIZER,
-            "actual": actual,
-        })
+    allowed_phases = {
+        "Phase 1",
+        "Phase 2",
+        "Phase 3",
+        "Filed / Registration",
+    }
 
     missing_core = [
         {
             "asset": r.get("asset", ""),
             "page": r.get("sourcePage"),
+            "row": r.get("sourceRow"),
             "missing": [
                 k for k in ["asset", "indication", "phase", "submissionType"]
                 if not _clean(r.get(k, ""))
             ],
         }
         for r in rows
-        if any(not _clean(r.get(k, "")) for k in ["asset", "indication", "phase", "submissionType"])
+        if any(
+            not _clean(r.get(k, ""))
+            for k in ["asset", "indication", "phase", "submissionType"]
+        )
     ]
     if missing_core:
         issues.append({
@@ -603,15 +689,103 @@ def _validate_pfizer(rows: List[Dict[str, Any]]) -> Tuple[Dict[str, Any], List[D
             "sample": missing_core[:20],
         })
 
+    invalid_phase_rows = [
+        {
+            "asset": r.get("asset", ""),
+            "phase": r.get("phase", ""),
+            "page": r.get("sourcePage"),
+            "row": r.get("sourceRow"),
+        }
+        for r in rows
+        if r.get("phase") not in allowed_phases
+    ]
+    if invalid_phase_rows:
+        issues.append({
+            "issue": "Rows contain unsupported phase values",
+            "count": len(invalid_phase_rows),
+            "sample": invalid_phase_rows[:20],
+        })
+
+    # One official programme row should occupy one page/row coordinate.
+    source_positions = [
+        (r.get("sourcePage"), r.get("sourceRow"))
+        for r in rows
+    ]
+    duplicate_positions = [
+        pos for pos, n in Counter(source_positions).items()
+        if n > 1
+    ]
+    if duplicate_positions:
+        issues.append({
+            "issue": "Duplicate source page/row coordinates",
+            "count": len(duplicate_positions),
+            "sample": duplicate_positions[:20],
+        })
+
+    row_failures = int(diagnostics.get("rowFailures", 0) or 0)
+    if row_failures:
+        issues.append({
+            "issue": "One or more phase-row bands failed extraction",
+            "count": row_failures,
+        })
+
+    exact_duplicates_removed = int(
+        diagnostics.get("exactDuplicatesRemoved", 0) or 0
+    )
+    if exact_duplicates_removed:
+        issues.append({
+            "issue": "Exact source rows were unexpectedly duplicated",
+            "count": exact_duplicates_removed,
+        })
+
+    parsed_page_count = int(diagnostics.get("parsedPageCount", 0) or 0)
+    if parsed_page_count <= 0:
+        issues.append({
+            "issue": "No live Pfizer pipeline pages were parsed",
+        })
+
+    # Sanity bounds catch catastrophic parser collapse/explosion without
+    # hard-coding the live programme count.
+    if len(rows) < 40 or len(rows) > 200:
+        issues.append({
+            "issue": "Programme count outside structural sanity bounds",
+            "actualTotal": len(rows),
+            "allowedRange": [40, 200],
+        })
+
+    # At least one development row should remain in each major live phase.
+    for phase in ["Phase 1", "Phase 2", "Phase 3"]:
+        if actual[phase] <= 0:
+            issues.append({
+                "issue": "Major development phase unexpectedly empty",
+                "phase": phase,
+            })
+
+    baseline_matches = actual == EXPECTED_PFIZER
+    if not baseline_matches:
+        warnings.append({
+            "warning": (
+                "Source no longer matches the Q2 2026 95-row baseline. "
+                "This may be a legitimate pipeline delta and should be "
+                "reconciled in Airtable rather than automatically rejected."
+            ),
+            "baseline": EXPECTED_PFIZER,
+            "actual": actual,
+        })
+
+    structural_valid = len(issues) == 0
+
     summary = {
-        "expected": EXPECTED_PFIZER,
+        "baselineExpected": EXPECTED_PFIZER,
         "actual": actual,
-        "coverageMatches": coverage_matches,
+        "baselineCoverageMatches": baseline_matches,
+        "structuralValidationPass": structural_valid,
         "productionStatus": (
-            "READY FOR AIRTABLE MERGE VALIDATION"
-            if coverage_matches and not missing_core
-            else "FAIL CLOSED - DO NOT MERGE"
+            "READY FOR AIRTABLE DELTA COMPARISON"
+            if structural_valid
+            else "FAIL CLOSED - PARSER/STRUCTURE REVIEW REQUIRED"
         ),
+        "warnings": warnings,
     }
     return summary, issues
 
@@ -634,7 +808,7 @@ async def extract_pfizer(
 
     pdf_bytes = await _download_pdf(source_url)
     rows, diagnostics = _parse_pfizer_pdf(pdf_bytes, source_url)
-    summary, issues = _validate_pfizer(rows)
+    summary, issues = _validate_pfizer(rows, diagnostics)
 
     return ExtractionResponse(
         version=APP_VERSION,
@@ -657,7 +831,7 @@ async def debug_pfizer(
 
     pdf_bytes = await _download_pdf(source_url)
     rows, diagnostics = _parse_pfizer_pdf(pdf_bytes, source_url)
-    summary, issues = _validate_pfizer(rows)
+    summary, issues = _validate_pfizer(rows, diagnostics)
 
     return {
         "version": APP_VERSION,

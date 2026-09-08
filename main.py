@@ -1,5 +1,6 @@
 import os
 import re
+import html as html_lib
 from collections import Counter
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -9,7 +10,7 @@ from fastapi import FastAPI, Header, HTTPException, Query
 from pydantic import BaseModel
 
 
-APP_VERSION = "V2.39.3 PFIZER STRUCTURAL DELTA VALIDATOR + SOURCE NORMALIZATION"
+APP_VERSION = "V2.40.0 MULTI-COMPANY PIPELINE ADAPTER - PFIZER + SANOFI"
 
 PFIZER_PDF_URL = (
     "https://cdn.pfizer.com/pfizercom/product-pipeline/"
@@ -23,6 +24,19 @@ EXPECTED_PFIZER = {
     "Phase 3": 31,
     "Filed / Registration": 2,
     "Total": 95,
+}
+
+
+SANOFI_PIPELINE_URL = "https://www.sanofi.com/en/our-science/our-pipeline"
+
+# Historical validated snapshot only. These counts are regression references,
+# not permanent production invariants.
+EXPECTED_SANOFI = {
+    "Phase 1": 16,
+    "Phase 2": 21,
+    "Phase 3": 20,
+    "Filed / Registration": 4,
+    "Total": 61,
 }
 
 PHASE_RE = re.compile(r"\b(Phase\s*[123]|Registration)\b", re.I)
@@ -43,7 +57,7 @@ PFIZER_EXTRACTED_TEXT_CORRECTIONS = {
 app = FastAPI(
     title="Pharma Pipeline PDF Adapter",
     version=APP_VERSION,
-    description="Read-only official-PDF extraction service for the Airtable pharma intelligence bootstrap.",
+    description="Read-only source-adapter service for recurring pharma pipeline intelligence monitoring.",
 )
 
 
@@ -790,12 +804,454 @@ def _validate_pfizer(
     return summary, issues
 
 
+
+# ---------------------------------------------------------------------------
+# Sanofi official HTML pipeline adapter
+# ---------------------------------------------------------------------------
+
+def _html_decode(value: Any) -> str:
+    return html_lib.unescape("" if value is None else str(value))
+
+
+def _sanofi_block_text_lines(raw_html: str) -> List[str]:
+    value = _html_decode(raw_html)
+    value = re.sub(r"<script\b[\s\S]*?</script>", "\n", value, flags=re.I)
+    value = re.sub(r"<style\b[\s\S]*?</style>", "\n", value, flags=re.I)
+    value = re.sub(r"<(?:br|hr)\b[^>]*>", "\n", value, flags=re.I)
+    value = re.sub(
+        r"<(?:div|p|li|section|article|tr|td|th|h1|h2|h3|h4|h5|h6|span|a|strong|em|button)\b[^>]*>",
+        "\n",
+        value,
+        flags=re.I,
+    )
+    value = re.sub(
+        r"</(?:div|p|li|section|article|tr|td|th|h1|h2|h3|h4|h5|h6|span|a|strong|em|button)>",
+        "\n",
+        value,
+        flags=re.I,
+    )
+    value = re.sub(r"<[^>]+>", " ", value)
+    value = value.replace("\r", "\n")
+    return [
+        re.sub(r"\s+", " ", x).strip()
+        for x in re.split(r"\n+", value)
+        if re.sub(r"\s+", " ", x).strip()
+    ]
+
+
+def _sanofi_normalized_label(value: Any) -> str:
+    return _norm(_clean(value).rstrip(":："))
+
+
+def _sanofi_value_after_label(lines: List[str], label: str) -> str:
+    wanted = _norm(label)
+    stop_labels = {
+        "name",
+        "phase",
+        "description",
+        "indication",
+        "therapeutic area",
+        "downloads available",
+    }
+
+    for i in range(0, max(0, len(lines) - 1)):
+        if _sanofi_normalized_label(lines[i]) != wanted:
+            continue
+
+        for j in range(i + 1, len(lines)):
+            candidate = _clean(lines[j]).replace("®", "").replace("™", "")
+            if not candidate:
+                continue
+
+            n = _norm(candidate)
+            if n in {"new", "new phase"}:
+                continue
+            if _sanofi_normalized_label(candidate) in stop_labels:
+                break
+            return candidate
+
+    return ""
+
+
+def _sanofi_phase_map(label: str) -> str:
+    return {
+        "1": "Phase 1",
+        "2": "Phase 2",
+        "3": "Phase 3",
+        "R": "Filed / Registration",
+    }.get(label, "")
+
+
+def _parse_sanofi_html(
+    raw_html: str,
+    source_url: str,
+) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
+    starts = [
+        m.start()
+        for m in re.finditer(
+            r"<p\b[^>]*>\s*Name\s*</p>",
+            raw_html,
+            flags=re.I,
+        )
+    ][:300]
+
+    rows: List[Dict[str, Any]] = []
+    warnings: List[Dict[str, Any]] = []
+    class_role_counts: Dict[str, Dict[str, Any]] = {}
+
+    for idx, start in enumerate(starts):
+        end = starts[idx + 1] if idx + 1 < len(starts) else min(
+            len(raw_html),
+            start + 30000,
+        )
+        raw = raw_html[start:end]
+        lines = _sanofi_block_text_lines(raw)
+
+        name_idx = next(
+            (
+                i
+                for i, line in enumerate(lines)
+                if _sanofi_normalized_label(line) == "name"
+            ),
+            -1,
+        )
+        asset = (
+            _clean(lines[name_idx + 1]).replace("®", "").replace("™", "")
+            if 0 <= name_idx < len(lines) - 1
+            else ""
+        )
+        indication = _sanofi_value_after_label(lines, "Indication")
+        description = _sanofi_value_after_label(lines, "Description")
+        source_ta = _sanofi_value_after_label(lines, "Therapeutic Area")
+
+        if not asset or not indication:
+            continue
+
+        phase_match = re.search(
+            r"<p\b[^>]*>\s*Phase\s*</p>",
+            raw,
+            flags=re.I,
+        )
+        states: List[Dict[str, str]] = []
+
+        if phase_match:
+            after = raw[
+                phase_match.end() : min(len(raw), phase_match.end() + 2600)
+            ]
+            stop_match = re.search(
+                r"<p\b[^>]*>\s*Description\s*</p>",
+                after,
+                flags=re.I,
+            )
+            phase_raw = after[: stop_match.start()] if stop_match else after
+
+            state_re = re.compile(
+                r"<div\b[^>]*class\s*=\s*[\"']([^\"']+)[\"'][^>]*>\s*(1|2|3|R)\s*</div>",
+                re.I,
+            )
+            for sm in state_re.finditer(phase_raw):
+                label = sm.group(2).upper()
+                if any(s["label"] == label for s in states):
+                    continue
+                states.append({
+                    "label": label,
+                    "className": _clean(sm.group(1)),
+                })
+                if len(states) >= 8:
+                    break
+
+        states = [s for s in states if s["label"] in {"1", "2", "3", "R"}]
+
+        frequencies = Counter(s["className"] for s in states)
+        unique_states = [
+            s for s in states if frequencies[s["className"]] == 1
+        ]
+        common_states = [
+            s for s in states if frequencies[s["className"]] >= 2
+        ]
+
+        active = (
+            unique_states[0]
+            if (
+                len(states) == 4
+                and len(unique_states) == 1
+                and len(common_states) == 3
+            )
+            else None
+        )
+        phase = _sanofi_phase_map(active["label"]) if active else ""
+
+        for state in states:
+            rec = class_role_counts.setdefault(
+                state["className"],
+                {
+                    "className": state["className"],
+                    "activeUnique": 0,
+                    "inactiveCommon": 0,
+                    "total": 0,
+                },
+            )
+            rec["total"] += 1
+            if active and state["className"] == active["className"]:
+                rec["activeUnique"] += 1
+            else:
+                rec["inactiveCommon"] += 1
+
+        if len(states) != 4:
+            warnings.append({
+                "asset": asset,
+                "indication": indication,
+                "sourceCardOrdinal": idx + 1,
+                "issue": f"Expected 4 phase states but found {len(states)}",
+                "states": states,
+            })
+        elif not active:
+            warnings.append({
+                "asset": asset,
+                "indication": indication,
+                "sourceCardOrdinal": idx + 1,
+                "issue": "Could not identify exactly one unique phase-state class",
+                "states": states,
+                "frequencies": dict(frequencies),
+            })
+
+        rows.append({
+            "company": "Sanofi",
+            "asset": asset,
+            "developmentCode": asset if re.fullmatch(
+                r"(?:SAR|SP)\d{4,9}",
+                asset,
+                flags=re.I,
+            ) else "",
+            "indication": indication,
+            "phase": phase,
+            "description": description,
+            "mechanismOfAction": description,
+            "sourceTherapeuticArea": source_ta,
+            "sourceUrl": source_url,
+            "sourceConfidence": "High" if phase else "Low",
+            "sourceAdapter": "SANOFI_PHASE_STATE_CARD",
+            "sourceCardOrdinal": idx + 1,
+        })
+
+    phase_counts = Counter(r.get("phase", "") for r in rows)
+
+    exact_fingerprints = [
+        (
+            _norm(r.get("asset")),
+            _norm(r.get("indication")),
+            _norm(r.get("phase")),
+            _norm(r.get("description")),
+        )
+        for r in rows
+    ]
+    exact_duplicate_count = sum(
+        n - 1
+        for n in Counter(exact_fingerprints).values()
+        if n > 1
+    )
+
+    coarse_groups: Dict[Tuple[str, str, str], List[Dict[str, Any]]] = {}
+    for row in rows:
+        key = (
+            _norm(row.get("asset")),
+            _norm(row.get("indication")),
+            _norm(row.get("phase")),
+        )
+        coarse_groups.setdefault(key, []).append(row)
+
+    variant_collisions = []
+    for key, grouped in coarse_groups.items():
+        if len(grouped) <= 1:
+            continue
+
+        descriptions = {_norm(r.get("description")) for r in grouped}
+        if len(descriptions) <= 1:
+            continue
+
+        variant_collisions.append({
+            "key": "|".join(key),
+            "count": len(grouped),
+            "interpretation": (
+                "Same asset + indication + phase but different source descriptions. "
+                "Preserve as separate source programmes/variants."
+            ),
+            "rows": [
+                {
+                    "sourceCardOrdinal": r.get("sourceCardOrdinal"),
+                    "asset": r.get("asset"),
+                    "indication": r.get("indication"),
+                    "phase": r.get("phase"),
+                    "description": r.get("description"),
+                    "sourceTherapeuticArea": r.get("sourceTherapeuticArea"),
+                }
+                for r in grouped
+            ],
+        })
+
+    diagnostics = {
+        "parser": "SANOFI_PHASE_STATE_CARD_V1",
+        "rawCardAnchors": len(starts),
+        "parsedRows": len(rows),
+        "phaseResolved": sum(1 for r in rows if r.get("phase")),
+        "phaseUnresolved": sum(1 for r in rows if not r.get("phase")),
+        "phaseCounts": dict(phase_counts),
+        "boundaryWarnings": len(warnings),
+        "warningDetails": warnings,
+        "exactDuplicates": exact_duplicate_count,
+        "variantCollisions": variant_collisions,
+        "classRoles": sorted(
+            class_role_counts.values(),
+            key=lambda x: (-x["activeUnique"], -x["total"]),
+        ),
+        "structuralNote": (
+            "Sanofi phase is resolved from the unique active CSS state among "
+            "1/2/3/R inside each source card. Therapeutic area is diagnostic only; "
+            "production TA must continue to come from the controlled indication taxonomy."
+        ),
+    }
+    return rows, diagnostics
+
+
+def _validate_sanofi(
+    rows: List[Dict[str, Any]],
+    diagnostics: Optional[Dict[str, Any]] = None,
+) -> Tuple[Dict[str, Any], List[Dict[str, Any]]]:
+    diagnostics = diagnostics or {}
+    counts = Counter(r.get("phase", "") for r in rows)
+    actual = {
+        "Phase 1": counts.get("Phase 1", 0),
+        "Phase 2": counts.get("Phase 2", 0),
+        "Phase 3": counts.get("Phase 3", 0),
+        "Filed / Registration": counts.get("Filed / Registration", 0),
+        "Total": len(rows),
+    }
+
+    issues: List[Dict[str, Any]] = []
+    warnings: List[Dict[str, Any]] = []
+
+    allowed_phases = {
+        "Phase 1",
+        "Phase 2",
+        "Phase 3",
+        "Filed / Registration",
+    }
+
+    missing_core = [
+        {
+            "asset": r.get("asset", ""),
+            "sourceCardOrdinal": r.get("sourceCardOrdinal"),
+            "missing": [
+                field
+                for field in ["asset", "indication", "phase"]
+                if not _clean(r.get(field, ""))
+            ],
+        }
+        for r in rows
+        if any(
+            not _clean(r.get(field, ""))
+            for field in ["asset", "indication", "phase"]
+        )
+    ]
+    if missing_core:
+        issues.append({
+            "issue": "Rows missing core fields",
+            "count": len(missing_core),
+            "sample": missing_core[:20],
+        })
+
+    invalid_phases = [
+        {
+            "asset": r.get("asset", ""),
+            "phase": r.get("phase", ""),
+            "sourceCardOrdinal": r.get("sourceCardOrdinal"),
+        }
+        for r in rows
+        if r.get("phase") not in allowed_phases
+    ]
+    if invalid_phases:
+        issues.append({
+            "issue": "Rows contain unsupported phase values",
+            "count": len(invalid_phases),
+            "sample": invalid_phases[:20],
+        })
+
+    if int(diagnostics.get("boundaryWarnings", 0) or 0) > 0:
+        issues.append({
+            "issue": "One or more Sanofi cards failed the four-state phase guardrail",
+            "count": int(diagnostics.get("boundaryWarnings", 0) or 0),
+        })
+
+    if int(diagnostics.get("exactDuplicates", 0) or 0) > 0:
+        issues.append({
+            "issue": "Exact Sanofi source cards are duplicated",
+            "count": int(diagnostics.get("exactDuplicates", 0) or 0),
+        })
+
+    if len(rows) < 20 or len(rows) > 150:
+        issues.append({
+            "issue": "Programme count outside structural sanity bounds",
+            "actualTotal": len(rows),
+            "allowedRange": [20, 150],
+        })
+
+    for phase in ["Phase 1", "Phase 2", "Phase 3"]:
+        if actual[phase] <= 0:
+            issues.append({
+                "issue": "Major development phase unexpectedly empty",
+                "phase": phase,
+            })
+
+    baseline_matches = actual == EXPECTED_SANOFI
+    if not baseline_matches:
+        warnings.append({
+            "warning": (
+                "Source no longer matches the previously validated 61-row Sanofi "
+                "snapshot. This may be a legitimate pipeline delta and should be "
+                "reconciled in Airtable rather than automatically rejected."
+            ),
+            "baseline": EXPECTED_SANOFI,
+            "actual": actual,
+        })
+
+    structural_valid = len(issues) == 0
+
+    summary = {
+        "baselineExpected": EXPECTED_SANOFI,
+        "actual": actual,
+        "baselineCoverageMatches": baseline_matches,
+        "structuralValidationPass": structural_valid,
+        "productionStatus": (
+            "READY FOR AIRTABLE DELTA COMPARISON"
+            if structural_valid
+            else "FAIL CLOSED - PARSER/STRUCTURE REVIEW REQUIRED"
+        ),
+        "warnings": warnings,
+    }
+    return summary, issues
+
+
+async def _download_html(url: str) -> str:
+    headers = {
+        "User-Agent": "PharmaPipelineAdapter/2.40.0 (+official-source-reader)",
+        "Accept": "text/html,application/xhtml+xml",
+    }
+    async with httpx.AsyncClient(
+        timeout=httpx.Timeout(25.0, connect=10.0),
+        follow_redirects=True,
+        headers=headers,
+    ) as client:
+        response = await client.get(url)
+        response.raise_for_status()
+        return response.text
+
+
 @app.get("/health")
 async def health() -> Dict[str, Any]:
     return {
         "ok": True,
         "version": APP_VERSION,
-        "service": "pharma-pipeline-pdf-adapter",
+        "service": "pharma-pipeline-adapter",
     }
 
 
@@ -840,3 +1296,95 @@ async def debug_pfizer(
         "diagnostics": diagnostics,
         "sampleRows": rows[:20],
     }
+
+
+@app.get("/extract/sanofi", response_model=ExtractionResponse)
+async def extract_sanofi(
+    source_url: str = Query(default=SANOFI_PIPELINE_URL),
+    x_adapter_key: Optional[str] = Header(default=None),
+) -> ExtractionResponse:
+    _auth(x_adapter_key)
+
+    raw_html = await _download_html(source_url)
+    rows, diagnostics = _parse_sanofi_html(raw_html, source_url)
+    summary, issues = _validate_sanofi(rows, diagnostics)
+
+    return ExtractionResponse(
+        version=APP_VERSION,
+        company="Sanofi",
+        sourceUrl=source_url,
+        sourceDate=None,
+        rows=rows,
+        summary=summary,
+        issues=issues,
+        diagnostics=diagnostics,
+    )
+
+
+@app.get("/debug/sanofi")
+async def debug_sanofi(
+    source_url: str = Query(default=SANOFI_PIPELINE_URL),
+    x_adapter_key: Optional[str] = Header(default=None),
+) -> Dict[str, Any]:
+    _auth(x_adapter_key)
+
+    raw_html = await _download_html(source_url)
+    rows, diagnostics = _parse_sanofi_html(raw_html, source_url)
+    summary, issues = _validate_sanofi(rows, diagnostics)
+
+    return {
+        "version": APP_VERSION,
+        "summary": summary,
+        "issues": issues,
+        "diagnostics": diagnostics,
+        "sampleRows": rows[:20],
+    }
+
+
+@app.get("/extract/{company_slug}", response_model=ExtractionResponse)
+async def extract_company(
+    company_slug: str,
+    x_adapter_key: Optional[str] = Header(default=None),
+) -> ExtractionResponse:
+    _auth(x_adapter_key)
+    slug = _norm(company_slug).replace(" ", "-")
+
+    if slug == "pfizer":
+        pdf_bytes = await _download_pdf(PFIZER_PDF_URL)
+        rows, diagnostics = _parse_pfizer_pdf(pdf_bytes, PFIZER_PDF_URL)
+        summary, issues = _validate_pfizer(rows, diagnostics)
+        return ExtractionResponse(
+            version=APP_VERSION,
+            company="Pfizer",
+            sourceUrl=PFIZER_PDF_URL,
+            sourceDate=diagnostics.get("sourceDate"),
+            rows=rows,
+            summary=summary,
+            issues=issues,
+            diagnostics=diagnostics,
+        )
+
+    if slug == "sanofi":
+        raw_html = await _download_html(SANOFI_PIPELINE_URL)
+        rows, diagnostics = _parse_sanofi_html(raw_html, SANOFI_PIPELINE_URL)
+        summary, issues = _validate_sanofi(rows, diagnostics)
+        return ExtractionResponse(
+            version=APP_VERSION,
+            company="Sanofi",
+            sourceUrl=SANOFI_PIPELINE_URL,
+            sourceDate=None,
+            rows=rows,
+            summary=summary,
+            issues=issues,
+            diagnostics=diagnostics,
+        )
+
+    raise HTTPException(
+        status_code=404,
+        detail=(
+            f"No validated pipeline adapter profile exists for '{company_slug}'. "
+            "Add and validate the official source profile before enabling recurring monitoring."
+        ),
+    )
+
+

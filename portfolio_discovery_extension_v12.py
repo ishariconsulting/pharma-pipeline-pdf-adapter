@@ -25,8 +25,6 @@ def _phase_canonical_v12(value: Any) -> str:
     ):
         return "registration"
 
-    # Capture integrated phases such as Phase I/II, Phase 1/2, Phase 2b/3,
-    # and Phase I/II/III without collapsing them to the first stage.
     token = r"(?:iii|ii|i|[123])(?:[abc])?"
     match = re.search(
         rf"\bphase\s*({token}(?:\s*(?:/|\\|\+|&|\-|to)\s*{token})*)",
@@ -34,8 +32,6 @@ def _phase_canonical_v12(value: Any) -> str:
         flags=re.I,
     )
     if not match:
-        # Fallback for strings normalized from unusual punctuation, e.g.
-        # 'Phase I II' or 'Phase 1 2'. Only inspect the immediate phase tail.
         match = re.search(r"\bphase\s+((?:(?:iii|ii|i|[123])(?:[abc])?\s*){1,3})", raw, flags=re.I)
 
     if match:
@@ -51,12 +47,9 @@ def _phase_canonical_v12(value: Any) -> str:
             if stage not in stages:
                 stages.append(stage)
         if stages:
-            # Numeric order gives a stable canonical form while retaining the
-            # fact that this is an integrated multi-stage program.
             stages = sorted(stages, key=int)
             return "phase " + " ".join(stages)
 
-    # Preserve simple values supported by V1.1.
     return base._phase_canonical(value)
 
 
@@ -104,7 +97,6 @@ def _compare_discovery_v12(request: base.DiscoveryCompareRequest) -> base.Discov
     return result
 
 
-# Patch V1.1 module globals used by its already-registered FastAPI route.
 base.DISCOVERY_VERSION = DISCOVERY_VERSION
 base._phase_canonical = _phase_canonical_v12
 base._commercial_decision = _commercial_decision_v12
@@ -138,7 +130,6 @@ def _v12_self_test() -> Dict[str, Any]:
             and expected_basis in basis
         )
 
-    # Regression: V1.1 comparator behavior remains intact after patch.
     regression = base._self_test()
     checks["v11_regression"] = bool(regression.get("ok"))
     return {"ok": all(checks.values()), "checks": checks, "v11Regression": regression}
@@ -148,7 +139,6 @@ V12_SELF_TEST_RESULTS = _v12_self_test()
 if not V12_SELF_TEST_RESULTS["ok"]:
     raise RuntimeError(f"Portfolio discovery V1.2 self-test failed: {V12_SELF_TEST_RESULTS}")
 
-# The V1.1 health/self-test routes reference these globals dynamically.
 base.SELF_TEST_RESULTS = {
     "ok": True,
     "checks": {
@@ -158,3 +148,7 @@ base.SELF_TEST_RESULTS = {
     "summary": V12_SELF_TEST_RESULTS["v11Regression"].get("summary", {}),
     "hybridPhaseSelfTest": True,
 }
+
+# Register company-source adapters only after comparator patching is complete.
+# These routes are read-only and do not alter Airtable or existing automations.
+import astrazeneca_pipeline_adapter  # noqa: E402,F401

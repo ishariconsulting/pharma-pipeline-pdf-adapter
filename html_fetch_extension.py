@@ -244,3 +244,4 @@ import portfolio_discovery_extension_v12  # noqa: E402,F401
 import portfolio_discovery_extension_v13  # noqa: E402,F401
 import astrazeneca_reconciliation_canary  # noqa: E402,F401
 import astrazeneca_reconciliation_canary_patch  # noqa: E402,F401
+import portfolio_discovery_regression_canaries  # noqa: E402,F401

@@ -2,25 +2,25 @@
 
 Adds two deterministic, company-agnostic reconciliation rules exposed by the
 58-row Pfizer regression canary:
-1) receptor-status shorthand such as HR+/HER2- is normalized before punctuation
-   stripping, so positive/negative meaning is not lost;
+1) receptor-status shorthand such as HR+/HER2- and written HR-positive /
+   HER2-negative are normalized before punctuation stripping, so polarity is
+   never corrupted by the older shorthand normalizer;
 2) an exact study/program code plus exact development-code identity receives a
    small corroboration boost. This allows the same programme to reconcile when
-   source and Portfolio differ only by a generic disease descriptor (for
-   example, 'gastroesophageal cancer' vs 'gastroesophageal') while remaining
-   fail-closed for rows with a different study code.
+   source and Portfolio differ only by a generic disease descriptor while
+   remaining fail-closed for rows with a different study code.
 
 No fuzzy matching and no master-data writes are introduced.
 """
 
 import re
-from typing import Any, List, Tuple
+from typing import Any, List, Set, Tuple
 
 import portfolio_discovery_extension_v11 as base
 import portfolio_discovery_extension_v13  # noqa: F401 - installs V1.3 logic
 
 
-DISCOVERY_VERSION = "V1.4.0 PORTFOLIO DISCOVERY READ ONLY - PRECISION QUALIFIER NORMALIZATION"
+DISCOVERY_VERSION = "V1.4.1 PORTFOLIO DISCOVERY READ ONLY - PRECISION QUALIFIER NORMALIZATION"
 
 _v13_clinical_norm = base._clinical_norm
 _v13_compare = base.compare_discovery
@@ -31,19 +31,59 @@ def _clinical_norm_v14(value: Any) -> str:
     if not text:
         return ""
 
-    # Preserve polarity before the lower-level normalizer removes punctuation.
-    # Boundaries are deliberately expressed without \b after +/- because + and -
-    # are non-word characters and can sit next to '/' or whitespace.
-    replacements = [
+    # First canonicalize already-written polarity terms so V1.1's historical
+    # `hr-` / `her2-` regex cannot partially match the hyphen in `HR-positive`
+    # and produce corrupted strings such as `hr negativepositive`.
+    written = [
+        (r"(?<![A-Za-z0-9])HR\s*[- ]\s*positive\b", "HR positive"),
+        (r"(?<![A-Za-z0-9])HR\s*[- ]\s*negative\b", "HR negative"),
+        (r"(?<![A-Za-z0-9])HER2\s*[- ]\s*positive\b", "HER2 positive"),
+        (r"(?<![A-Za-z0-9])HER2\s*[- ]\s*negative\b", "HER2 negative"),
+    ]
+    for pattern, repl in written:
+        text = re.sub(pattern, repl, text, flags=re.I)
+
+    # Preserve +/- polarity before the lower-level normalizer removes
+    # punctuation. Do not use a word-boundary after +/-: these symbols are
+    # non-word characters and are frequently adjacent to '/' or whitespace.
+    shorthand = [
         (r"(?<![A-Za-z0-9])HR\s*\+(?![A-Za-z0-9])", "HR positive"),
         (r"(?<![A-Za-z0-9])HR\s*-(?![A-Za-z0-9])", "HR negative"),
         (r"(?<![A-Za-z0-9])HER2\s*\+(?![A-Za-z0-9])", "HER2 positive"),
         (r"(?<![A-Za-z0-9])HER2\s*-(?![A-Za-z0-9])", "HER2 negative"),
     ]
-    for pattern, repl in replacements:
+    for pattern, repl in shorthand:
         text = re.sub(pattern, repl, text, flags=re.I)
 
     return _v13_clinical_norm(text)
+
+
+def _study_codes_v14(value: Any) -> Set[str]:
+    """Conservative named trial/program extraction with compound study names.
+
+    V1.1 covered e.g. MM-5 and MEVPRO-1 but not compound programme identifiers
+    such as Symbiotic-GI-16 / Symbiotic-Lung-01. We still only inspect text in
+    parentheses and require a known study family plus a numeric suffix.
+    """
+    text = base._clean(value)
+    tokens: Set[str] = set()
+    families = (
+        "mm|ev|dv|mevpro|fourlight|talapro|her2climb|symbiotic|"
+        "mountaineer|padl1nk|be6a"
+    )
+    for raw in re.findall(r"\(([^()]*)\)", text):
+        n = base._norm(raw)
+        if not n:
+            continue
+        # Allow up to two intermediate alpha/alphanumeric components between
+        # the known family and final number: `symbiotic gi 16`, `be6a lung 01`.
+        if re.search(rf"\b(?:{families})(?:\s+[a-z0-9]+){{0,2}}\s+\d+\b", n):
+            tokens.add(n)
+            continue
+        # Retain V1.1's compact family-number shape such as MM-5 -> `mm 5`.
+        if re.search(rf"\b(?:{families})\s*\d+\b", n):
+            tokens.add(n)
+    return tokens
 
 
 def _indication_score_v14(
@@ -91,8 +131,8 @@ def _indication_score_v14(
             evidence.append("Verified indication alias present in source indication")
             break
 
-    source_codes = base._study_codes(source.indication)
-    portfolio_codes = base._study_codes(portfolio.indication)
+    source_codes = _study_codes_v14(source.indication)
+    portfolio_codes = _study_codes_v14(portfolio.indication)
     exact_study_code = bool(source_codes and portfolio_codes and source_codes & portfolio_codes)
     if exact_study_code:
         score += 30
@@ -146,6 +186,7 @@ def _indication_score_v14(
 
 base._clinical_norm = _clinical_norm_v14
 base._indication_score = _indication_score_v14
+base._study_codes = _study_codes_v14
 base.DISCOVERY_VERSION = DISCOVERY_VERSION
 
 
@@ -153,6 +194,7 @@ def _compare_discovery_v14(request: base.DiscoveryCompareRequest) -> base.Discov
     result = _v13_compare(request)
     result.version = DISCOVERY_VERSION
     result.guardrails["receptorPolarityNormalization"] = True
+    result.guardrails["compoundStudyCodeNormalization"] = True
     result.guardrails["exactStudyAndDevelopmentCodeCorroboration"] = True
     result.guardrails["fuzzyMatching"] = False
     return result
@@ -226,6 +268,11 @@ def _self_test_v14() -> dict:
     checks["different_study_fails_closed"] = (
         "Exact development code corroborates exact study/program code" not in evidence3
         and score3 < 72
+    )
+
+    checks["symbiotic_code_extracted"] = (
+        _study_codes_v14(s2.indication) == {"symbiotic gi 16"}
+        and _study_codes_v14(p2.indication) == {"symbiotic gi 16"}
     )
 
     return {"ok": all(checks.values()), "checks": checks}

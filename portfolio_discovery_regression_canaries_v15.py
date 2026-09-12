@@ -1,8 +1,9 @@
 """READ-ONLY regression bridge for the latest Portfolio Discovery comparator.
 
-This module installs V1.5 first, then imports the frozen Pfizer and Vertex
-regression fixtures. That forces the legacy canary suite to execute against the
-current comparator rather than the historical V1.3 import state.
+The historical canary module contains frozen Pfizer and Vertex fixtures plus
+precomputed results from its original import state. This bridge deliberately
+re-runs the fixture functions after the latest comparator has been installed,
+so the gate validates current behaviour rather than cached historical results.
 
 No Airtable, Portfolio, RPC, MRS, Queue, or automation writes are introduced.
 """
@@ -14,17 +15,27 @@ import portfolio_discovery_extension_v11 as base
 import portfolio_discovery_regression_canaries as frozen
 
 
-CANARY_VERSION = "V1.1 PORTFOLIO DISCOVERY REGRESSION CANARIES - CURRENT COMPARATOR"
+CANARY_VERSION = "V1.2 PORTFOLIO DISCOVERY REGRESSION CANARIES - CURRENT COMPARATOR"
+
+# Re-run the frozen fixtures now. Do not rely on the historical module-level
+# PFIZER_REGRESSION / VERTEX_REGRESSION objects because those may have been
+# computed before V1.5 was installed in the process.
+CURRENT_PFIZER = frozen._run_pfizer()
+CURRENT_VERTEX = frozen._run_vertex()
 
 LATEST_REGRESSION_CHECKS = {
-    "frozen_suite_passes": bool(frozen.REGRESSION_RESULTS.get("ok")),
-    "pfizer_runs_on_v15": frozen.PFIZER_REGRESSION.get("version") == latest.DISCOVERY_VERSION,
-    "vertex_runs_on_v15": frozen.VERTEX_REGRESSION.get("version") == latest.DISCOVERY_VERSION,
-    "pfizer_all_58_still_match": frozen.PFIZER_REGRESSION.get("checks", {}).get("all_58_matched") is True,
-    "vertex_vx993_still_new_asset": frozen.VERTEX_REGRESSION.get("checks", {}).get("vx993_new_asset") is True,
-    "vertex_vx407_still_new_asset": frozen.VERTEX_REGRESSION.get("checks", {}).get("vx407_new_asset") is True,
-    "vertex_cushing_still_new_indication": frozen.VERTEX_REGRESSION.get("checks", {}).get("atumelnant_cushing_new_indication") is True,
-    "vertex_cah_still_matched": frozen.VERTEX_REGRESSION.get("checks", {}).get("atumelnant_cah_matched") is True,
+    "pfizer_runs_on_v15": CURRENT_PFIZER.get("version") == latest.DISCOVERY_VERSION,
+    "vertex_runs_on_v15": CURRENT_VERTEX.get("version") == latest.DISCOVERY_VERSION,
+    "pfizer_all_58_still_match": CURRENT_PFIZER.get("checks", {}).get("all_58_matched") is True,
+    "pfizer_no_new_asset": CURRENT_PFIZER.get("checks", {}).get("no_new_asset") is True,
+    "pfizer_no_new_indication": CURRENT_PFIZER.get("checks", {}).get("no_new_indication") is True,
+    "pfizer_no_possible_duplicate": CURRENT_PFIZER.get("checks", {}).get("no_possible_duplicate") is True,
+    "vertex_vx993_still_new_asset": CURRENT_VERTEX.get("checks", {}).get("vx993_new_asset") is True,
+    "vertex_vx407_still_new_asset": CURRENT_VERTEX.get("checks", {}).get("vx407_new_asset") is True,
+    "vertex_cushing_still_new_indication": CURRENT_VERTEX.get("checks", {}).get("atumelnant_cushing_new_indication") is True,
+    "vertex_cah_still_matched": CURRENT_VERTEX.get("checks", {}).get("atumelnant_cah_matched") is True,
+    "pfizer_read_only": CURRENT_PFIZER.get("checks", {}).get("read_only") is True,
+    "vertex_read_only": CURRENT_VERTEX.get("checks", {}).get("read_only") is True,
 }
 
 LATEST_REGRESSION_RESULTS: Dict[str, Any] = {
@@ -32,8 +43,8 @@ LATEST_REGRESSION_RESULTS: Dict[str, Any] = {
     "canaryVersion": CANARY_VERSION,
     "comparatorVersion": latest.DISCOVERY_VERSION,
     "checks": LATEST_REGRESSION_CHECKS,
-    "pfizer": frozen.PFIZER_REGRESSION,
-    "vertex": frozen.VERTEX_REGRESSION,
+    "pfizer": CURRENT_PFIZER,
+    "vertex": CURRENT_VERTEX,
     "guardrails": {
         "readOnly": True,
         "masterWrites": False,

@@ -236,3 +236,8 @@ async def fetch_html(
 ) -> HtmlFetchResponse:
     _auth(x_adapter_key)
     return await _fetch_public_html(url)
+
+
+# Additive route registration only. Importing this module does not alter any
+# existing pipeline/regulatory automation or master-data write path.
+import portfolio_discovery_extension  # noqa: E402,F401

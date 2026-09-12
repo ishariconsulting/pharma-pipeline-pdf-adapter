@@ -240,4 +240,4 @@ async def fetch_html(
 
 # Additive route registration only. Importing this module does not alter any
 # existing pipeline/regulatory automation or master-data write path.
-import portfolio_discovery_extension_v11  # noqa: E402,F401
+import portfolio_discovery_extension_v12  # noqa: E402,F401

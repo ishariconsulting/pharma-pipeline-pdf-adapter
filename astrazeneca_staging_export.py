@@ -16,13 +16,14 @@ import portfolio_discovery_extension_v11 as comparator
 import portfolio_discovery_extension_v12  # noqa: F401
 import portfolio_discovery_extension_v13  # noqa: F401
 import portfolio_discovery_extension_v14  # noqa: F401
+import portfolio_discovery_extension_v15  # noqa: F401 - verified disease aliases
 import astrazeneca_pipeline_adapter as az
 import astrazeneca_pipeline_adapter_v13  # noqa: F401 - patches source parsing globals
 import astrazeneca_pipeline_adapter_v14  # noqa: F401 - prevents study-token splits inside asset names
 from astrazeneca_reconciliation_canary import PORTFOLIO_SNAPSHOT, SNAPSHOT_AS_OF, _to_source_row
 
 
-EXPORT_VERSION = "V1.3 ASTRAZENECA DISCOVERY STAGING EXPORT - CASE-SAFE SOURCE HYGIENE QA"
+EXPORT_VERSION = "V1.4 ASTRAZENECA DISCOVERY STAGING EXPORT - VERIFIED DISEASE ALIAS QA"
 STAGE_CLASSES = {
     "NEW ASSET",
     "NEW INDICATION",

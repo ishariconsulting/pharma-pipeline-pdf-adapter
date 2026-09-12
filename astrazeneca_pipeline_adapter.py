@@ -22,7 +22,7 @@ from main import _auth, app
 from html_fetch_extension import _assert_public_http_url
 
 
-AZ_PIPELINE_VERSION = "V1.1.0 ASTRAZENECA OFFICIAL PIPELINE READ ONLY"
+AZ_PIPELINE_VERSION = "V1.2.0 ASTRAZENECA OFFICIAL PIPELINE READ ONLY"
 AZ_PIPELINE_URL = "https://www.astrazeneca.com/our-therapy-areas/pipeline.html"
 AZ_SOURCE_FAMILY = "AstraZeneca Official Pipeline"
 AZ_COMPANY = "AstraZeneca"
@@ -129,6 +129,7 @@ class _PipelineHTMLParser(HTMLParser):
         self._heading_buf: List[str] = []
         self._li_depth = 0
         self._li_buf: List[str] = []
+        self._li_had_anchor = False
         self._a_depth = 0
         self._a_buf: List[str] = []
         self.current_area: Optional[str] = None
@@ -137,8 +138,18 @@ class _PipelineHTMLParser(HTMLParser):
         self.in_removed = False
         self.rows: List[Dict[str, Any]] = []
 
+    def _reset_context(self) -> None:
+        self.current_area = None
+        self.current_as_of = None
+        self.current_phase = None
+        self.in_removed = False
+
     def _append_current(self, text: str) -> None:
         text = _clean(text)
+        low = _norm(text)
+        if low in {"back to top", "back to top↑"} or low.startswith("back to top"):
+            self._reset_context()
+            return
         if not self.current_area or not _looks_like_pipeline_item(text):
             return
         if self.in_removed:
@@ -167,7 +178,10 @@ class _PipelineHTMLParser(HTMLParser):
             self._li_depth += 1
             if self._li_depth == 1:
                 self._li_buf = []
+                self._li_had_anchor = False
         if tag == "a" and self.current_area:
+            if self._li_depth > 0:
+                self._li_had_anchor = True
             self._a_depth += 1
             if self._a_depth == 1:
                 self._a_buf = []
@@ -191,9 +205,12 @@ class _PipelineHTMLParser(HTMLParser):
                     self.current_as_of = as_of
                     self.current_phase = None
                     self.in_removed = removed
+                else:
+                    # A new, unrelated H2 means we have left the pipeline section.
+                    self._reset_context()
             elif tag == "h3":
                 phase = _phase_from_heading(text)
-                if phase:
+                if phase and self.current_area:
                     self.current_phase = phase
             self._heading_tag = None
             self._heading_buf = []
@@ -206,8 +223,13 @@ class _PipelineHTMLParser(HTMLParser):
 
         if tag == "li" and self._li_depth > 0:
             if self._li_depth == 1:
-                self._append_current(" ".join(self._li_buf))
+                # When the item contains an anchor, the anchor is the clean
+                # program label. Do not also emit the enclosing LI, which can
+                # contain hidden accessibility/modal text and double-count.
+                if not self._li_had_anchor:
+                    self._append_current(" ".join(self._li_buf))
                 self._li_buf = []
+                self._li_had_anchor = False
             self._li_depth -= 1
 
 
@@ -396,16 +418,18 @@ def _summarize(rows: List[AZPipelineRow]) -> Dict[str, Any]:
 def _self_test() -> Dict[str, Any]:
     fixture = """
     <h2>Oncology (as of 27 July 2026)</h2>
-    <h3>Phase I</h3><ul><li><a>AZD0240 solid tumours</a></li></ul>
+    <h3>Phase I</h3><ul><li><a>AZD0240 solid tumours</a><span>hidden details</span></li></ul>
     <h3>Phase II</h3><ul><li>AZD0120 multiple myeloma</li><li>Etcamah (camizestrant) HR+ HER2- breast cancer</li></ul>
     <h3>Phase III</h3><ul><li>zadavotide guraxetan (AZD2265) VECTRA-01 prostate cancer (mCRPC)</li></ul>
     <h3>LCM Projects</h3><ul><li>Tagrisso ADAURA2 EGFRm NSCLC stage Ia2-Ia3 following complete tumour resection</li></ul>
-    <h2>Removed since last quarter</h2><ul><li>AZD2068 solid tumours</li></ul>
+    <a>back to top</a>
+    <h2>Removed since last quarter</h2><ul><li>AZD2068 solid tumours</li></ul><a>back to top</a>
+    <ul><li><a>Footer navigation must not be captured</a></li></ul>
     """
     rows = parse_pipeline_html(fixture)
     by_text = {r.programText: r for r in rows}
     checks = {
-        "anchor_or_li_dedup": sum(1 for r in rows if r.programText == "AZD0240 solid tumours") == 1,
+        "anchor_preferred_over_li": "AZD0240 solid tumours" in by_text and "AZD0240 solid tumours hidden details" not in by_text,
         "phase1_parsed": by_text["AZD0240 solid tumours"].phase == "Phase 1",
         "phase2_commercial": by_text["AZD0120 multiple myeloma"].commercialInScope,
         "brand_molecule": (
@@ -420,6 +444,7 @@ def _self_test() -> Dict[str, Any]:
             and by_text["Tagrisso ADAURA2 EGFRm NSCLC stage Ia2-Ia3 following complete tumour resection"].importantLabelExpansion
         ),
         "removed_not_commercial": not by_text["AZD2068 solid tumours"].commercialInScope,
+        "footer_not_captured": "Footer navigation must not be captured" not in by_text,
     }
     return {"ok": all(checks.values()), "checks": checks, "rowCount": len(rows)}
 

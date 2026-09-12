@@ -1,14 +1,34 @@
-"""Hotfix for the read-only AstraZeneca reconciliation canary.
+"""Read-only quality patch for the AstraZeneca reconciliation canary.
 
-The V1 canary represented fieldDeltas as a list of delta dictionaries, but its
-summary loop treated that list as a dictionary. This patch replaces only the
-read-only run_canary function. No Airtable/master-data writes are introduced.
+Fixes field-delta aggregation and emits compact diagnostic slices so the
+comparator can be tuned before any candidate staging or master-data writes.
 """
 
-from collections import Counter
-from typing import Any, Dict
+from collections import Counter, defaultdict
+from typing import Any, Dict, List
 
 import astrazeneca_reconciliation_canary as canary
+
+
+def _compact(candidate: Dict[str, Any]) -> str:
+    asset = (
+        candidate.get("asset")
+        or candidate.get("brand")
+        or candidate.get("molecule")
+        or candidate.get("developmentCode")
+        or "?"
+    )
+    indication = candidate.get("indication") or "?"
+    phase = candidate.get("phase") or "?"
+    classification = candidate.get("classification") or "?"
+    existing = candidate.get("existingPortfolioRecordIds") or []
+    method = candidate.get("matchMethod") or "No Match"
+    evidence = candidate.get("matchEvidence") or []
+    deltas = candidate.get("fieldDeltas") or []
+    return (
+        f"{classification}|{phase}|{asset}|{indication}|"
+        f"existing={len(existing)}|method={method}|evidence={evidence}|delta={deltas}"
+    )
 
 
 async def run_canary_fixed() -> Dict[str, Any]:
@@ -30,25 +50,28 @@ async def run_canary_fixed() -> Dict[str, Any]:
     summary = dict(result.summary)
 
     delta_counts = Counter()
+    confidence_counts = Counter()
+    method_counts = Counter()
+    phase_class_counts = Counter()
+    class_samples: Dict[str, List[str]] = defaultdict(list)
+
     for candidate in result.candidates:
+        classification = str(candidate.get("classification") or "UNKNOWN")
+        phase = str(candidate.get("phase") or "UNKNOWN")
+        phase_class_counts[f"{phase}|{classification}"] += 1
+        confidence_counts[str(candidate.get("matchConfidence") or "Unknown")] += 1
+        method_counts[str(candidate.get("matchMethod") or "No Match")] += 1
         for delta in candidate.get("fieldDeltas") or []:
             if isinstance(delta, dict) and delta.get("field"):
                 delta_counts[str(delta["field"])] += 1
+        if len(class_samples[classification]) < 12:
+            class_samples[classification].append(_compact(candidate))
 
     unresolved = [
-        canary._compact_candidate(c)
+        _compact(c)
         for c in result.candidates
         if c.get("classification") not in {"MATCHED", "EXCLUDED BY RULE"}
     ]
-
-    # Include small quality diagnostics so we can assess whether discovery is
-    # producing useful candidates or systematic false positives before staging.
-    confidence_counts = Counter(
-        str(c.get("matchConfidence") or "Unknown") for c in result.candidates
-    )
-    method_counts = Counter(
-        str(c.get("matchMethod") or "No Match") for c in result.candidates
-    )
 
     return {
         "version": result.version,
@@ -56,9 +79,11 @@ async def run_canary_fixed() -> Dict[str, Any]:
         "commercialInScopeRows": len(source_in_scope),
         "portfolioSnapshotRows": len(canary.PORTFOLIO_SNAPSHOT),
         "summary": summary,
+        "phaseClassification": dict(sorted(phase_class_counts.items())),
         "fieldDeltaCounts": dict(delta_counts),
         "matchConfidence": dict(confidence_counts),
         "matchMethods": dict(method_counts),
+        "classificationSamples": dict(class_samples),
         "unresolvedCount": len(unresolved),
         "unresolvedSample": unresolved[:30],
     }

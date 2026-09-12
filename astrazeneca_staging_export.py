@@ -17,10 +17,11 @@ import portfolio_discovery_extension_v12  # noqa: F401
 import portfolio_discovery_extension_v13  # noqa: F401
 import portfolio_discovery_extension_v14  # noqa: F401
 import astrazeneca_pipeline_adapter as az
+import astrazeneca_pipeline_adapter_v13  # noqa: F401 - patches source parsing globals
 from astrazeneca_reconciliation_canary import PORTFOLIO_SNAPSHOT, SNAPSHOT_AS_OF, _to_source_row
 
 
-EXPORT_VERSION = "V1.1 ASTRAZENECA DISCOVERY STAGING EXPORT - READ ONLY"
+EXPORT_VERSION = "V1.2 ASTRAZENECA DISCOVERY STAGING EXPORT - SOURCE HYGIENE QA"
 STAGE_CLASSES = {
     "NEW ASSET",
     "NEW INDICATION",
@@ -76,6 +77,7 @@ async def _build_staging() -> Tuple[Dict[str, Any], List[Dict[str, Any]]]:
     summary = {
         "ok": True,
         "exportVersion": EXPORT_VERSION,
+        "adapterVersion": az.AZ_PIPELINE_VERSION,
         "comparatorVersion": result.version,
         "batchRunId": request.batchRunId,
         "sourceRows": len(source_all),
@@ -96,6 +98,7 @@ async def run_staging_export() -> Dict[str, Any]:
             + json.dumps(
                 {
                     "exportVersion": EXPORT_VERSION,
+                    "adapterVersion": summary["adapterVersion"],
                     "comparatorVersion": summary["comparatorVersion"],
                     "batchRunId": summary["batchRunId"],
                     "ordinal": idx,

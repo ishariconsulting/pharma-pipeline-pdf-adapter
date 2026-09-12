@@ -7,6 +7,7 @@ a count-only probe is public so deployments can be validated without exposing
 arbitrary-fetch capability.
 """
 
+import asyncio
 import hashlib
 import re
 from collections import Counter
@@ -21,7 +22,7 @@ from main import _auth, app
 from html_fetch_extension import _assert_public_http_url
 
 
-AZ_PIPELINE_VERSION = "V1.0.0 ASTRAZENECA OFFICIAL PIPELINE READ ONLY"
+AZ_PIPELINE_VERSION = "V1.1.0 ASTRAZENECA OFFICIAL PIPELINE READ ONLY"
 AZ_PIPELINE_URL = "https://www.astrazeneca.com/our-therapy-areas/pipeline.html"
 AZ_SOURCE_FAMILY = "AstraZeneca Official Pipeline"
 AZ_COMPANY = "AstraZeneca"
@@ -128,11 +129,34 @@ class _PipelineHTMLParser(HTMLParser):
         self._heading_buf: List[str] = []
         self._li_depth = 0
         self._li_buf: List[str] = []
+        self._a_depth = 0
+        self._a_buf: List[str] = []
         self.current_area: Optional[str] = None
         self.current_as_of: Optional[str] = None
         self.current_phase: Optional[str] = None
         self.in_removed = False
         self.rows: List[Dict[str, Any]] = []
+
+    def _append_current(self, text: str) -> None:
+        text = _clean(text)
+        if not self.current_area or not _looks_like_pipeline_item(text):
+            return
+        if self.in_removed:
+            self.rows.append({
+                "therapyArea": self.current_area,
+                "sourceAsOf": self.current_as_of,
+                "phase": "Removed",
+                "programText": text,
+                "removedSinceLastQuarter": True,
+            })
+        elif self.current_phase:
+            self.rows.append({
+                "therapyArea": self.current_area,
+                "sourceAsOf": self.current_as_of,
+                "phase": self.current_phase,
+                "programText": text,
+                "removedSinceLastQuarter": False,
+            })
 
     def handle_starttag(self, tag: str, attrs: List[tuple[str, Optional[str]]]) -> None:
         tag = tag.lower()
@@ -143,12 +167,18 @@ class _PipelineHTMLParser(HTMLParser):
             self._li_depth += 1
             if self._li_depth == 1:
                 self._li_buf = []
+        if tag == "a" and self.current_area:
+            self._a_depth += 1
+            if self._a_depth == 1:
+                self._a_buf = []
 
     def handle_data(self, data: str) -> None:
         if self._heading_tag:
             self._heading_buf.append(data)
         if self._li_depth > 0:
             self._li_buf.append(data)
+        if self._a_depth > 0:
+            self._a_buf.append(data)
 
     def handle_endtag(self, tag: str) -> None:
         tag = tag.lower()
@@ -168,26 +198,15 @@ class _PipelineHTMLParser(HTMLParser):
             self._heading_tag = None
             self._heading_buf = []
 
+        if tag == "a" and self._a_depth > 0:
+            if self._a_depth == 1:
+                self._append_current(" ".join(self._a_buf))
+                self._a_buf = []
+            self._a_depth -= 1
+
         if tag == "li" and self._li_depth > 0:
             if self._li_depth == 1:
-                text = _clean(" ".join(self._li_buf))
-                if self.current_area and _looks_like_pipeline_item(text):
-                    if self.in_removed:
-                        self.rows.append({
-                            "therapyArea": self.current_area,
-                            "sourceAsOf": self.current_as_of,
-                            "phase": "Removed",
-                            "programText": text,
-                            "removedSinceLastQuarter": True,
-                        })
-                    elif self.current_phase:
-                        self.rows.append({
-                            "therapyArea": self.current_area,
-                            "sourceAsOf": self.current_as_of,
-                            "phase": self.current_phase,
-                            "programText": text,
-                            "removedSinceLastQuarter": False,
-                        })
+                self._append_current(" ".join(self._li_buf))
                 self._li_buf = []
             self._li_depth -= 1
 
@@ -211,7 +230,6 @@ def _split_program_text(text: str) -> Dict[str, Optional[str]]:
     if code_match:
         result["developmentCode"] = _clean(code_match.group(0))
 
-    # Development code is the displayed asset.
     if code_match and code_match.start() == 0:
         result["asset"] = _clean(code_match.group(0))
         rest = _clean(text[code_match.end():])
@@ -220,7 +238,6 @@ def _split_program_text(text: str) -> Dict[str, Optional[str]]:
         result["parseNotes"] = "Leading development-code identity"
         return result
 
-    # Named molecule followed by a development code in parentheses.
     paren_code = re.match(r"^(.+?)\s*\(([^)]+)\)\s+(.+)$", text)
     if paren_code and CODE_RE.fullmatch(_clean(paren_code.group(2))):
         named = _clean(paren_code.group(1))
@@ -232,7 +249,6 @@ def _split_program_text(text: str) -> Dict[str, Optional[str]]:
         result["parseNotes"] = "Named molecule with parenthetical development code"
         return result
 
-    # Brand / pipeline name with molecule in parentheses.
     brand_molecule = re.match(r"^([^()+/]+?)\s*\(([^)]+)\)\s+(.+)$", text)
     if brand_molecule:
         brand = _clean(brand_molecule.group(1))
@@ -269,9 +285,6 @@ def _split_program_text(text: str) -> Dict[str, Optional[str]]:
     elif asset:
         result["molecule"] = asset
 
-    # Study/program token immediately after the asset is kept in source-facing
-    # indication text. Comparator V1.2 treats it as qualifier evidence and does
-    # not rely on fuzzy matching.
     result["indication"] = rest or None
     result["parseStatus"] = "PASS" if asset and rest else "REVIEW"
     result["parseNotes"] = "Conservative leading-identity parse"
@@ -383,7 +396,7 @@ def _summarize(rows: List[AZPipelineRow]) -> Dict[str, Any]:
 def _self_test() -> Dict[str, Any]:
     fixture = """
     <h2>Oncology (as of 27 July 2026)</h2>
-    <h3>Phase I</h3><ul><li>AZD0240 solid tumours</li></ul>
+    <h3>Phase I</h3><ul><li><a>AZD0240 solid tumours</a></li></ul>
     <h3>Phase II</h3><ul><li>AZD0120 multiple myeloma</li><li>Etcamah (camizestrant) HR+ HER2- breast cancer</li></ul>
     <h3>Phase III</h3><ul><li>zadavotide guraxetan (AZD2265) VECTRA-01 prostate cancer (mCRPC)</li></ul>
     <h3>LCM Projects</h3><ul><li>Tagrisso ADAURA2 EGFRm NSCLC stage Ia2-Ia3 following complete tumour resection</li></ul>
@@ -392,6 +405,7 @@ def _self_test() -> Dict[str, Any]:
     rows = parse_pipeline_html(fixture)
     by_text = {r.programText: r for r in rows}
     checks = {
+        "anchor_or_li_dedup": sum(1 for r in rows if r.programText == "AZD0240 solid tumours") == 1,
         "phase1_parsed": by_text["AZD0240 solid tumours"].phase == "Phase 1",
         "phase2_commercial": by_text["AZD0120 multiple myeloma"].commercialInScope,
         "brand_molecule": (
@@ -413,6 +427,28 @@ def _self_test() -> Dict[str, Any]:
 SELF_TEST = _self_test()
 if not SELF_TEST["ok"]:
     raise RuntimeError(f"AstraZeneca pipeline adapter self-test failed: {SELF_TEST}")
+
+
+async def _startup_live_probe() -> None:
+    try:
+        raw_html = await _fetch_source_html()
+        rows = parse_pipeline_html(raw_html)
+        in_scope = [r for r in rows if r.commercialInScope]
+        summary = _summarize(rows)
+        print(
+            "AZ_PIPELINE_STARTUP_PROBE "
+            f"ok={bool(rows)} total={len(rows)} in_scope={len(in_scope)} "
+            f"as_of={summary['sourceAsOfValues']} phases={summary['summaryByPhase']} "
+            f"areas={summary['summaryByTherapyArea']} parse={summary['parseStatusSummary']}",
+            flush=True,
+        )
+    except Exception as exc:
+        print(f"AZ_PIPELINE_STARTUP_PROBE ok=False error={type(exc).__name__}:{exc}", flush=True)
+
+
+@app.on_event("startup")
+async def _schedule_astrazeneca_startup_probe() -> None:
+    asyncio.create_task(_startup_live_probe())
 
 
 @app.get("/discover/astrazeneca/pipeline/health")

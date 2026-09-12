@@ -11,7 +11,13 @@ from typing import Any, Dict, List, Optional, Tuple
 import portfolio_discovery_extension_v11 as base
 
 
-DISCOVERY_VERSION = "V1.2.0 PORTFOLIO DISCOVERY READ ONLY - HYBRID PHASE AWARE"
+DISCOVERY_VERSION = "V1.2.1 PORTFOLIO DISCOVERY READ ONLY - HYBRID PHASE AWARE"
+
+# Capture the V1.1 implementations BEFORE patching module globals. Any V1.2
+# fallback must call these stable references, never base._phase_canonical after
+# it has been replaced by V1.2 (which would recurse).
+_original_phase_canonical = base._phase_canonical
+_original_compare = base.compare_discovery
 
 
 def _phase_canonical_v12(value: Any) -> str:
@@ -50,7 +56,7 @@ def _phase_canonical_v12(value: Any) -> str:
             stages = sorted(stages, key=int)
             return "phase " + " ".join(stages)
 
-    return base._phase_canonical(value)
+    return _original_phase_canonical(value)
 
 
 def _commercial_decision_v12(
@@ -84,9 +90,6 @@ def _commercial_decision_v12(
         return "Exclude", ["Legacy / Low Commercial Value"], "Phase 1 is excluded unless explicitly strategic under COMMERCIAL_PORTFOLIO_V1."
 
     return "Review", ["Insufficient Evidence"], "No deterministic commercial inclusion signal or eligible development phase."
-
-
-_original_compare = base.compare_discovery
 
 
 def _compare_discovery_v12(request: base.DiscoveryCompareRequest) -> base.DiscoveryCompareResponse:
@@ -129,6 +132,10 @@ def _v12_self_test() -> Dict[str, Any]:
             and decision == expected_decision
             and expected_basis in basis
         )
+
+    # Regression for a non-phase Portfolio value: this was the recursion edge
+    # exposed by AstraZeneca marketed records during the live canary.
+    checks["approved_fallback_no_recursion"] = _phase_canonical_v12("Approved") == _original_phase_canonical("Approved")
 
     regression = base._self_test()
     checks["v11_regression"] = bool(regression.get("ok"))

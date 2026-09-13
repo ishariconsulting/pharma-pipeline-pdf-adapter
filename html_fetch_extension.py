@@ -13,7 +13,7 @@ from pydantic import BaseModel
 from main import _auth, app
 
 
-HTML_FETCH_VERSION = "V2.41.1 EXTERNAL HTML FETCH EXTENSION"
+HTML_FETCH_VERSION = "V2.41.2 EXTERNAL HTML FETCH EXTENSION"
 HTML_FETCH_MAX_BYTES = 2_500_000
 HTML_FETCH_VISIBLE_TEXT_MAX = 200_000
 HTML_FETCH_MAX_ANCHORS = 400
@@ -151,7 +151,10 @@ async def _assert_public_http_url(url: str) -> None:
             raise HTTPException(status_code=400, detail="Local/private source addresses are not allowed")
 
 
-async def _fetch_public_html(url: str) -> HtmlFetchResponse:
+async def _fetch_public_html(
+    url: str,
+    timeout_seconds: float = 35.0,
+) -> HtmlFetchResponse:
     headers = {
         "User-Agent": (
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -164,7 +167,15 @@ async def _fetch_public_html(url: str) -> HtmlFetchResponse:
         "Pragma": "no-cache",
     }
 
-    timeout = httpx.Timeout(35.0, connect=12.0)
+    connect_timeout = min(
+        12.0,
+        max(5.0, timeout_seconds * 0.4),
+    )
+
+    timeout = httpx.Timeout(
+        timeout_seconds,
+        connect=connect_timeout,
+    )
     current_url = url
     response: Optional[httpx.Response] = None
 
@@ -232,10 +243,18 @@ async def fetch_html_health() -> Dict[str, Any]:
 @app.get("/fetch/html", response_model=HtmlFetchResponse)
 async def fetch_html(
     url: str = Query(..., min_length=8),
+    timeout_seconds: float = Query(
+        default=35.0,
+        ge=5.0,
+        le=35.0,
+    ),
     x_adapter_key: Optional[str] = Header(default=None),
 ) -> HtmlFetchResponse:
     _auth(x_adapter_key)
-    return await _fetch_public_html(url)
+    return await _fetch_public_html(
+        url,
+        timeout_seconds=timeout_seconds,
+    )
 
 
 # Additive route registration only. Importing these modules does not alter any

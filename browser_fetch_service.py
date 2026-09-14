@@ -1,0 +1,348 @@
+"""Read-only browser retrieval worker for public pharma source pages.
+
+This service exists only to retrieve public pages that cannot be reliably fetched
+through normal server-side HTTP (for example JavaScript-rendered pages or sources
+that return 403/408 to a simple machine client). It never writes to Airtable or
+any master-data store.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import html as html_lib
+import ipaddress
+import os
+import re
+import socket
+from typing import Any, Dict, List, Optional, Set
+from urllib.parse import urljoin, urlparse
+
+from fastapi import FastAPI, Header, HTTPException, Query
+from pydantic import BaseModel
+from playwright.async_api import Browser, BrowserContext, Page, async_playwright
+
+
+BROWSER_FETCH_VERSION = "BROWSER_RETRIEVAL_V1.0"
+MAX_VISIBLE_TEXT = 200_000
+MAX_HTML_BYTES = 2_500_000
+MAX_ANCHORS = 400
+MAX_HEADINGS = 100
+DEFAULT_TIMEOUT_SECONDS = 35.0
+
+LILLY_CANARY_URL = "https://www.lilly.com/science/research-development/pipeline"
+BAYER_CANARY_URL = "https://www.bayer.com/en/pharma/development-pipeline"
+
+app = FastAPI(
+    title="Pharma Browser Retrieval Worker",
+    version=BROWSER_FETCH_VERSION,
+    description="Read-only browser transport for public pharma intelligence sources.",
+)
+
+
+class BrowserFetchResponse(BaseModel):
+    version: str
+    sourceUrl: str
+    finalUrl: str
+    httpStatus: int
+    contentType: Optional[str] = None
+    bodyBytes: int
+    title: Optional[str] = None
+    metaDescription: Optional[str] = None
+    visibleTextLength: int
+    visibleText: str
+    headings: List[Dict[str, Any]]
+    anchors: List[Dict[str, str]]
+    transport: str = "PLAYWRIGHT_CHROMIUM"
+    retrievalMode: str = "BROWSER_REQUIRED"
+
+
+def _auth(x_browser_key: Optional[str]) -> None:
+    expected = os.getenv("BROWSER_FETCH_KEY", "").strip()
+    if not expected:
+        raise HTTPException(status_code=503, detail="Browser worker key is not configured")
+    if x_browser_key != expected:
+        raise HTTPException(status_code=401, detail="Invalid browser worker key")
+
+
+def _strip_html(raw_html: str) -> str:
+    text = raw_html or ""
+    text = re.sub(r"<!--[\s\S]*?-->", " ", text)
+    text = re.sub(r"<script\b[^>]*>[\s\S]*?</script>", " ", text, flags=re.I)
+    text = re.sub(r"<style\b[^>]*>[\s\S]*?</style>", " ", text, flags=re.I)
+    text = re.sub(r"<noscript\b[^>]*>[\s\S]*?</noscript>", " ", text, flags=re.I)
+    text = re.sub(r"<svg\b[^>]*>[\s\S]*?</svg>", " ", text, flags=re.I)
+    text = re.sub(r"<[^>]+>", " ", text)
+    text = html_lib.unescape(text)
+    return re.sub(r"\s+", " ", text).strip()
+
+
+async def _resolve_public_host(host: str, port: int) -> None:
+    try:
+        loop = asyncio.get_running_loop()
+        infos = await loop.getaddrinfo(host, port, type=socket.SOCK_STREAM)
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"Could not resolve source host: {exc}") from exc
+
+    addresses = {info[4][0] for info in infos if info and info[4]}
+    if not addresses:
+        raise HTTPException(status_code=502, detail="Source host resolved to no addresses")
+
+    for addr in addresses:
+        try:
+            ip = ipaddress.ip_address(addr.split("%", 1)[0])
+        except ValueError:
+            continue
+        if (
+            ip.is_private
+            or ip.is_loopback
+            or ip.is_link_local
+            or ip.is_reserved
+            or ip.is_multicast
+            or ip.is_unspecified
+        ):
+            raise HTTPException(status_code=400, detail="Local/private source addresses are not allowed")
+
+
+async def _assert_public_http_url(url: str, validated_hosts: Optional[Set[str]] = None) -> None:
+    parsed = urlparse(url)
+    if parsed.scheme not in {"http", "https"}:
+        raise HTTPException(status_code=400, detail="Only http/https URLs are allowed")
+    if not parsed.hostname:
+        raise HTTPException(status_code=400, detail="URL hostname is required")
+    if parsed.username or parsed.password:
+        raise HTTPException(status_code=400, detail="URL credentials are not allowed")
+
+    host = parsed.hostname.strip().lower()
+    if host in {"localhost", "localhost.localdomain"} or host.endswith(".local"):
+        raise HTTPException(status_code=400, detail="Local/private hosts are not allowed")
+
+    if validated_hosts is not None and host in validated_hosts:
+        return
+
+    await _resolve_public_host(host, parsed.port or (443 if parsed.scheme == "https" else 80))
+    if validated_hosts is not None:
+        validated_hosts.add(host)
+
+
+async def _install_request_guard(page: Page) -> None:
+    validated_hosts: Set[str] = set()
+
+    async def guard(route) -> None:
+        request = route.request
+        parsed = urlparse(request.url)
+
+        if request.resource_type in {"image", "media", "font"}:
+            await route.abort()
+            return
+
+        if parsed.scheme in {"data", "blob"}:
+            await route.continue_()
+            return
+
+        try:
+            await _assert_public_http_url(request.url, validated_hosts)
+        except HTTPException:
+            await route.abort()
+            return
+
+        await route.continue_()
+
+    await page.route("**/*", guard)
+
+
+async def _extract_rendered(page: Page, source_url: str, response_status: int) -> BrowserFetchResponse:
+    raw_html = await page.content()
+    encoded = raw_html.encode("utf-8", errors="ignore")
+    if len(encoded) > MAX_HTML_BYTES:
+        raise HTTPException(status_code=413, detail="Rendered HTML exceeds fetch size limit")
+
+    title = (await page.title()).strip() or None
+    final_url = page.url
+    await _assert_public_http_url(final_url)
+
+    try:
+        visible_text = await page.locator("body").inner_text(timeout=5_000)
+    except Exception:
+        visible_text = _strip_html(raw_html)
+    visible_text = re.sub(r"\s+", " ", visible_text or "").strip()
+
+    try:
+        meta_description = await page.locator('meta[name="description"]').get_attribute("content", timeout=2_000)
+    except Exception:
+        meta_description = None
+    if not meta_description:
+        try:
+            meta_description = await page.locator('meta[property="og:description"]').get_attribute("content", timeout=2_000)
+        except Exception:
+            meta_description = None
+    if meta_description:
+        meta_description = meta_description.strip()[:500] or None
+
+    headings = await page.evaluate(
+        """(limit) => Array.from(document.querySelectorAll('h1,h2,h3,h4'))
+          .map((el) => ({level: Number(el.tagName.substring(1)), text: (el.innerText || el.textContent || '').replace(/\\s+/g,' ').trim().slice(0,240)}))
+          .filter((x) => x.text && !x.text.includes('{{') && !x.text.includes('}}'))
+          .slice(0, limit)""",
+        MAX_HEADINGS,
+    )
+
+    raw_anchors = await page.evaluate(
+        """(limit) => Array.from(document.querySelectorAll('a[href]'))
+          .map((el) => ({text: (el.innerText || el.textContent || '').replace(/\\s+/g,' ').trim().slice(0,240), href: el.getAttribute('href') || ''}))
+          .filter((x) => x.text && x.href && !x.href.startsWith('#') && !x.href.startsWith('javascript:') && !x.href.startsWith('mailto:') && !x.href.startsWith('tel:'))
+          .slice(0, limit)""",
+        MAX_ANCHORS * 2,
+    )
+
+    anchors: List[Dict[str, str]] = []
+    seen = set()
+    for item in raw_anchors:
+        try:
+            absolute = urljoin(final_url, item.get("href", ""))
+            parsed = urlparse(absolute)
+            if parsed.scheme not in {"http", "https"}:
+                continue
+        except Exception:
+            continue
+        key = (item.get("text", "").lower(), absolute)
+        if key in seen:
+            continue
+        seen.add(key)
+        anchors.append({"text": item.get("text", ""), "url": absolute})
+        if len(anchors) >= MAX_ANCHORS:
+            break
+
+    return BrowserFetchResponse(
+        version=BROWSER_FETCH_VERSION,
+        sourceUrl=source_url,
+        finalUrl=final_url,
+        httpStatus=response_status,
+        contentType="text/html; rendered=chromium",
+        bodyBytes=len(encoded),
+        title=title,
+        metaDescription=meta_description,
+        visibleTextLength=len(visible_text),
+        visibleText=visible_text[:MAX_VISIBLE_TEXT],
+        headings=headings,
+        anchors=anchors,
+    )
+
+
+async def _browser_fetch(url: str, timeout_seconds: float = DEFAULT_TIMEOUT_SECONDS) -> BrowserFetchResponse:
+    await _assert_public_http_url(url)
+    timeout_ms = int(timeout_seconds * 1000)
+
+    async with async_playwright() as pw:
+        browser: Browser = await pw.chromium.launch(
+            headless=True,
+            args=["--no-sandbox", "--disable-dev-shm-usage", "--disable-gpu"],
+        )
+        context: Optional[BrowserContext] = None
+        try:
+            context = await browser.new_context(
+                user_agent=(
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                    "AppleWebKit/537.36 (KHTML, like Gecko) "
+                    "Chrome/124.0.0.0 Safari/537.36"
+                ),
+                locale="en-GB",
+                viewport={"width": 1365, "height": 900},
+                java_script_enabled=True,
+            )
+            page = await context.new_page()
+            await _install_request_guard(page)
+
+            try:
+                response = await page.goto(url, wait_until="domcontentloaded", timeout=timeout_ms)
+            except Exception as exc:
+                raise HTTPException(status_code=504, detail=f"Browser navigation failed: {type(exc).__name__}") from exc
+
+            if response is None:
+                raise HTTPException(status_code=502, detail="Browser navigation returned no document response")
+
+            status = int(response.status)
+            if status >= 400:
+                raise HTTPException(status_code=502, detail=f"Browser source returned HTTP {status}")
+
+            try:
+                await page.wait_for_load_state("networkidle", timeout=min(10_000, timeout_ms))
+            except Exception:
+                pass
+
+            await page.wait_for_timeout(1_000)
+            return await _extract_rendered(page, url, status)
+        finally:
+            if context is not None:
+                await context.close()
+            await browser.close()
+
+
+@app.get("/health")
+async def health() -> Dict[str, Any]:
+    return {
+        "ok": True,
+        "version": BROWSER_FETCH_VERSION,
+        "service": "pharma-browser-retrieval",
+        "writeMode": "READ_ONLY",
+    }
+
+
+@app.get("/fetch/browser", response_model=BrowserFetchResponse)
+async def fetch_browser(
+    url: str = Query(..., min_length=8),
+    timeout_seconds: float = Query(DEFAULT_TIMEOUT_SECONDS, ge=5.0, le=35.0),
+    x_browser_key: Optional[str] = Header(default=None),
+) -> BrowserFetchResponse:
+    _auth(x_browser_key)
+    return await _browser_fetch(url, timeout_seconds=timeout_seconds)
+
+
+async def _run_canary(url: str, expected_terms: List[str]) -> Dict[str, Any]:
+    try:
+        result = await _browser_fetch(url, timeout_seconds=35.0)
+        text = result.visibleText.lower()
+        matched = [term for term in expected_terms if term.lower() in text]
+        return {
+            "ok": bool(result.httpStatus == 200 and result.visibleTextLength >= 800 and matched),
+            "version": BROWSER_FETCH_VERSION,
+            "sourceUrl": url,
+            "finalUrl": result.finalUrl,
+            "httpStatus": result.httpStatus,
+            "visibleTextLength": result.visibleTextLength,
+            "title": result.title,
+            "matchedExpectedTerms": matched,
+            "transport": result.transport,
+            "retrievalMode": result.retrievalMode,
+        }
+    except HTTPException as exc:
+        return {
+            "ok": False,
+            "version": BROWSER_FETCH_VERSION,
+            "sourceUrl": url,
+            "errorStatus": exc.status_code,
+            "error": str(exc.detail),
+        }
+    except Exception as exc:
+        return {
+            "ok": False,
+            "version": BROWSER_FETCH_VERSION,
+            "sourceUrl": url,
+            "errorStatus": 500,
+            "error": type(exc).__name__,
+        }
+
+
+@app.get("/canary/lilly")
+async def canary_lilly() -> Dict[str, Any]:
+    return await _run_canary(
+        LILLY_CANARY_URL,
+        ["pipeline", "phase"],
+    )
+
+
+@app.get("/canary/bayer")
+async def canary_bayer() -> Dict[str, Any]:
+    return await _run_canary(
+        BAYER_CANARY_URL,
+        ["pipeline", "phase"],
+    )

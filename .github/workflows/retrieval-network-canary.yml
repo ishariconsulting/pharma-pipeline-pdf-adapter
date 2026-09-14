@@ -1,0 +1,34 @@
+name: Retrieval Network Canary
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - "retrieval_network_canary.py"
+      - ".github/workflows/retrieval-network-canary.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  alternate-network-canary:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install canary dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install httpx==0.28.1 playwright==1.55.0
+          python -m playwright install --with-deps chromium
+
+      - name: Run read-only alternate-network canary
+        run: python retrieval_network_canary.py

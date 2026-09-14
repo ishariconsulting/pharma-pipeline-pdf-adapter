@@ -8,7 +8,7 @@ investor presentation rather than the intermittently blocked live pipeline page.
 
 The canary downloads the official investor PDF, locates the Lilly Select Pipeline
 slide, extracts programme cells from PDF vector geometry, separates asset vs
-indication using source text colour, and emits structured rows.
+indication using source typography, and emits structured rows.
 
 NO Airtable or master-data writes are performed.
 """
@@ -24,7 +24,7 @@ from typing import Any, Dict, List, Tuple
 import fitz  # PyMuPDF
 import httpx
 
-VERSION = "LILLY_STATIC_DOCUMENT_CANARY_V1.0_READ_ONLY"
+VERSION = "LILLY_STATIC_DOCUMENT_CANARY_V1.1_READ_ONLY"
 SOURCE_URL = "https://investor.lilly.com/static-files/ab69001c-650b-44f6-b629-309ee33f2335"
 EXPECTED_SOURCE_DATE = "August 3, 2026"
 
@@ -51,14 +51,14 @@ def is_red(color: int) -> bool:
     r = (int(color) >> 16) & 255
     g = (int(color) >> 8) & 255
     b = int(color) & 255
-    return r >= 150 and g <= 110 and b <= 110
+    return r >= 150 and g <= 130 and b <= 130
 
 
-def is_black(color: int) -> bool:
-    r = (int(color) >> 16) & 255
-    g = (int(color) >> 8) & 255
-    b = int(color) & 255
-    return max(r, g, b) <= 95
+def is_italic(span: Dict[str, Any]) -> bool:
+    font = str(span.get("font", "")).lower()
+    flags = int(span.get("flags", 0))
+    # PyMuPDF TEXT_FONT_ITALIC is bit 1; retain a font-name fallback.
+    return bool(flags & 2) or "italic" in font or "oblique" in font
 
 
 def download_pdf() -> bytes:
@@ -103,8 +103,6 @@ def candidate_cell_rects(page: fitz.Page) -> List[fitz.Rect]:
                 continue
             r = fitz.Rect(item[1])
             rw, rh = r.width / w, r.height / h
-            # Pipeline programme cells are ~11.5% page width and ~5.5% page height.
-            # Keep a deliberately bounded envelope and exclude legend / banners.
             if not (0.09 <= rw <= 0.135 and 0.035 <= rh <= 0.08):
                 continue
             if r.y0 < 0.16 * h or r.y1 > 0.88 * h:
@@ -130,6 +128,8 @@ def spans_in_rect(page_dict: Dict[str, Any], rect: fitz.Rect) -> List[Dict[str, 
                                 "color": int(span.get("color", 0)),
                                 "bbox": tuple(float(x) for x in srect),
                                 "size": float(span.get("size", 0)),
+                                "font": str(span.get("font", "")),
+                                "flags": int(span.get("flags", 0)),
                             }
                         )
     return sorted(out, key=lambda s: (s["bbox"][1], s["bbox"][0]))
@@ -138,7 +138,6 @@ def spans_in_rect(page_dict: Dict[str, Any], rect: fitz.Rect) -> List[Dict[str, 
 def join_spans(spans: List[Dict[str, Any]]) -> str:
     if not spans:
         return ""
-    # Build line-aware text so wrapped asset names stay ordered.
     lines: List[List[Dict[str, Any]]] = []
     for span in spans:
         cy = (span["bbox"][1] + span["bbox"][3]) / 2
@@ -191,12 +190,14 @@ def parse_pipeline(page: fitz.Page) -> Tuple[List[Dict[str, Any]], Dict[str, Any
         if any(k in n for k in ["addition or milestone achieved", "updates since"]):
             continue
 
-        black = [s for s in spans if is_black(s["color"])]
-        red = [s for s in spans if is_red(s["color"])]
-        asset = join_spans(black)
-        indication = join_spans(red)
+        # Lilly encodes the programme name in upright text and the indication in
+        # italic text. Colour is retained as an additional signal, but typography
+        # is the primary split because PDF extraction normalises some red glyphs.
+        indication_spans = [s for s in spans if is_italic(s) or is_red(s["color"])]
+        asset_spans = [s for s in spans if s not in indication_spans]
+        asset = join_spans(asset_spans)
+        indication = join_spans(indication_spans)
 
-        # Ignore non-programme boxes and fail closed on malformed programme-looking boxes.
         if not asset or not indication:
             rejected.append(
                 {
@@ -204,6 +205,15 @@ def parse_pipeline(page: fitz.Page) -> Tuple[List[Dict[str, Any]], Dict[str, Any
                     "asset": asset,
                     "indication": indication,
                     "rect": [round(v, 2) for v in (rect.x0, rect.y0, rect.x1, rect.y1)],
+                    "spans": [
+                        {
+                            "text": s["text"],
+                            "font": s["font"],
+                            "flags": s["flags"],
+                            "color": s["color"],
+                        }
+                        for s in spans[:8]
+                    ],
                 }
             )
             continue
@@ -219,7 +229,6 @@ def parse_pipeline(page: fitz.Page) -> Tuple[List[Dict[str, Any]], Dict[str, Any
             }
         )
 
-    # Deterministic de-duplication.
     deduped: List[Dict[str, Any]] = []
     seen = set()
     for row in rows:
@@ -232,7 +241,7 @@ def parse_pipeline(page: fitz.Page) -> Tuple[List[Dict[str, Any]], Dict[str, Any
     diagnostics = {
         "candidateCellCount": len(candidate_cell_rects(page)),
         "rejectedCellCount": len(rejected),
-        "rejectedSamples": rejected[:12],
+        "rejectedSamples": rejected[:8],
         "approvedBannerY": round(approved_y, 2),
     }
     return deduped, diagnostics

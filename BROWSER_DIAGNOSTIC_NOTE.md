@@ -1,0 +1,1 @@
+Temporary diagnostic note. Browser canary failures must report exception type and message so deployment/runtime dependency failures can be distinguished from source access failures. Remove after validation if desired.

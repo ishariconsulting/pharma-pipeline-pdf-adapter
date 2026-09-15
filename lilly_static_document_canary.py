@@ -24,7 +24,7 @@ from typing import Any, Dict, List, Tuple
 import fitz  # PyMuPDF
 import httpx
 
-VERSION = "LILLY_STATIC_DOCUMENT_CANARY_V1.1_READ_ONLY"
+VERSION = "LILLY_STATIC_DOCUMENT_CANARY_V1.2_READ_ONLY"
 SOURCE_URL = "https://investor.lilly.com/static-files/ab69001c-650b-44f6-b629-309ee33f2335"
 EXPECTED_SOURCE_DATE = "August 3, 2026"
 
@@ -57,7 +57,6 @@ def is_red(color: int) -> bool:
 def is_italic(span: Dict[str, Any]) -> bool:
     font = str(span.get("font", "")).lower()
     flags = int(span.get("flags", 0))
-    # PyMuPDF TEXT_FONT_ITALIC is bit 1; retain a font-name fallback.
     return bool(flags & 2) or "italic" in font or "oblique" in font
 
 
@@ -190,9 +189,6 @@ def parse_pipeline(page: fitz.Page) -> Tuple[List[Dict[str, Any]], Dict[str, Any
         if any(k in n for k in ["addition or milestone achieved", "updates since"]):
             continue
 
-        # Lilly encodes the programme name in upright text and the indication in
-        # italic text. Colour is retained as an additional signal, but typography
-        # is the primary split because PDF extraction normalises some red glyphs.
         indication_spans = [s for s in spans if is_italic(s) or is_red(s["color"])]
         asset_spans = [s for s in spans if s not in indication_spans]
         asset = join_spans(asset_spans)
@@ -291,6 +287,7 @@ def main() -> int:
                 "sourceDate": source_date,
                 "projectCount": len(rows),
                 "phaseCounts": dict(counts),
+                "projects": rows,
                 "orforglipronRows": orforglipron,
                 "sampleProjects": rows[:12],
                 "diagnostics": diagnostics,

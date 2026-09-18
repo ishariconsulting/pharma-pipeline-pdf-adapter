@@ -34,19 +34,24 @@ from generic_pipeline_interpreter_canary import (
 )
 
 
-ROUTE_VERSION = "GENERIC_PIPELINE_EXTRACTION_V1.0_READ_ONLY"
+ADAPTER_PROFILE = "PIPELINE_GENERIC_HTML_V1"
+ROUTE_VERSION = "GENERIC_PIPELINE_EXTRACTION_V1.1_READ_ONLY"
 
 
 class GenericPipelineExtractionResponse(BaseModel):
     version: str
+    routeVersion: str
     interpreterVersion: str
     company: str
     sourceUrl: str
     finalUrl: str
+    sourceDate: Optional[str] = None
     readOnly: bool
     readyForDiscovery: bool
     rowCount: int
     rows: List[Dict[str, Any]]
+    summary: Dict[str, Any]
+    issues: List[Dict[str, Any]]
     diagnostics: Dict[str, Any]
     validation: Dict[str, Any]
     guardrails: Dict[str, Any]
@@ -167,21 +172,49 @@ async def _extract_generic_pipeline(
         diagnostics,
     )
 
-    row_payloads = [
-        row.as_discovery_contract()
-        for row in rows
+    row_payloads: List[Dict[str, Any]] = []
+    for row in rows:
+        payload = row.as_discovery_contract()
+        payload["sourceAdapter"] = ADAPTER_PROFILE
+        payload["sourceCardOrdinal"] = payload.get("sourceOrdinal")
+        payload["sourceTherapeuticArea"] = payload.get("therapeuticArea", "")
+        row_payloads.append(payload)
+
+    structural_pass = bool(validation.get("pass"))
+    issues = [
+        {"issue": str(issue)}
+        for issue in validation.get("issues", [])
     ]
+    summary = {
+        "structuralValidationPass": structural_pass,
+        "actual": {
+            "Total": len(row_payloads),
+        },
+        "productionStatus": (
+            "READY FOR AIRTABLE DELTA COMPARISON"
+            if structural_pass
+            else "FAIL CLOSED - PARSER/STRUCTURE REVIEW REQUIRED"
+        ),
+        "selectedMethod": diagnostics.get("selectedMethod"),
+        "ctgovPhaseFallbackRows": diagnostics.get("ctgovPhaseFallbackRows", 0),
+        "companySpecificParserBranch": False,
+        "writeMode": "READ_ONLY",
+    }
 
     return GenericPipelineExtractionResponse(
-        version=ROUTE_VERSION,
+        version=ADAPTER_PROFILE,
+        routeVersion=ROUTE_VERSION,
         interpreterVersion=INTERPRETER_VERSION,
         company=company,
         sourceUrl=source_url,
         finalUrl=final_url,
+        sourceDate=None,
         readOnly=True,
-        readyForDiscovery=bool(validation.get("pass")),
+        readyForDiscovery=structural_pass,
         rowCount=len(row_payloads),
         rows=row_payloads,
+        summary=summary,
+        issues=issues,
         diagnostics=diagnostics,
         validation=validation,
         guardrails={
@@ -200,7 +233,8 @@ async def _extract_generic_pipeline(
 async def generic_pipeline_health() -> Dict[str, Any]:
     return {
         "ok": True,
-        "version": ROUTE_VERSION,
+        "version": ADAPTER_PROFILE,
+        "routeVersion": ROUTE_VERSION,
         "interpreterVersion": INTERPRETER_VERSION,
         "readOnly": True,
         "writeMode": "READ_ONLY",

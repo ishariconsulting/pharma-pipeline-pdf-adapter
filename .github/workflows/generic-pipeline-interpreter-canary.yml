@@ -40,8 +40,8 @@ jobs:
           from generic_pipeline_extension import _extract_generic_pipeline
 
           paths = {route.path for route in app.routes}
-          assert "/extract/generic-pipeline" in paths
-          assert "/extract/generic-pipeline/health" in paths
+          assert "/extract/generic/pipeline" in paths
+          assert "/extract/generic/pipeline/health" in paths
 
           result = asyncio.run(
               _extract_generic_pipeline(

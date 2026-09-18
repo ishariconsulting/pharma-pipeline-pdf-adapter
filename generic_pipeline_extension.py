@@ -229,7 +229,7 @@ async def _extract_generic_pipeline(
     )
 
 
-@app.get("/extract/generic-pipeline/health")
+@app.get("/extract/generic/pipeline/health")
 async def generic_pipeline_health() -> Dict[str, Any]:
     return {
         "ok": True,
@@ -242,7 +242,7 @@ async def generic_pipeline_health() -> Dict[str, Any]:
 
 
 @app.get(
-    "/extract/generic-pipeline",
+    "/extract/generic/pipeline",
     response_model=GenericPipelineExtractionResponse,
 )
 async def extract_generic_pipeline(

@@ -36,6 +36,7 @@ import re
 import sys
 import unicodedata
 from dataclasses import dataclass, asdict
+from functools import lru_cache
 from html.parser import HTMLParser
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
@@ -241,12 +242,68 @@ def phase_canonical(value: Any) -> str:
 
 
 def trial_ids(value: Any) -> List[str]:
+    # Keep trial IDs deterministic. Named studies remain in the separate
+    # study field; do not reinterpret arbitrary capitalized prose as an ID.
     return uniq(
         re.findall(
-            r"\b(?:NCT\d{8}|[A-Z][A-Za-z0-9]+(?:[- ][A-Za-z0-9]+){0,4})\b",
+            r"\bNCT\d{8}\b",
             clean(value),
+            flags=re.I,
         )
     )
+
+
+@lru_cache(maxsize=256)
+def ctgov_phase(nct_id: str) -> str:
+    """Read-only phase fallback for pipeline rows that expose an NCT ID
+    but encode phase only through visual/CSS state rather than text.
+    """
+    nct = clean(nct_id).upper()
+    if not re.fullmatch(r"NCT\d{8}", nct):
+        return ""
+
+    url = f"https://clinicaltrials.gov/api/v2/studies/{nct}"
+    try:
+        with httpx.Client(
+            timeout=httpx.Timeout(20.0, connect=8.0),
+            follow_redirects=True,
+            headers={"Accept": "application/json"},
+        ) as client:
+            response = client.get(url)
+            response.raise_for_status()
+            payload = response.json()
+    except Exception:
+        return ""
+
+    phases = (
+        payload.get("protocolSection", {})
+        .get("designModule", {})
+        .get("phases", [])
+    )
+
+    ranks = {
+        "EARLY_PHASE1": 1,
+        "PHASE1": 1,
+        "PHASE1|PHASE2": 2,
+        "PHASE2": 2,
+        "PHASE2|PHASE3": 3,
+        "PHASE3": 3,
+        "PHASE4": 4,
+    }
+
+    best = 0
+    for raw in phases or []:
+        value = clean(raw).upper()
+        if value in ranks:
+            best = max(best, ranks[value])
+            continue
+        if value == "NA":
+            continue
+        m = re.search(r"([1-4])", value)
+        if m:
+            best = max(best, int(m.group(1)))
+
+    return f"Phase {best}" if best else ""
 
 
 @dataclass
@@ -261,6 +318,7 @@ class DiscoveryRow:
     brand: str = ""
     indication: str = ""
     phase: str = ""
+    phaseEvidence: str = ""
     programStatus: str = ""
     sponsorOwner: str = ""
     partners: List[str] = None
@@ -478,14 +536,25 @@ def extract_rows_from_tables(
                         phase_raw = cell
                         break
 
+            study = value_at(raw_row, header_map, "study")
             phase = phase_canonical(phase_raw)
+            phase_evidence = "SOURCE_TEXT" if phase else ""
+
+            # Generic, source-backed fallback: some pipeline tables render the
+            # active phase as CSS/graphics while exposing a trial NCT in text.
+            # When that happens, resolve phase from the public CT.gov record.
+            if not phase:
+                ids = trial_ids(study)
+                if ids:
+                    phase = ctgov_phase(ids[0])
+                    if phase:
+                        phase_evidence = "CLINICALTRIALS_GOV_FALLBACK"
 
             if not asset or not indication or not phase:
                 continue
 
             ordinal += 1
 
-            study = value_at(raw_row, header_map, "study")
             molecule = value_at(raw_row, header_map, "molecule")
             development_code = value_at(raw_row, header_map, "developmentCode")
             brand = value_at(raw_row, header_map, "brand")
@@ -504,6 +573,7 @@ def extract_rows_from_tables(
                     brand=brand,
                     indication=indication,
                     phase=phase,
+                    phaseEvidence=phase_evidence,
                     sponsorOwner=company,
                     partners=[partner_text] if partner_text else [],
                     study=study,
@@ -695,6 +765,10 @@ def extract_rows_from_labelled_flow(
                     j + 1,
                     ["Indication", "Clinical phase", "Study"],
                 )
+                # Fail closed on prose accidentally captured after an empty
+                # Study label. Named studies should be compact labels.
+                if len(study) > 120 or len(study.split()) > 12:
+                    study = ""
                 break
 
         asset, molecule = prior_identity_pair(tokens, i)
@@ -711,6 +785,7 @@ def extract_rows_from_labelled_flow(
                     molecule=molecule,
                     indication=indication,
                     phase=phase,
+                    phaseEvidence="SOURCE_TEXT",
                     sponsorOwner=company,
                     partners=[],
                     study=study,
@@ -798,6 +873,11 @@ def interpret_pipeline_html(
             1
             for row in selected
             if row.asset and row.indication and row.phase
+        ),
+        "ctgovPhaseFallbackRows": sum(
+            1
+            for row in selected
+            if row.phaseEvidence == "CLINICALTRIALS_GOV_FALLBACK"
         ),
         "methodsEvaluated": [name for name, _ in candidates],
         "companySpecificParserBranch": False,

@@ -4,6 +4,8 @@ on:
   pull_request:
     paths:
       - "generic_pipeline_interpreter_canary.py"
+      - "generic_pipeline_extension.py"
+      - "service_entrypoint.py"
       - ".github/workflows/generic-pipeline-interpreter-canary.yml"
   workflow_dispatch:
 
@@ -21,11 +23,42 @@ jobs:
         with:
           python-version: "3.11"
 
-      - name: Install minimal dependencies
+      - name: Install service dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install httpx==0.28.1
+          pip install -r requirements.txt
 
       - name: Run read-only multi-company canary
         run: |
           python generic_pipeline_interpreter_canary.py
+
+      - name: Smoke-test read-only generic extraction route
+        run: |
+          python - <<'PY'
+          import asyncio
+          from service_entrypoint import app
+          from generic_pipeline_extension import _extract_generic_pipeline
+
+          paths = {route.path for route in app.routes}
+          assert "/extract/generic-pipeline" in paths
+          assert "/extract/generic-pipeline/health" in paths
+
+          result = asyncio.run(
+              _extract_generic_pipeline(
+                  company="Sobi",
+                  source_url="https://www.sobi.com/en/pipeline",
+              )
+          )
+          assert result.readOnly is True
+          assert result.readyForDiscovery is True
+          assert result.rowCount >= 4
+          assert result.guardrails["airtableWrites"] is False
+          assert result.guardrails["masterDataWrites"] is False
+          print({
+              "routeRegistered": True,
+              "company": result.company,
+              "rowCount": result.rowCount,
+              "readyForDiscovery": result.readyForDiscovery,
+              "readOnly": result.readOnly,
+          })
+          PY

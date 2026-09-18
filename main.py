@@ -1341,6 +1341,28 @@ async def debug_sanofi(
     }
 
 
+@app.get("/extract/generic-pipeline")
+async def extract_generic_pipeline_compat(
+    company: str = Query(..., min_length=1, max_length=160),
+    source_url: str = Query(..., min_length=8),
+    timeout_seconds: float = Query(default=35.0, ge=5.0, le=35.0),
+    x_adapter_key: Optional[str] = Header(default=None),
+):
+    """Compatibility alias registered before the dynamic /extract/{company_slug} route.
+
+    Keeps existing Airtable configs valid while the canonical generic route lives at
+    /extract/generic/pipeline. Read-only and uses the same authenticated handler.
+    """
+    _auth(x_adapter_key)
+    from generic_pipeline_extension import _extract_generic_pipeline
+
+    return await _extract_generic_pipeline(
+        company=company,
+        source_url=source_url,
+        timeout_seconds=timeout_seconds,
+    )
+
+
 @app.get("/extract/{company_slug}", response_model=ExtractionResponse)
 async def extract_company(
     company_slug: str,

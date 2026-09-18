@@ -12,3 +12,4 @@ import astrazeneca_staging_export  # noqa: E402,F401
 import lilly_static_extension  # noqa: E402,F401
 import bms_pipeline_extension_v3  # noqa: E402,F401
 import bms_pipeline_extension_v4  # noqa: E402,F401
+import generic_pipeline_extension  # noqa: E402,F401

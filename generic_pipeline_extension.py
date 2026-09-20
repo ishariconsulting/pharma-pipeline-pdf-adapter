@@ -14,6 +14,7 @@ Guardrails:
 from __future__ import annotations
 
 import asyncio
+import os
 from typing import Any, Dict, List, Optional
 from urllib.parse import urljoin
 
@@ -30,12 +31,13 @@ from html_fetch_extension import (
 from generic_pipeline_interpreter_canary import (
     VERSION as INTERPRETER_VERSION,
     interpret_pipeline_html,
+    interpret_pipeline_structure,
     validate_source,
 )
 
 
 ADAPTER_PROFILE = "PIPELINE_GENERIC_HTML_V1"
-ROUTE_VERSION = "GENERIC_PIPELINE_EXTRACTION_V1.1_READ_ONLY"
+ROUTE_VERSION = "GENERIC_PIPELINE_EXTRACTION_V1.2_ROUTED_READ_ONLY"
 
 
 class GenericPipelineExtractionResponse(BaseModel):
@@ -147,29 +149,197 @@ async def _fetch_raw_public_html(
     return response.text, final_url
 
 
+def _browser_config() -> tuple[str, str]:
+    return (
+        os.getenv("BROWSER_FETCH_BASE_URL", "").strip().rstrip("/"),
+        os.getenv("BROWSER_FETCH_KEY", "").strip(),
+    )
+
+
+def _browser_fallback_allowed(exc: HTTPException) -> bool:
+    detail = str(exc.detail or "").lower()
+    return (
+        exc.status_code == 504
+        or "timed out" in detail
+        or any(f"http {status}" in detail for status in (403, 408, 429))
+    )
+
+
+async def _fetch_browser_structure(
+    url: str,
+    timeout_seconds: float,
+) -> Dict[str, Any]:
+    """Retrieve the public page through the isolated browser worker.
+
+    The worker owns browser/network safety. This service receives only the
+    rendered structural evidence needed by the generic interpreter.
+    """
+
+    base, key = _browser_config()
+    if not base or not key:
+        raise HTTPException(
+            status_code=502,
+            detail="Browser fallback is required but not configured",
+        )
+
+    endpoint = f"{base}/fetch/browser"
+    timeout = httpx.Timeout(timeout_seconds + 12.0, connect=12.0)
+
+    try:
+        async with httpx.AsyncClient(
+            timeout=timeout,
+            follow_redirects=False,
+        ) as client:
+            response = await client.get(
+                endpoint,
+                params={
+                    "url": url,
+                    "timeout_seconds": timeout_seconds,
+                },
+                headers={
+                    "X-Browser-Key": key,
+                    "Accept": "application/json",
+                },
+            )
+    except httpx.TimeoutException as exc:
+        raise HTTPException(
+            status_code=504,
+            detail="Browser fallback timed out",
+        ) from exc
+    except httpx.HTTPError as exc:
+        raise HTTPException(
+            status_code=502,
+            detail=f"Browser fallback transport failed: {exc}",
+        ) from exc
+
+    try:
+        payload = response.json()
+    except Exception as exc:
+        raise HTTPException(
+            status_code=502,
+            detail="Browser fallback returned invalid JSON",
+        ) from exc
+
+    if response.status_code >= 400:
+        raise HTTPException(
+            status_code=502,
+            detail=(
+                f"Browser fallback failed: HTTP {response.status_code}; "
+                f"{payload.get('detail', 'no detail')}"
+            ),
+        )
+
+    visible_lines = payload.get("visibleLines")
+    tables = payload.get("tables")
+
+    if not isinstance(visible_lines, list) or not isinstance(tables, list):
+        raise HTTPException(
+            status_code=502,
+            detail=(
+                "Browser fallback response does not expose rendered "
+                "visibleLines/tables; deploy browser worker V1.1+ first"
+            ),
+        )
+
+    return payload
+
+
 async def _extract_generic_pipeline(
     *,
     company: str,
     source_url: str,
     timeout_seconds: float = 35.0,
 ) -> GenericPipelineExtractionResponse:
-    raw_html, final_url = await _fetch_raw_public_html(
-        source_url,
-        timeout_seconds=timeout_seconds,
-    )
+    retrieval_mode = "DIRECT"
+    routing_reason = "DIRECT_STRUCTURE_PASS"
+    browser_version: Optional[str] = None
+    direct_failure: Optional[str] = None
+    final_url = source_url
+    rows = []
+    diagnostics: Dict[str, Any] = {}
+    validation: Dict[str, Any] = {}
 
-    # The interpreter is CPU-light but may use the public CT.gov phase fallback
-    # for source rows whose phase is only encoded visually.
-    rows, diagnostics = await asyncio.to_thread(
-        interpret_pipeline_html,
-        company,
-        final_url,
-        raw_html,
-    )
-    validation = validate_source(
-        company,
-        rows,
-        diagnostics,
+    try:
+        raw_html, final_url = await _fetch_raw_public_html(
+            source_url,
+            timeout_seconds=timeout_seconds,
+        )
+
+        rows, diagnostics = await asyncio.to_thread(
+            interpret_pipeline_html,
+            company,
+            final_url,
+            raw_html,
+        )
+        validation = validate_source(
+            company,
+            rows,
+            diagnostics,
+        )
+
+        # A 200 response can still be only a JavaScript shell. Structural
+        # parser failure is therefore a controlled reason to render once.
+        if not validation.get("pass"):
+            base, key = _browser_config()
+            if base and key:
+                routing_reason = "DIRECT_STRUCTURE_FAIL"
+                browser = await _fetch_browser_structure(
+                    source_url,
+                    timeout_seconds,
+                )
+                retrieval_mode = "BROWSER_REQUIRED"
+                browser_version = str(browser.get("version") or "")
+                final_url = str(browser.get("finalUrl") or source_url)
+
+                rows, diagnostics = await asyncio.to_thread(
+                    interpret_pipeline_structure,
+                    company,
+                    final_url,
+                    browser.get("visibleLines") or [],
+                    browser.get("tables") or [],
+                )
+                validation = validate_source(
+                    company,
+                    rows,
+                    diagnostics,
+                )
+
+    except HTTPException as exc:
+        if not _browser_fallback_allowed(exc):
+            raise
+
+        direct_failure = str(exc.detail or "")
+        routing_reason = "DIRECT_TRANSPORT_FAIL"
+        browser = await _fetch_browser_structure(
+            source_url,
+            timeout_seconds,
+        )
+        retrieval_mode = "BROWSER_REQUIRED"
+        browser_version = str(browser.get("version") or "")
+        final_url = str(browser.get("finalUrl") or source_url)
+
+        rows, diagnostics = await asyncio.to_thread(
+            interpret_pipeline_structure,
+            company,
+            final_url,
+            browser.get("visibleLines") or [],
+            browser.get("tables") or [],
+        )
+        validation = validate_source(
+            company,
+            rows,
+            diagnostics,
+        )
+
+    diagnostics = dict(diagnostics)
+    diagnostics.update(
+        {
+            "retrievalMode": retrieval_mode,
+            "routingReason": routing_reason,
+            "browserVersion": browser_version,
+            "directFailure": direct_failure,
+            "portfolioDependentValidation": False,
+        }
     )
 
     row_payloads: List[Dict[str, Any]] = []
@@ -197,6 +367,10 @@ async def _extract_generic_pipeline(
         ),
         "selectedMethod": diagnostics.get("selectedMethod"),
         "ctgovPhaseFallbackRows": diagnostics.get("ctgovPhaseFallbackRows", 0),
+        "retrievalMode": retrieval_mode,
+        "routingReason": routing_reason,
+        "browserVersion": browser_version,
+        "portfolioDependentValidation": False,
         "companySpecificParserBranch": False,
         "writeMode": "READ_ONLY",
     }
@@ -222,9 +396,11 @@ async def _extract_generic_pipeline(
             "portfolioWrites": False,
             "masterDataWrites": False,
             "companySpecificParserBranch": False,
+            "portfolioDependentValidation": False,
             "publicHttpOnly": True,
             "ssrfGuard": True,
             "fuzzyIdentityResolution": False,
+            "browserEscalationBounded": True,
         },
     )
 

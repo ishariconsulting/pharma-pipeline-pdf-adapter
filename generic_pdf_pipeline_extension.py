@@ -689,6 +689,7 @@ def parse_stage_bar_pdf(
             bars.append({"rect": rect, "fillKey": fill_key})
 
         candidates: List[Dict[str, Any]] = []
+        out_of_scope_commercial = 0
         for bar in sorted(bars, key=lambda item: item["rect"].y0):
             rect = bar["rect"]
             y = (rect.y0 + rect.y1) / 2.0
@@ -697,6 +698,11 @@ def parse_stage_bar_pdf(
                 key=lambda key: abs(stage_centers[key] - rect.x1),
             )
             phase = _canonical_stage_bar(label)
+            if label == "Commercial":
+                # Commercial/approved rows are outside active-development
+                # pipeline monitoring and belong in products/regulatory truth.
+                out_of_scope_commercial += 1
+                continue
 
             indication_words = [
                 w for w in words
@@ -795,6 +801,7 @@ def parse_stage_bar_pdf(
                 "stageCenters": {k: round(v, 1) for k, v in stage_centers.items()},
             },
             "candidateBars": len(bars),
+            "outOfScopeCommercialRows": out_of_scope_commercial,
             "parsedRows": parsed_here,
         })
 
@@ -823,6 +830,9 @@ def parse_stage_bar_pdf(
         "phaseUnresolved": 0,
         "rowFailures": len(failures),
         "failureSamples": failures[:12],
+        "outOfScopeCommercialRows": sum(
+            int(p.get("outOfScopeCommercialRows", 0)) for p in page_diags
+        ),
         "boundaryWarnings": 0,
         "companySpecificParserBranch": False,
         "portfolioDependentValidation": False,

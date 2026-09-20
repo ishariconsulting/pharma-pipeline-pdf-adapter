@@ -1,136 +1,137 @@
-"""Read-only direct source-shape diagnostics for generic pipeline onboarding.
+"""Read-only official pipeline artifact diagnostics.
 
-No Airtable writes. No browser fallback. Captures enough structural evidence
-from the official source HTML to improve the reusable parser safely.
+Inspects first-party XLSX/PDF pipeline artifacts discovered from company source
+pages. No Airtable or master-data writes.
 """
 
-import asyncio
+from __future__ import annotations
+
+import io
 import json
 import re
+import zipfile
+import xml.etree.ElementTree as ET
 
-from generic_pipeline_extension import _fetch_raw_public_html
-from html_fetch_extension import _anchors
-from generic_pipeline_interpreter_canary import (
-    PageShapeParser,
-    interpret_pipeline_html,
-    validate_source,
-)
+import fitz
+import httpx
 
 
-SOURCES = [
-    ("Gilead Sciences", "https://www.gilead.com/science/pipeline"),
-    ("Amgen", "https://www.amgen.com/science/clinical-trials"),
-    ("Ionis Pharmaceuticals", "https://ionis.com/science-and-innovation/pipeline"),
-    ("Johnson & Johnson Key Events", "https://www.investor.jnj.com/pipeline/2026-key-events/default.aspx"),
-    ("GSK", "https://www.gsk.com/en-gb/innovation/pipeline/"),
-    ("Biogen", "https://www.biogen.com/science-and-innovation/pipeline.html"),
-    ("Johnson & Johnson Innovative Medicine", "https://www.investor.jnj.com/pipeline/Innovative-Medicine-pipeline/default.aspx"),
-    ("Merck KGaA", "https://www.emdgroup.com/en/research/our-approach-to-research-and-development/healthcare.html"),
-    ("Menarini Group", "https://www.menarini.com/en-us/innovation-research/our-pipeline-and-products.html"),
-    ("Takeda", "https://www.takeda.com/science/pipeline/"),
-    ("argenx SE", "https://argenx.com/pipeline"),
-    ("Roche", "https://www.roche.com/solutions/pipeline"),
-    ("BioNTech SE", "https://www.biontech.com/int/en/home/pipeline-and-products/pipeline.html"),
-    ("Wave Life Sciences", "https://wavelifesciences.com/pipeline/research-and-development/"),
-    ("Boehringer Ingelheim", "https://www.boehringer-ingelheim.com/science-innovation/human-health-innovation/pipeline"),
+ARTIFACTS = [
+    {
+        "company": "GSK",
+        "kind": "xlsx",
+        "url": "https://www.gsk.com/media/2qfbw2yv/2q2026-pipeline-list.xlsx",
+    },
+    {
+        "company": "Takeda",
+        "kind": "pdf",
+        "url": "https://assets-dam.takeda.com/image/upload/v1785376660/Global/Investor/Financial-Results/FY2026/Q1/qr2026_q1_Pipeline_table_en.pdf",
+    },
+    {
+        "company": "argenx SE",
+        "kind": "pdf",
+        "url": "https://argenx.com/content/dam/argenx-corp/pipeline/Pipeline_August2026%201.pdf.coredownload.inline.pdf",
+    },
+    {
+        "company": "Roche",
+        "kind": "pdf",
+        "url": "https://assets.roche.com/f/176343/x/cb875526bd/pharmahy26.pdf",
+    },
 ]
 
-SIGNAL_RE = re.compile(
-    r"phase\s*[1-4]|phase\s*i{1,3}|preclinical|registration|regulatory|indication|pipeline|program|programme|candidate",
-    re.I,
-)
+
+def clean(v):
+    return re.sub(r"\s+", " ", str(v or "")).strip()
 
 
-def compact_line(line: str) -> str:
-    return " ".join(str(line).split())[:300]
+def download(url):
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/124.0.0.0 Safari/537.36 PipelineArtifactCanary/1.0",
+        "Accept": "application/pdf,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet,*/*;q=0.8",
+    }
+    with httpx.Client(timeout=45.0, follow_redirects=True, headers=headers) as client:
+        r = client.get(url)
+    r.raise_for_status()
+    return r.content, str(r.url), r.headers.get("content-type")
 
 
-async def one(company: str, url: str, sem: asyncio.Semaphore):
-    async with sem:
+def xlsx_cells(data):
+    ns = {"m":"http://schemas.openxmlformats.org/spreadsheetml/2006/main","r":"http://schemas.openxmlformats.org/officeDocument/2006/relationships"}
+    rel_ns = {"p":"http://schemas.openxmlformats.org/package/2006/relationships"}
+    out = []
+    with zipfile.ZipFile(io.BytesIO(data)) as z:
+        shared = []
+        if "xl/sharedStrings.xml" in z.namelist():
+            root = ET.fromstring(z.read("xl/sharedStrings.xml"))
+            for si in root.findall("m:si", ns):
+                shared.append(clean(" ".join(t.text or "" for t in si.findall(".//m:t", ns))))
+        wb = ET.fromstring(z.read("xl/workbook.xml"))
+        rels = ET.fromstring(z.read("xl/_rels/workbook.xml.rels"))
+        relmap = {x.attrib["Id"]:x.attrib["Target"] for x in rels.findall("p:Relationship", rel_ns)}
+        for sh in wb.findall("m:sheets/m:sheet", ns):
+            name = sh.attrib.get("name","")
+            rid = sh.attrib.get("{http://schemas.openxmlformats.org/officeDocument/2006/relationships}id")
+            target = relmap.get(rid,"")
+            path = target if target.startswith("xl/") else "xl/"+target.lstrip("/")
+            if path not in z.namelist():
+                path = "xl/worksheets/"+target.split("/")[-1]
+            root = ET.fromstring(z.read(path))
+            rows = []
+            for row in root.findall(".//m:sheetData/m:row", ns)[:80]:
+                vals = []
+                for c in row.findall("m:c", ns):
+                    typ=c.attrib.get("t")
+                    v=c.find("m:v", ns)
+                    val=""
+                    if typ=="inlineStr":
+                        val=clean(" ".join(t.text or "" for t in c.findall(".//m:t",ns)))
+                    elif v is not None:
+                        raw=v.text or ""
+                        if typ=="s" and raw.isdigit() and int(raw)<len(shared):
+                            val=shared[int(raw)]
+                        else:
+                            val=raw
+                    vals.append({"ref":c.attrib.get("r"),"value":clean(val)})
+                if any(x["value"] for x in vals):
+                    rows.append(vals)
+            out.append({"sheet":name,"rows":rows[:50]})
+    return out
+
+
+def inspect_pdf(data):
+    doc=fitz.open(stream=data,filetype="pdf")
+    pages=[]
+    for i in range(len(doc)):
+        text=clean(doc[i].get_text("text",sort=True))
+        low=text.lower()
+        if any(k in low for k in ["phase 1","phase i","phase 2","phase ii","phase 3","phase iii","pipeline","preclinical","registration"]):
+            pages.append({"page":i+1,"text":text[:5000]})
+    return {"pageCount":len(doc),"signalPages":pages[:12]}
+
+
+def main():
+    for item in ARTIFACTS:
+        company=item["company"]
         try:
-            html, final_url = await _fetch_raw_public_html(url, timeout_seconds=25.0)
-            parser = PageShapeParser()
-            parser.feed(html)
-            rows, diagnostics = await asyncio.to_thread(
-                interpret_pipeline_html,
-                company,
-                final_url,
-                html,
-            )
-            validation = validate_source(company, rows, diagnostics)
-
-            artifact_links = []
-            for a in _anchors(html, final_url):
-                label = compact_line(a.get("text", ""))
-                href = str(a.get("url", ""))
-                probe = f"{label} {href}".lower()
-                if (
-                    any(ext in probe for ext in (".pdf", ".xlsx", ".xls", ".csv"))
-                    or any(term in probe for term in ("download", "printable pipeline", "pipeline list", "pipeline pdf"))
-                ):
-                    artifact_links.append({"text": label, "url": href[:500]})
-                    if len(artifact_links) >= 20:
-                        break
-
-            signal_lines = []
-            for idx, line in enumerate(parser.visible_lines):
-                if SIGNAL_RE.search(line):
-                    signal_lines.append({"i": idx, "text": compact_line(line)})
-                    if len(signal_lines) >= 18:
-                        break
-
-            table_samples = []
-            for ti, table in enumerate(parser.tables[:5]):
-                sample_rows = []
-                for raw_row in table[:5]:
-                    cells = [compact_line(c) for c in raw_row if compact_line(c)]
-                    if cells:
-                        sample_rows.append(cells[:10])
-                if sample_rows:
-                    table_samples.append({"table": ti, "rows": sample_rows})
-
-            payload = {
-                "company": company,
-                "finalUrl": final_url,
-                "htmlChars": len(html),
-                "visibleLineCount": len(parser.visible_lines),
-                "tableCount": len(parser.tables),
-                "semanticTableRows": diagnostics.get("semanticTableRows"),
-                "labelledFlowRows": diagnostics.get("labelledFlowRows"),
-                "selectedRows": diagnostics.get("selectedRows"),
-                "selectedMethod": diagnostics.get("selectedMethod"),
-                "validationPass": validation.get("pass"),
-                "issues": validation.get("issues"),
-                "signalLines": signal_lines,
-                "artifactLinks": artifact_links,
-                "tableSamples": table_samples,
+            data,final_url,ctype=download(item["url"])
+            if item["kind"]=="xlsx":
+                detail={"sheets":xlsx_cells(data)}
+            else:
+                detail=inspect_pdf(data)
+            result={
+                "company":company,
+                "kind":item["kind"],
+                "sourceUrl":item["url"],
+                "finalUrl":final_url,
+                "contentType":ctype,
+                "bytes":len(data),
+                "ok":True,
+                "detail":detail,
             }
         except Exception as exc:
-            payload = {
-                "company": company,
-                "validationPass": False,
-                "issues": [f"{type(exc).__name__}: {exc}"],
-            }
-
-        print("PIPELINE_SHAPE_DIAGNOSTIC", json.dumps(payload, ensure_ascii=False), flush=True)
-        return payload
+            result={"company":company,"kind":item["kind"],"sourceUrl":item["url"],"ok":False,"error":f"{type(exc).__name__}: {exc}"}
+        print("STATIC_PIPELINE_ARTIFACT",json.dumps(result,ensure_ascii=False),flush=True)
 
 
-async def main():
-    sem = asyncio.Semaphore(4)
-    results = await asyncio.gather(*(one(company, url, sem) for company, url in SOURCES))
-    print(
-        "PIPELINE_SHAPE_SUMMARY",
-        json.dumps(
-            {
-                "tested": len(results),
-                "structuralPass": sum(1 for r in results if r.get("validationPass")),
-                "failed": sum(1 for r in results if not r.get("validationPass")),
-            }
-        ),
-        flush=True,
-    )
-
-
-if __name__ == "__main__":
-    asyncio.run(main())
+if __name__=="__main__":
+    main()

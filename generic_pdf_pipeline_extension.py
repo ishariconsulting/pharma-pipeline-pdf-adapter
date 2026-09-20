@@ -217,6 +217,61 @@ def _code_anchors(words: List[Tuple[Any, ...]], header: Dict[str, float]) -> Lis
     return anchors
 
 
+def _decode_pdf_control_digits(text: str) -> str:
+    """Recover digits from a common custom-font control-code mapping.
+
+    Some vector PDFs embed decimal digits as character codes 19..28 instead of
+    Unicode 0..9. Mapping those ten consecutive control codes back to 0..9 is
+    font-encoding recovery, not a company-specific asset lookup.
+    """
+    out: List[str] = []
+    for ch in str(text or ""):
+        code = ord(ch)
+        if 19 <= code <= 28:
+            out.append(str(code - 19))
+        elif code >= 32 or ch in "\t\n\r":
+            out.append(ch)
+    return "".join(out)
+
+
+def _raw_code_anchors(
+    page: fitz.Page,
+    header: Dict[str, float],
+) -> List[Tuple[float, str]]:
+    left_min = max(0.0, header["assetX"] - 20.0)
+    left_max = header.get("assetRightX", header["indicationX"]) - 5.0
+    raw = page.get_text("rawdict")
+    by_line: Dict[int, List[Tuple[float, str]]] = {}
+
+    for block in raw.get("blocks", []):
+        for line in block.get("lines", []):
+            for span in line.get("spans", []):
+                for ch in span.get("chars", []):
+                    bbox = ch.get("bbox") or [0, 0, 0, 0]
+                    x0 = float(bbox[0])
+                    cy = (float(bbox[1]) + float(bbox[3])) / 2.0
+                    if cy <= header["headerY"] + 8:
+                        continue
+                    if not (left_min <= x0 < left_max):
+                        continue
+                    c = _decode_pdf_control_digits(ch.get("c", ""))
+                    if not c:
+                        continue
+                    key = int(round(cy / 3.0) * 3)
+                    by_line.setdefault(key, []).append((x0, c))
+
+    anchors: List[Tuple[float, str]] = []
+    for key, chars in sorted(by_line.items()):
+        text = clean("".join(c for _, c in sorted(chars)))
+        if "<" in text or ">" in text:
+            continue
+        if re.search(r"\((?:US|U\.S\.|EU|Japan|China|Global)\)", text, re.I):
+            continue
+        if _is_code_like(text):
+            anchors.append((float(key), text))
+    return anchors
+
+
 def _active_code(anchors: List[Tuple[float, str]], y: float) -> Tuple[Optional[float], str]:
     """Associate a stage row to the nearest plausible development-code anchor.
 
@@ -227,7 +282,7 @@ def _active_code(anchors: List[Tuple[float, str]], y: float) -> Tuple[Optional[f
     eligible = [
         (cy, text)
         for cy, text in anchors
-        if (cy <= y + 24.0 and y - cy <= 140.0)
+        if (cy <= y + 40.0 and y - cy <= 140.0)
     ]
     if not eligible:
         return None, ""
@@ -302,6 +357,21 @@ def parse_semantic_pdf(company: str, source_url: str, data: bytes) -> Tuple[List
         header = detected
         stages = _stage_candidates(words, header)
         anchors = _code_anchors(words, header)
+        raw_anchors = _raw_code_anchors(page, header)
+        if raw_anchors:
+            merged: List[Tuple[float, str]] = list(anchors)
+            for raw_y, raw_text in raw_anchors:
+                if not any(abs(existing_y - raw_y) <= 4.5 for existing_y, _ in merged):
+                    merged.append((raw_y, raw_text))
+                elif any(
+                    abs(existing_y - raw_y) <= 4.5 and len(raw_text) > len(existing_text)
+                    for existing_y, existing_text in merged
+                ):
+                    merged = [
+                        (raw_y, raw_text) if abs(existing_y - raw_y) <= 4.5 else (existing_y, existing_text)
+                        for existing_y, existing_text in merged
+                    ]
+            anchors = sorted(merged)
         anchor_ys = [y for y, _ in anchors]
         parsed_here = 0
         rejected_here = 0
@@ -319,6 +389,8 @@ def parse_semantic_pdf(company: str, source_url: str, data: bytes) -> Tuple[List
                 and abs(_word_center_y(w) - y) <= 19.0
             ]
             indication = _join_words(indication_words)
+            if clean(indication) == "-":
+                indication = "Undisclosed"
 
             # If a market/stage continuation line omits the indication, inherit
             # the most recent indication for the same development code.
@@ -758,7 +830,10 @@ async def extract_generic_pdf(
         "rowCount": len(rows),
         "issues": issues,
         "allCoreRowsComplete": not incomplete,
-        "semanticTableFound": diagnostics["semanticTablePages"] > 0,
+        "semanticTableFound": (
+            int(diagnostics.get("semanticTablePages", 0)) > 0
+            or int(diagnostics.get("semanticStageBarPages", 0)) > 0
+        ),
     }
 
     return GenericPdfPipelineResponse(

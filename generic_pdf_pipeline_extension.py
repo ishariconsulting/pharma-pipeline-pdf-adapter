@@ -285,16 +285,29 @@ def _active_code(anchors: List[Tuple[float, str]], y: float) -> Tuple[Optional[f
         for cy, text in anchors
         if cy <= y + 4.0 and y - cy <= 140.0
     ]
-    if preceding:
-        return max(preceding, key=lambda item: item[0])
+    latest_preceding = max(preceding, key=lambda item: item[0]) if preceding else None
 
+    # A development-code label can sit just below the first stage/market line
+    # of its block. Use that forward anchor only when it is very close and the
+    # previous programme anchor is materially farther away.
     forward = [
         (cy, text)
         for cy, text in anchors
         if y < cy <= y + 18.0
     ]
-    if forward:
-        return min(forward, key=lambda item: item[0])
+    nearest_forward = min(forward, key=lambda item: item[0]) if forward else None
+
+    if latest_preceding and y - latest_preceding[0] <= 35.0:
+        return latest_preceding
+    if nearest_forward and (
+        latest_preceding is None
+        or abs(nearest_forward[0] - y) + 18.0 < abs(y - latest_preceding[0])
+    ):
+        return nearest_forward
+    if latest_preceding:
+        return latest_preceding
+    if nearest_forward:
+        return nearest_forward
 
     return None, ""
 

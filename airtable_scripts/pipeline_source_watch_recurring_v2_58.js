@@ -661,7 +661,7 @@
       if (!norm(sourceWatchName).includes("pipeline")) {
           throw new Error(
               `Source Watch "${sourceWatchName}" is not a pipeline source. ` +
-              `This V2.57.0 monitor only processes validated pipeline sources.`
+              `This V2.58.0 monitor only processes validated pipeline sources.`
           );
       }
 

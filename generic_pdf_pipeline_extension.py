@@ -320,6 +320,9 @@ def parse_semantic_pdf(company: str, source_url: str, data: bytes) -> Tuple[List
     page_diags: List[Dict[str, Any]] = []
     failure_samples: List[Dict[str, Any]] = []
     active_header: Optional[Dict[str, float]] = None
+    carry_code: str = ""
+    carry_molecule: str = ""
+    carry_uses = 0
 
     for page_idx in range(len(doc)):
         page = doc[page_idx]
@@ -373,6 +376,11 @@ def parse_semantic_pdf(company: str, source_url: str, data: bytes) -> Tuple[List
                         for existing_y, existing_text in merged
                     ]
             anchors = sorted(merged)
+        if inherited and not anchors and carry_code and stages:
+            synthetic_y = min(y for y, _, _ in stages)
+            anchors = [(synthetic_y, carry_code)]
+            carry_uses += 1
+
         anchor_ys = [y for y, _ in anchors]
         parsed_here = 0
         rejected_here = 0
@@ -480,6 +488,8 @@ def parse_semantic_pdf(company: str, source_url: str, data: bytes) -> Tuple[List
                 "marketRegion": region,
                 "sourceStageText": stage_text,
                 "sourcePage": page_idx + 1,
+                "sourceCodeY": round(code_y, 1) if code_y is not None else None,
+                "sourceStageY": round(y, 1),
                 "sourceOrdinal": len(rows) + 1,
                 "parserMethod": "SEMANTIC_PDF_TABLE",
                 "sourceAdapter": ADAPTER_PROFILE,
@@ -495,6 +505,44 @@ def parse_semantic_pdf(company: str, source_url: str, data: bytes) -> Tuple[List
             "parsedRows": parsed_here,
             "rejectedRows": rejected_here,
         })
+
+        page_rows = [r for r in rows if r.get("sourcePage") == page_idx + 1]
+        if page_rows:
+            carry_code = clean(page_rows[-1].get("developmentCode"))
+            carry_molecule = clean(page_rows[-1].get("molecule"))
+
+    boundary_samples: List[Dict[str, Any]] = []
+    ordered_rows = sorted(
+        rows,
+        key=lambda r: (
+            int(r.get("sourcePage") or 0),
+            float(r.get("sourceStageY") or 0),
+        ),
+    )
+    for prev, cur in zip(ordered_rows, ordered_rows[1:]):
+        if prev.get("sourcePage") != cur.get("sourcePage"):
+            continue
+        dy = abs(float(cur.get("sourceStageY") or 0) - float(prev.get("sourceStageY") or 0))
+        if dy > 30:
+            continue
+        if norm(prev.get("developmentCode")) == norm(cur.get("developmentCode")):
+            continue
+        a = set(norm(prev.get("indication")).split())
+        b = set(norm(cur.get("indication")).split())
+        if not a or not b:
+            continue
+        overlap = len(a & b) / max(1, min(len(a), len(b)))
+        if overlap >= 0.55:
+            boundary_samples.append({
+                "page": prev.get("sourcePage"),
+                "stageY1": prev.get("sourceStageY"),
+                "stageY2": cur.get("sourceStageY"),
+                "code1": prev.get("developmentCode"),
+                "code2": cur.get("developmentCode"),
+                "indication1": prev.get("indication"),
+                "indication2": cur.get("indication"),
+                "tokenOverlap": round(overlap, 3),
+            })
 
     # Exact source-grain de-duplication only.
     deduped: List[Dict[str, Any]] = []
@@ -524,7 +572,9 @@ def parse_semantic_pdf(company: str, source_url: str, data: bytes) -> Tuple[List
         "phaseUnresolved": 0,
         "rowFailures": sum(int(p.get("rejectedRows", 0)) for p in page_diags),
         "failureSamples": failure_samples[:12],
-        "boundaryWarnings": 0,
+        "boundaryWarnings": len(boundary_samples),
+        "boundarySamples": boundary_samples[:12],
+        "crossPageCarryUses": carry_uses,
         "companySpecificParserBranch": False,
         "portfolioDependentValidation": False,
         "writes": 0,
@@ -900,6 +950,8 @@ async def extract_generic_pdf(
         issues.append(f"{len(incomplete)} parsed rows missing core fields")
     if int(diagnostics.get("rowFailures", 0)) > 0:
         issues.append(f"{diagnostics['rowFailures']} source rows could not be resolved structurally")
+    if int(diagnostics.get("boundaryWarnings", 0)) > 0:
+        issues.append(f"{diagnostics['boundaryWarnings']} possible PDF row-boundary ambiguities require review")
 
     ready = not issues
     summary = {

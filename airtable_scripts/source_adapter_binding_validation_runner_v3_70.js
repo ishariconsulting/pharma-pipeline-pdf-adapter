@@ -1,0 +1,972 @@
+/*
+V3.70 — SOURCE WATCH ADAPTER BINDING VALIDATION RUNNER + GENERIC PIPELINE PAGE QA
+Supported adapters: GENERIC_HTML_CONTENT_V1 + PIPELINE_GENERIC_HTML_V1
+
+Purpose
+-------
+Validate one Source Watch → Adapter Registry binding before that source is treated
+as production-runnable with a reusable adapter.
+
+Trigger:
+- Source Watch: Adapter Binding Status = In Validation
+- Adapter Binding Validation Requested = checked
+
+Input:
+- sourceWatchRecordId = Airtable record ID from trigger record
+
+Validation performed in one run:
+1. Source/adapter configuration
+2. HTTP retrieval
+3. Basic extraction
+4. Canonical INTEL_ADAPTER_V1 structure
+5. Company resolution
+6. Source-type routing / reconciliation
+
+Writes only to:
+- Source Watch binding QA fields
+- Adapter Validation Runs
+
+Never writes to Portfolio, Clinical Trials, Signals, Regulatory, Congress,
+Intelligence Update Queue, or customer-facing master intelligence.
+*/
+
+const { sourceWatchRecordId } = input.config();
+
+if (!sourceWatchRecordId) {
+    throw new Error("Missing input variable: sourceWatchRecordId");
+}
+
+const SCRIPT_VERSION = "V3.70";
+const CONTRACT_VERSION = "INTEL_ADAPTER_V1";
+const EXTERNAL_ADAPTER_BASE_URL = "https://pharma-pipeline-pdf-adapter.onrender.com";
+
+function readSecret(name) {
+    try {
+        if (typeof input.secret === "function") return String(input.secret(name) || "");
+        if (input.secret && input.secret[name]) return String(input.secret[name] || "");
+    } catch (_) {}
+    return "";
+}
+
+const adapterApiKey = readSecret("adapterApiKey");
+
+// ---------- TABLES ----------
+const sourceWatch = base.getTable("tblnYjf3o2j114h5O");
+const adapters = base.getTable("tblQl5FXhZBLcRkpB");
+const validationRuns = base.getTable("tblEcwKnNONkufkhr");
+const companies = base.getTable("tbliseaiZjNPYKQCD");
+const portfolio = base.getTable("tblRCNY70YVbnKOoq");
+
+// ---------- SOURCE WATCH FIELDS ----------
+const SF = {
+    name: sourceWatch.getField("fldDUUiUuqJ9DDGBN"),
+    type: sourceWatch.getField("fldpskQVms0EvdADg"),
+    sourceUrl: sourceWatch.getField("fldwtcZXm6ep56O9h"),
+    machineUrl: sourceWatch.getField("fldyBAfEfqgIWCMK6"),
+    fetchMethod: sourceWatch.getField("fld8aUJmwGz6niCWa"),
+    status: sourceWatch.getField("fldaP8DrwHGWIL4AF"),
+    adapter: sourceWatch.getField("flddJ99DAQoIxkyQL"),
+    company: sourceWatch.getField("fldVFZ4V5UL5vC13u"),
+    bindingStatus: sourceWatch.getField("fldZNp5O3a75pnree"),
+    bindingLastValidation: sourceWatch.getField("fldE0i0tBeGNrjZTf"),
+    bindingNotes: sourceWatch.getField("fldcTmrWsJISL84xM"),
+    bindingRequested: sourceWatch.getField("fldppv7xqxuS3C4i4"),
+};
+
+// ---------- ADAPTER FIELDS ----------
+const AF = {
+    name: adapters.getField("fldtLKygXi0pGdR5u"),
+    status: adapters.getField("fldlUmD2fj9KZkPt5"),
+};
+
+// ---------- COMPANY / PORTFOLIO ----------
+const CF = {
+    name: companies.getField("fld7vtyljAkyDBuf1"),
+};
+
+const PF = {
+    company: portfolio.getField("fldjCKvEybJ3M1UlR"),
+    brand: portfolio.getField("fldbWcJPf2MKTPd8d"),
+    molecule: portfolio.getField("fldKWvXu9zHGcxXWr"),
+    devCode: portfolio.getField("fld37HbPPFfA8gZeS"),
+};
+
+// ---------- VALIDATION RUN FIELDS ----------
+const VF = {
+    runId: "fldSquGMHgir64KQB",
+    adapter: "fldPhtSh1DKJo7Jkl",
+    sourceWatch: "fldTBRtw9MaN2rZLu",
+    runTimestamp: "fld7SO91ThwkNUdNg",
+    validationType: "fldW71pY2e72HOUzR",
+    scriptVersion: "fld5tMsVRlUj7QVjk",
+    adapterStatusAtRun: "fldXXyY95BrrVufn3",
+    overallResult: "fldNXf8Y1X9jIPwTp",
+    sourcesTested: "flddQHX4B5wxDncEo",
+    passCount: "fldUiWrPtkDvmAojS",
+    reviewCount: "fldFLFSCF8MibCsvo",
+    failCount: "fldoCGYOJgXutAY3T",
+    passSources: "fldKhXzXPobQjzzge",
+    reviewSources: "fldgHGq45qppxcvGt",
+    failSources: "fldXeGAEmjdxXQzud",
+    resultDetail: "fldfh6Jd24BzzFYbr",
+    nextAction: "fldY41UVUXzXkYhjt",
+    runNotes: "fldxK3qAGclNA3gZN",
+};
+
+// ---------- HELPERS ----------
+function selectName(record, field) {
+    return record.getCellValue(field)?.name || null;
+}
+
+function linkedIds(record, field) {
+    return (record.getCellValue(field) || []).map(x => x.id);
+}
+
+function decodeBasicEntities(s) {
+    return (s || "")
+        .replace(/&nbsp;/gi, " ")
+        .replace(/&amp;/gi, "&")
+        .replace(/&quot;/gi, '"')
+        .replace(/&#39;/gi, "'")
+        .replace(/&apos;/gi, "'")
+        .replace(/&lt;/gi, "<")
+        .replace(/&gt;/gi, ">");
+}
+
+function stripHtml(html) {
+    let text = (html || "")
+        .replace(/<!--[\s\S]*?-->/g, " ")
+        .replace(/<script\b[^>]*>[\s\S]*?<\/script>/gi, " ")
+        .replace(/<style\b[^>]*>[\s\S]*?<\/style>/gi, " ")
+        .replace(/<noscript\b[^>]*>[\s\S]*?<\/noscript>/gi, " ")
+        .replace(/<svg\b[^>]*>[\s\S]*?<\/svg>/gi, " ")
+        .replace(/<[^>]+>/g, " ");
+    text = decodeBasicEntities(text);
+    return text.replace(/\s+/g, " ").trim();
+}
+
+function extractTitle(html) {
+    const m = (html || "").match(/<title[^>]*>([\s\S]*?)<\/title>/i);
+    return m ? stripHtml(m[1]).slice(0, 300) : null;
+}
+
+function extractMetaDescription(html) {
+    const patterns = [
+        /<meta[^>]+name=["']description["'][^>]+content=["']([^"']*)["'][^>]*>/i,
+        /<meta[^>]+content=["']([^"']*)["'][^>]+name=["']description["'][^>]*>/i,
+        /<meta[^>]+property=["']og:description["'][^>]+content=["']([^"']*)["'][^>]*>/i,
+        /<meta[^>]+content=["']([^"']*)["'][^>]+property=["']og:description["'][^>]*>/i,
+    ];
+    for (const p of patterns) {
+        const m = (html || "").match(p);
+        if (m) return decodeBasicEntities(m[1]).trim().slice(0, 500);
+    }
+    return null;
+}
+
+function fnv1a(str) {
+    let h = 0x811c9dc5;
+    const s = str || "";
+    const limit = Math.min(s.length, 100000);
+    for (let i = 0; i < limit; i++) {
+        h ^= s.charCodeAt(i);
+        h = Math.imul(h, 0x01000193);
+    }
+    return ("00000000" + (h >>> 0).toString(16)).slice(-8);
+}
+
+function classifyBlocked(html, title, visibleText) {
+    const titleText = (title || "").toLowerCase();
+    const visibleHead = (visibleText || "").slice(0, 5000).toLowerCase();
+    const rawHead = (html || "").slice(0, 12000).toLowerCase();
+
+    const strong = [
+        "verify you are human",
+        "checking your browser",
+        "access denied",
+        "request blocked",
+        "enable javascript and cookies to continue",
+        "attention required! | cloudflare",
+        "just a moment...",
+    ];
+
+    for (const indicator of strong) {
+        if (titleText.includes(indicator) || visibleHead.includes(indicator)) {
+            return indicator;
+        }
+    }
+
+    const rawChallenge =
+        rawHead.includes("cf-chl-") ||
+        rawHead.includes("challenge-platform") ||
+        rawHead.includes("cloudflare");
+
+    if (rawChallenge && (visibleText || "").length < 800) {
+        return "challenge shell with insufficient useful text";
+    }
+    return null;
+}
+
+function absoluteUrl(href, baseUrl) {
+    if (!href) return null;
+    const h = decodeBasicEntities(href.trim());
+    if (!h || h.startsWith("#") || h.startsWith("javascript:") ||
+        h.startsWith("mailto:") || h.startsWith("tel:")) {
+        return null;
+    }
+    try {
+        return new URL(h, baseUrl).href;
+    } catch (_) {
+        return null;
+    }
+}
+
+function extractAnchors(html, baseUrl) {
+    const out = [];
+    const seen = new Set();
+    const re = /<a\b[^>]*href=["']([^"']+)["'][^>]*>([\s\S]*?)<\/a>/gi;
+    let m;
+    while ((m = re.exec(html || "")) && out.length < 300) {
+        const url = absoluteUrl(m[1], baseUrl);
+        const text = stripHtml(m[2]).slice(0, 240);
+        if (!url || !text) continue;
+        if (/\{\{|\}\}/.test(text) || /%7B%7B/i.test(url)) continue;
+        const key = `${text.toLowerCase()}|${url}`;
+        if (seen.has(key)) continue;
+        seen.add(key);
+        out.push({ text, url });
+    }
+    return out;
+}
+
+function extractHeadings(html) {
+    const out = [];
+    const re = /<h([1-4])\b[^>]*>([\s\S]*?)<\/h\1>/gi;
+    let m;
+    while ((m = re.exec(html || "")) && out.length < 60) {
+        const text = stripHtml(m[2]);
+        if (!text || text.length < 2 || /\{\{|\}\}/.test(text)) continue;
+        out.push({ level: Number(m[1]), text: text.slice(0, 240) });
+    }
+    return out;
+}
+
+function evidenceScore(sourceType, a) {
+    const s = `${a.text} ${a.url}`.toLowerCase();
+    let score = 0;
+
+    if (sourceType === "Company Press Releases") {
+        if (/press-release-detail|press release|news release/.test(s)) score += 10;
+        if (/research|pipeline|phase [123]|fda|ema|approval|results/.test(s)) score += 4;
+    } else if (sourceType === "Pipeline Page") {
+        if (/pipeline|phase\s*[123]|phase\s*i{1,3}|preclinical|registration|filed|programme|program|candidate|indication|asset/.test(s)) score += 10;
+        if (/clinical|development|research|r&d|trial/.test(s)) score += 3;
+    } else if (sourceType === "Product / Medicines Page") {
+        if (/product-detail|medicine|product/.test(s)) score += 8;
+    } else if (sourceType === "Quarterly Earnings") {
+        if (/quarter|q[1-4]|earnings|financial|results|revenue|20\d{2}/.test(s)) score += 8;
+    } else if (sourceType === "Investor Relations") {
+        if (/annual report|quarterly|financial|event|presentation|sec filing|news/.test(s)) score += 7;
+    } else if (sourceType === "Annual Report / 10-K") {
+        if (/10-k|annual report|sec\.gov|shareholder|management/.test(s)) score += 8;
+    }
+    return score;
+}
+
+function routeTargets(sourceType) {
+    const map = {
+        "Company Press Releases": ["Signals", "Intelligence Update Queue"],
+        "Pipeline Page": ["Portfolio", "Intelligence Update Queue"],
+        "Product / Medicines Page": ["Portfolio", "Signals"],
+        "Quarterly Earnings": ["Companies", "Signals", "Portfolio"],
+        "Investor Relations": ["Companies", "Signals"],
+        "Annual Report / 10-K": ["Companies", "Signals", "Portfolio"],
+    };
+    return map[sourceType] || [];
+}
+
+function normalizeAlias(s) {
+    return (s || "")
+        .toLowerCase()
+        .replace(/[™®©]/g, "")
+        .replace(/[^a-z0-9]+/g, " ")
+        .replace(/\s+/g, " ")
+        .trim();
+}
+
+function portfolioAliasesForCompany(companyId, records) {
+    const out = [];
+    for (const r of records) {
+        if (!linkedIds(r, PF.company).includes(companyId)) continue;
+        const values = [
+            r.getCellValueAsString(PF.brand),
+            r.getCellValueAsString(PF.molecule),
+            r.getCellValueAsString(PF.devCode),
+        ].filter(Boolean);
+        for (const raw of values) {
+            const norm = normalizeAlias(raw);
+            if (norm.length >= 3) out.push({ recordId: r.id, raw, norm });
+        }
+    }
+    return out;
+}
+
+function matchPortfolioCandidate(label, aliases) {
+    const c = normalizeAlias(label);
+    if (c.length < 3) return null;
+
+    let best = null;
+    for (const a of aliases) {
+        if (c === a.norm || c.includes(a.norm) || a.norm.includes(c)) {
+            if (!best || a.norm.length > best.norm.length) best = a;
+        }
+    }
+    return best;
+}
+
+
+function urlPathDepth(url) {
+    try {
+        return new URL(url).pathname.split('/').filter(Boolean).length;
+    } catch (_) {
+        return 0;
+    }
+}
+
+function sameHost(a, b) {
+    try {
+        return new URL(a).hostname.toLowerCase() === new URL(b).hostname.toLowerCase();
+    } catch (_) {
+        return false;
+    }
+}
+
+function looksLikePressReleaseCandidate(anchor, pageUrl) {
+    const text = (anchor?.text || "").trim();
+    const url = anchor?.url || "";
+    if (!text || !url || url === pageUrl) return false;
+    if (!sameHost(url, pageUrl)) return false;
+
+    const lower = `${text} ${url}`.toLowerCase();
+    const generic = /^(home|media|news|newsroom|press releases?|read more|learn more|view all|more)$/i.test(text);
+    if (generic) return false;
+
+    const articlePattern = /press-release|press_release|news-release|news_release|\/news\/|\/media\/|\/article\/|\/stories\/|20\d{2}/i.test(lower);
+    const deeperThanIndex = urlPathDepth(url) > urlPathDepth(pageUrl);
+    const usefulLabel = text.length >= 18;
+    const strongTitle = text.length >= 35;
+
+    // Archive/category pages often use clean root-level slugs for individual
+    // posts, so an article can legitimately be shallower than the index URL
+    // (for example /category/announcements/ -> /recordati-announces-.../).
+    // A long, non-generic same-host title is therefore sufficient evidence.
+    return usefulLabel && (articlePattern || deeperThanIndex || strongTitle);
+}
+
+function looksLikePressReleaseHeadingCandidate(heading) {
+    const text = (heading?.text || "").trim();
+    if (!text || text.length < 18) return false;
+
+    const generic = /^(media|news|newsroom|press releases?|announcements?|business & financial news|latest news|recent news|featured|resources|contact us|about us|investors?)$/i.test(text);
+    if (generic) return false;
+
+    const dateOnly = /^(?:20\d{2}[,\/-]\s*)?(?:jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|jun(?:e)?|jul(?:y)?|aug(?:ust)?|sep(?:tember)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?|\d{1,2})[\s,\/-\d:]*$/i.test(text);
+    if (dateOnly) return false;
+
+    const releaseSignal = /(announc|report|result|approv|appoint|acqui|licens|collabor|launch|publish|trial|study|phase|data|fda|ema|chmp|revenue|ebitda|income|dividend|agreement|treatment|medicine|product|therapy|regulatory|guidance|financial|share|press release)/i.test(text);
+
+    // Some press-release indexes (for example WordPress-style media pages)
+    // expose article titles as headings while the only anchor label is "Download".
+    // Long, non-generic headings are therefore valid structured evidence even
+    // when there is no separate article-detail link.
+    return releaseSignal || text.length >= 45;
+}
+
+async function fetchPageDirect(url) {
+    const response = await fetch(url, {
+        method: "GET",
+        headers: {
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"
+        }
+    });
+
+    const html = await response.text();
+    const visibleText = stripHtml(html);
+    const title = extractTitle(html);
+    const metaDescription = extractMetaDescription(html);
+    const finalUrl = response.url || url;
+
+    return {
+        mode: "Airtable Direct",
+        httpStatus: response.status,
+        ok: response.ok,
+        finalUrl,
+        contentType: response.headers.get("content-type"),
+        title,
+        metaDescription,
+        visibleText,
+        headings: extractHeadings(html),
+        anchors: extractAnchors(html, finalUrl),
+        blockedIndicator: classifyBlocked(html, title, visibleText),
+        rawHtmlAvailable: true,
+    };
+}
+
+async function fetchPageExternal(url) {
+    if (!adapterApiKey) {
+        throw new Error("External HTML fallback required but Airtable secret adapterApiKey is unavailable.");
+    }
+
+    const endpoint = `${EXTERNAL_ADAPTER_BASE_URL}/fetch/html?url=${encodeURIComponent(url)}`;
+    const response = await fetch(endpoint, {
+        method: "GET",
+        headers: {
+            "x-adapter-key": adapterApiKey,
+            "Accept": "application/json"
+        }
+    });
+
+    const bodyText = await response.text();
+    let body;
+    try {
+        body = JSON.parse(bodyText);
+    } catch (_) {
+        throw new Error(`External HTML fallback returned non-JSON HTTP ${response.status}.`);
+    }
+
+    if (!response.ok) {
+        const detail = body?.detail ? String(body.detail) : `HTTP ${response.status}`;
+        throw new Error(`External HTML fallback failed: ${detail}`);
+    }
+
+    const visibleText = String(body.visibleText || "");
+    const title = body.title || null;
+
+    return {
+        mode: "External HTML Fallback",
+        httpStatus: Number(body.httpStatus || 0),
+        ok: Number(body.httpStatus || 0) >= 200 && Number(body.httpStatus || 0) < 400,
+        finalUrl: body.finalUrl || url,
+        contentType: body.contentType || null,
+        title,
+        metaDescription: body.metaDescription || null,
+        visibleText,
+        headings: Array.isArray(body.headings) ? body.headings : [],
+        anchors: Array.isArray(body.anchors) ? body.anchors : [],
+        blockedIndicator: classifyBlocked("", title, visibleText),
+        rawHtmlAvailable: false,
+    };
+}
+
+async function fetchPageWithFallback(url) {
+    try {
+        const direct = await fetchPageDirect(url);
+        const fallbackStatus = [403, 408, 429, 500, 502, 503, 504].includes(direct.httpStatus);
+        const fallbackContent =
+            !!direct.blockedIndicator ||
+            (direct.ok && String(direct.visibleText || "").trim().length < 800);
+
+        // Some pharma sites return HTTP 200 to Airtable but only deliver a
+        // JavaScript shell / challenge page with no useful server-rendered text.
+        // Treat that as a retrieval failure and try the external fetch service
+        // before classifying the source binding as failed.
+        if (!fallbackStatus && !fallbackContent) return direct;
+    } catch (err) {
+        const msg = String(err?.message || err).toLowerCase();
+        const fallbackError =
+            msg.includes("redirect") ||
+            msg.includes("301") ||
+            msg.includes("302") ||
+            msg.includes("timeout") ||
+            msg.includes("timed out") ||
+            msg.includes("408") ||
+            msg.includes("403") ||
+            msg.includes("429") ||
+            msg.includes("failed to fetch");
+        if (!fallbackError) throw err;
+    }
+
+    return await fetchPageExternal(url);
+}
+
+function structuralQa(payload) {
+    const errors = [];
+    if (payload.contractVersion !== CONTRACT_VERSION) errors.push("Wrong contractVersion.");
+    if (!payload.source?.sourceWatchRecordId) errors.push("Missing sourceWatchRecordId.");
+    if (!payload.source?.sourceName) errors.push("Missing sourceName.");
+    if (!payload.source?.sourceType) errors.push("Missing sourceType.");
+    if (!payload.source?.sourceUrl) errors.push("Missing sourceUrl.");
+    if (!payload.source?.contentFingerprint) errors.push("Missing contentFingerprint.");
+    if (!Array.isArray(payload.evidence)) errors.push("Evidence must be an array.");
+    if (!Array.isArray(payload.entities)) errors.push("Entities must be an array.");
+    if (!Array.isArray(payload.events)) errors.push("Events must be an array.");
+    if (!Array.isArray(payload.relationships)) errors.push("Relationships must be an array.");
+    return errors;
+}
+
+async function writeRun({
+    source,
+    adapterId,
+    adapterName,
+    adapterStatus,
+    overallResult,
+    detail,
+    nextAction
+}) {
+    const nowIso = new Date().toISOString();
+    const compactTs = nowIso.replace(/[-:.TZ]/g, "").slice(0, 14);
+    const runId = `${adapterName}|${SCRIPT_VERSION}|BINDING|${source.id}|${compactTs}`;
+
+    const pass = overallResult === "PASS" ? 1 : 0;
+    const review = overallResult === "REVIEW" ? 1 : 0;
+    const fail = overallResult === "FAIL" ? 1 : 0;
+
+    return await validationRuns.createRecordAsync({
+        [VF.runId]: runId,
+        [VF.adapter]: [{ id: adapterId }],
+        [VF.sourceWatch]: [{ id: source.id }],
+        [VF.runTimestamp]: nowIso,
+        // Existing select value; V3.50 runNotes identifies this as Binding QA.
+        [VF.validationType]: { name: "Reconciliation" },
+        [VF.scriptVersion]: SCRIPT_VERSION,
+        [VF.adapterStatusAtRun]: adapterStatus || "",
+        [VF.overallResult]: { name: overallResult },
+        [VF.sourcesTested]: 1,
+        [VF.passCount]: pass,
+        [VF.reviewCount]: review,
+        [VF.failCount]: fail,
+        [VF.passSources]: pass ? source.getCellValueAsString(SF.name) : "",
+        [VF.reviewSources]: review ? source.getCellValueAsString(SF.name) : "",
+        [VF.failSources]: fail ? source.getCellValueAsString(SF.name) : "",
+        [VF.resultDetail]: JSON.stringify(detail, null, 2),
+        [VF.nextAction]: nextAction,
+        [VF.runNotes]:
+            "V3.70 source-specific Adapter Binding QA with direct-fetch + external fallback + structured press-release extraction + generic Pipeline Page structural and Portfolio-alias reconciliation. Uses Reconciliation validation type for compatibility with existing select options. No master intelligence writes.",
+    });
+}
+
+// ---------- LOAD SOURCE ----------
+const swQ = await sourceWatch.selectRecordsAsync({
+    fields: [
+        SF.name, SF.type, SF.sourceUrl, SF.machineUrl, SF.fetchMethod,
+        SF.status, SF.adapter, SF.company, SF.bindingStatus,
+        SF.bindingLastValidation, SF.bindingNotes, SF.bindingRequested
+    ]
+});
+
+const source = swQ.getRecord(sourceWatchRecordId);
+if (!source) {
+    throw new Error(`Source Watch record not found: ${sourceWatchRecordId}`);
+}
+
+const sourceName = source.getCellValueAsString(SF.name).trim();
+const sourceType = selectName(source, SF.type);
+const monitoringStatus = selectName(source, SF.status);
+const fetchMethod = selectName(source, SF.fetchMethod);
+const bindingStatus = selectName(source, SF.bindingStatus);
+const requested = !!source.getCellValue(SF.bindingRequested);
+
+if (!requested) {
+    throw new Error("Adapter Binding Validation Requested is not checked.");
+}
+if (bindingStatus !== "In Validation") {
+    throw new Error(`Adapter Binding Status must be In Validation. Current: ${bindingStatus || "blank"}`);
+}
+
+const adapterIds = linkedIds(source, SF.adapter);
+
+let overallResult = "PASS";
+const issues = [];
+const warnings = [];
+
+if (monitoringStatus !== "Active") {
+    issues.push(`Source Monitoring Status is ${monitoringStatus || "blank"}, not Active.`);
+}
+if (fetchMethod !== "HTML Page") {
+    issues.push(`Fetch Method is ${fetchMethod || "blank"}, not HTML Page.`);
+}
+if (adapterIds.length !== 1) {
+    issues.push(`Expected exactly one Adapter Registry link; found ${adapterIds.length}.`);
+}
+
+// ---------- LOAD ADAPTER ----------
+const adapterQ = await adapters.selectRecordsAsync({ fields: [AF.name, AF.status] });
+const adapter = adapterIds.length === 1 ? adapterQ.getRecord(adapterIds[0]) : null;
+const adapterName = adapter ? adapter.getCellValueAsString(AF.name).trim() : null;
+const adapterStatus = adapter ? selectName(adapter, AF.status) : null;
+
+if (!adapter) issues.push("Linked Adapter Registry record not found.");
+
+const adapterNameAllowed =
+    (sourceType === "Pipeline Page" && adapterName === "PIPELINE_GENERIC_HTML_V1") ||
+    (sourceType !== "Pipeline Page" && adapterName === "GENERIC_HTML_CONTENT_V1");
+
+if (adapterName && !adapterNameAllowed) {
+    issues.push(
+        `${SCRIPT_VERSION} binding QA does not allow adapter ${adapterName} for source type ${sourceType || "blank"}.`
+    );
+}
+if (adapterStatus && adapterStatus !== "Validated") {
+    issues.push(`Linked adapter status is ${adapterStatus}, not Validated.`);
+}
+
+const supportedTypes = [
+    "Company Press Releases",
+    "Pipeline Page",
+    "Product / Medicines Page",
+    "Quarterly Earnings",
+    "Investor Relations",
+    "Annual Report / 10-K",
+];
+
+if (!supportedTypes.includes(sourceType)) {
+    issues.push(`GENERIC_HTML_CONTENT_V1 binding QA has no explicit routing rule for source type ${sourceType || "blank"}.`);
+}
+
+// ---------- COMPANY CONTEXT ----------
+const companyIds = linkedIds(source, SF.company);
+const companyQ = await companies.selectRecordsAsync({ fields: [CF.name] });
+const companyMap = new Map(companyQ.records.map(r => [r.id, r.getCellValueAsString(CF.name).trim()]));
+const companyNames = companyIds.map(id => companyMap.get(id) || id);
+
+if (companyIds.length !== 1) {
+    issues.push(`Expected exactly one Company link; found ${companyIds.length}.`);
+}
+
+// ---------- FETCH / EXTRACT ----------
+const machineUrl = source.getCellValueAsString(SF.machineUrl).trim();
+const sourceUrl = source.getCellValueAsString(SF.sourceUrl).trim();
+const url = machineUrl || sourceUrl;
+
+let httpStatus = null;
+let finalUrl = null;
+let contentType = null;
+let title = null;
+let metaDescription = null;
+let visibleText = "";
+let fingerprint = null;
+let headings = [];
+let evidence = [];
+let structuralErrors = [];
+let reconciliation = null;
+let pipelineDiagnostics = null;
+let retrievalMode = null;
+
+if (!url) {
+    issues.push("No Source URL or Machine Source URL configured.");
+}
+
+if (issues.length === 0) {
+    try {
+        const page = await fetchPageWithFallback(url);
+
+        retrievalMode = page.mode;
+        httpStatus = page.httpStatus;
+        finalUrl = page.finalUrl || url;
+        contentType = page.contentType;
+        visibleText = page.visibleText || "";
+        title = page.title;
+        metaDescription = page.metaDescription;
+        headings = page.headings || [];
+        fingerprint = fnv1a(visibleText.toLowerCase().replace(/\s+/g, " "));
+
+        if (!page.ok) {
+            issues.push(`HTTP ${page.httpStatus}`);
+        } else if (page.blockedIndicator) {
+            issues.push(`Blocked/challenge content detected: ${page.blockedIndicator}`);
+        } else if (visibleText.length < 800) {
+            issues.push(`Too little usable visible text: ${visibleText.length} characters.`);
+        } else if (
+            contentType &&
+            !contentType.toLowerCase().includes("text/html") &&
+            !contentType.toLowerCase().includes("application/xhtml")
+        ) {
+            warnings.push(`Unexpected content type: ${contentType}`);
+        }
+
+        const anchors = page.anchors || [];
+        evidence = anchors
+            .map(a => ({ ...a, score: evidenceScore(sourceType, a) }))
+            .filter(a => a.score > 0)
+            .sort((a, b) => b.score - a.score)
+            .slice(0, 60);
+
+        const payload = {
+            contractVersion: CONTRACT_VERSION,
+            source: {
+                sourceWatchRecordId: source.id,
+                sourceName,
+                sourceType,
+                sourceUrl: finalUrl || url,
+                fetchedAt: new Date().toISOString(),
+                contentFingerprint: fingerprint,
+            },
+            document: {
+                title,
+                metaDescription,
+                visibleTextLength: visibleText.length,
+                headings,
+            },
+            entities: [],
+            events: [],
+            relationships: [],
+            evidence: evidence.map(e => ({
+                kind: "link",
+                label: e.text,
+                url: e.url,
+                score: e.score,
+            })),
+            provenance: {
+                sourceWatchRecordId: source.id,
+                sourceUrl: finalUrl || url,
+                extractionMethod: adapterName,
+                scriptVersion: SCRIPT_VERSION,
+            },
+            warnings: [...warnings],
+        };
+
+        structuralErrors = structuralQa(payload);
+        if (structuralErrors.length > 0) {
+            issues.push(...structuralErrors.map(x => `Structural QA: ${x}`));
+        }
+
+        // ---------- RECONCILIATION ----------
+        const routes = routeTargets(sourceType);
+        if (routes.length === 0) {
+            issues.push(`No routing targets configured for source type ${sourceType}.`);
+        }
+
+        let candidates = [];
+        let resolved = [];
+
+        if (sourceType === "Company Press Releases") {
+            const pageUrl = finalUrl || url;
+            const anchorCandidates = anchors
+                .filter(a => looksLikePressReleaseCandidate(a, pageUrl))
+                .map(a => ({ ...a, source: "anchor" }));
+
+            const headingCandidates = headings
+                .filter(h => looksLikePressReleaseHeadingCandidate(h))
+                .map(h => ({ text: h.text, url: pageUrl, source: `h${h.level}` }));
+
+            const seenPressItems = new Set();
+            candidates = [];
+            for (const c of [...anchorCandidates, ...headingCandidates]) {
+                const key = `${normalizeAlias(c.text)}|${c.url}`;
+                if (!key || seenPressItems.has(key)) continue;
+                seenPressItems.add(key);
+                candidates.push(c);
+            }
+
+            if (candidates.length < 1) {
+                warnings.push("No structured press-release titles or article-detail links detected from the index page.");
+            }
+        } else if (sourceType === "Pipeline Page") {
+            const pageUrl = finalUrl || url;
+            const portfolioQ = await portfolio.selectRecordsAsync({
+                fields: [PF.company, PF.brand, PF.molecule, PF.devCode]
+            });
+            const aliases = portfolioAliasesForCompany(companyIds[0], portfolioQ.records);
+            const visibleNorm = normalizeAlias(visibleText);
+
+            const phaseSignals = [...new Set(
+                (visibleText.match(/\b(?:phase\s*(?:1|2|3|i{1,3})|preclinical|registration|filed)\b/gi) || [])
+                    .map(normalizeAlias)
+                    .filter(Boolean)
+            )];
+
+            const pipelineVocabularyDetected =
+                /\bpipeline\b|\bprogramme\b|\bprogram\b|\bcandidate\b|\bclinical development\b|\bindication\b/i
+                    .test(visibleText);
+
+            const structuredLabels = [
+                ...anchors.map(a => ({ text: a.text, url: a.url, source: "anchor" })),
+                ...headings.map(h => ({ text: h.text, url: pageUrl, source: `h${h.level}` })),
+            ];
+
+            const seenLabels = new Set();
+            candidates = [];
+            for (const c of structuredLabels) {
+                const key = normalizeAlias(c.text);
+                if (!key || seenLabels.has(key)) continue;
+                seenLabels.add(key);
+                if (/pipeline|phase\s*[123]|phase\s*i{1,3}|preclinical|registration|filed|programme|program|candidate|indication|asset|clinical|development/i.test(c.text)) {
+                    candidates.push(c);
+                }
+            }
+
+            const resolvedRecordIds = new Set();
+            for (const a of aliases) {
+                if (!a.norm || !visibleNorm.includes(a.norm) || resolvedRecordIds.has(a.recordId)) continue;
+                resolvedRecordIds.add(a.recordId);
+                resolved.push({
+                    candidate: { text: a.raw, url: pageUrl, source: "visibleText" },
+                    match: a
+                });
+            }
+
+            if (candidates.length === 0 && resolved.length > 0) {
+                candidates = resolved.map(x => x.candidate);
+            }
+
+            pipelineDiagnostics = {
+                pipelineVocabularyDetected,
+                phaseSignals,
+                portfolioAliasCount: aliases.length,
+                matchedPortfolioRecordCount: resolvedRecordIds.size,
+                structuredCandidateCount: candidates.length,
+            };
+
+            if (!pipelineVocabularyDetected) {
+                warnings.push("Page retrieved, but no clear pipeline/programme vocabulary was detected.");
+            }
+            if (phaseSignals.length < 2) {
+                warnings.push(`Insufficient pipeline stage structure detected; only ${phaseSignals.length} distinct stage signal(s).`);
+            }
+            if (resolvedRecordIds.size < 1) {
+                warnings.push("No existing Portfolio asset alias was found in the retrieved pipeline page.");
+            }
+
+        } else if (sourceType === "Product / Medicines Page") {
+            const portfolioQ = await portfolio.selectRecordsAsync({
+                fields: [PF.company, PF.brand, PF.molecule, PF.devCode]
+            });
+            const aliases = portfolioAliasesForCompany(companyIds[0], portfolioQ.records);
+
+            const structuredLabels = [
+                ...anchors.map(a => ({ text: a.text, url: a.url, source: "anchor" })),
+                ...headings.map(h => ({ text: h.text, url: finalUrl || url, source: `h${h.level}` })),
+            ];
+
+            const seenLabels = new Set();
+            candidates = [];
+            for (const c of structuredLabels) {
+                const key = normalizeAlias(c.text);
+                if (!key || seenLabels.has(key)) continue;
+                seenLabels.add(key);
+                const match = matchPortfolioCandidate(c.text, aliases);
+                if (match) {
+                    candidates.push(c);
+                    resolved.push({ candidate: c, match });
+                }
+            }
+
+            if (resolved.length === 0) {
+                warnings.push("No structured product label matched existing Portfolio aliases.");
+            }
+        } else if (sourceType === "Quarterly Earnings") {
+            candidates = evidence.filter(e => /quarter|q[1-4]|earnings|financial|results|revenue|20\d{2}/i.test(`${e.text} ${e.url}`));
+            if (candidates.length < 1) warnings.push("No clear quarterly/financial evidence candidate found.");
+        } else if (sourceType === "Investor Relations") {
+            candidates = evidence.filter(e => /annual report|quarterly|financial|event|presentation|sec filing|news/i.test(`${e.text} ${e.url}`));
+            if (candidates.length < 1) warnings.push("No clear IR evidence candidate found.");
+        } else if (sourceType === "Annual Report / 10-K") {
+            candidates = evidence.filter(e => /10-k|annual report|sec\.gov|shareholder|management/i.test(`${e.text} ${e.url}`));
+            if (candidates.length < 1) warnings.push("No authoritative annual-report/10-K evidence candidate found.");
+        }
+
+        reconciliation = {
+            companyIds,
+            companyNames,
+            routeTargets: routes,
+            candidateCount: candidates.length,
+            resolvedCandidateCount: resolved.length,
+            pipelineDiagnostics,
+            sampleCandidates: candidates.slice(0, 10),
+            sampleResolved: resolved.slice(0, 10).map(x => ({
+                candidateLabel: x.candidate.text,
+                candidateUrl: x.candidate.url,
+                portfolioRecordId: x.match.recordId,
+                portfolioAlias: x.match.raw,
+            })),
+        };
+
+    } catch (err) {
+        issues.push(String(err?.message || err));
+    }
+}
+
+// ---------- CLASSIFICATION ----------
+if (issues.length > 0) {
+    overallResult = "FAIL";
+} else if (warnings.length > 0) {
+    overallResult = "REVIEW";
+} else {
+    overallResult = "PASS";
+}
+
+const nowIso = new Date().toISOString();
+
+let nextAction;
+if (overallResult === "PASS") {
+    nextAction = "Source-specific adapter binding passed and may be treated as production-eligible by future orchestrator logic.";
+} else if (overallResult === "REVIEW") {
+    nextAction = "Keep this source binding out of production until warnings are reviewed or the binding is revalidated.";
+} else {
+    nextAction = "Binding failed. Keep source out of production; correct source URL/configuration/parser fit and revalidate.";
+}
+
+const detail = {
+    sourceWatchRecordId: source.id,
+    sourceName,
+    sourceType,
+    companyIds,
+    companyNames,
+    adapterRecordId: adapterIds[0] || null,
+    adapterName,
+    adapterStatus,
+    requestedUrl: url || null,
+    retrievalMode,
+    httpStatus,
+    finalUrl,
+    contentType,
+    title,
+    visibleTextLength: visibleText.length,
+    contentFingerprint: fingerprint,
+    headingCount: headings.length,
+    evidenceCount: evidence.length,
+    structuralErrors,
+    reconciliation,
+    warnings,
+    issues,
+    overallResult,
+};
+
+const validationRunRecordId = await writeRun({
+    source,
+    adapterId: adapterIds[0],
+    adapterName: adapterName || "UNRESOLVED_ADAPTER",
+    adapterStatus,
+    overallResult,
+    detail,
+    nextAction,
+});
+
+// ---------- UPDATE SOURCE WATCH BINDING STATE ----------
+const bindingStatusOut =
+    overallResult === "PASS" ? "Validated" :
+    overallResult === "REVIEW" ? "Needs Review" :
+    "Failed";
+
+const notes =
+    `${SCRIPT_VERSION} Binding QA: ${overallResult}. ` +
+    `Adapter=${adapterName || "unresolved"}; Company=${companyNames.join(", ") || "unresolved"}; ` +
+    `HTTP=${httpStatus ?? "n/a"}; Evidence=${evidence.length}; ` +
+    `Routes=${reconciliation?.routeTargets?.join(", ") || "none"}. ` +
+    `${issues.length ? `Issues: ${issues.join(" | ")}. ` : ""}` +
+    `${warnings.length ? `Warnings: ${warnings.join(" | ")}. ` : ""}` +
+    nextAction;
+
+await sourceWatch.updateRecordAsync(source.id, {
+    [SF.bindingRequested.id]: false,
+    [SF.bindingStatus.id]: { name: bindingStatusOut },
+    [SF.bindingLastValidation.id]: nowIso,
+    [SF.bindingNotes.id]: notes.slice(0, 9000),
+});
+
+// ---------- OUTPUT ----------
+output.set("validationRunRecordId", validationRunRecordId);
+output.set("overallResult", overallResult);
+output.set("message", `${SCRIPT_VERSION}: ${sourceName} binding ${overallResult}.`);
+
+console.log(`${SCRIPT_VERSION}: ${sourceName} binding ${overallResult}.`);

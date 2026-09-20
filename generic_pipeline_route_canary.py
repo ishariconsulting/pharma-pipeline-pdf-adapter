@@ -1,42 +1,36 @@
-"""Read-only static-document canary for reusable pipeline PDF routing."""
-import asyncio, json
-from generic_pdf_pipeline_extension import extract_generic_pdf
+"""Read-only Roche pipeline PDF geometry diagnostic."""
+import asyncio, json, fitz
+from generic_pdf_pipeline_extension import download_pdf, clean
 
-SOURCES=[
- ("Roche","https://assets.roche.com/f/176343/x/cb875526bd/pharmahy26.pdf"),
- ("argenx SE","https://argenx.com/content/dam/argenx-corp/pipeline/Pipeline_August2026%201.pdf.coredownload.inline.pdf"),
- ("Bayer","https://www.bayer.com/sites/default/files/ph-rd-pipeline-2026-04-29-final.pdf"),
-]
+URL="https://assets.roche.com/f/176343/x/cb875526bd/pharmahy26.pdf"
 
-async def one(company,url):
-    try:
-        r=await extract_generic_pdf(company,url,35.0)
-        print("STATIC_PDF_PIPELINE_CANARY "+json.dumps({
-          "company":company,
-          "readyForDiscovery":r.readyForDiscovery,
-          "rowCount":r.rowCount,
-          "selectedMethod":r.summary.get("selectedMethod"),
-          "issues":[x.get("issue") for x in r.issues],
-          "diagnostics":{
-            "semanticTablePages":r.diagnostics.get("semanticTablePages"),
-            "semanticStageBarPages":r.diagnostics.get("semanticStageBarPages"),
-            "rowFailures":r.diagnostics.get("rowFailures"),
-            "boundaryWarnings":r.diagnostics.get("boundaryWarnings"),
-            "exactDuplicatesRemoved":r.diagnostics.get("exactDuplicatesRemoved"),
-            "outOfScopeCommercialRows":r.diagnostics.get("outOfScopeCommercialRows"),
-          },
-          "sampleRows":r.rows[:8],
-          "masterWrites":0,
-        },ensure_ascii=False),flush=True)
-    except Exception as exc:
-        print("STATIC_PDF_PIPELINE_CANARY "+json.dumps({
-          "company":company,"readyForDiscovery":False,
-          "error":f"{type(exc).__name__}: {exc}","masterWrites":0
-        },ensure_ascii=False),flush=True)
+def line_groups(words):
+    rows={}
+    for w in words:
+        x0,y0,x1,y1,txt,*_=w
+        key=round(((y0+y1)/2)/2)*2
+        rows.setdefault(key,[]).append((x0,txt))
+    out=[]
+    for y,items in sorted(rows.items()):
+        text=clean(" ".join(t for _,t in sorted(items)))
+        if text:
+            out.append({"y":round(y,1),"items":[{"x":round(float(x),1),"t":t} for x,t in sorted(items)],"text":text})
+    return out
 
 async def main():
-    for company,url in SOURCES:
-        await one(company,url)
+    data,final=await download_pdf(URL,35.0)
+    doc=fitz.open(stream=data,filetype="pdf")
+    for idx in [2,3]:
+        page=doc[idx]
+        lines=line_groups(page.get_text("words"))
+        picked=[r for r in lines if (
+            "Phase I" in r["text"] or "Phase II" in r["text"] or "Phase III" in r["text"] or
+            "Registration" in r["text"] or r["text"].startswith("RG") or r["text"].startswith("CHU")
+        )][:120]
+        print("ROCHE_GEOMETRY "+json.dumps({
+          "page":idx+1,"width":page.rect.width,"height":page.rect.height,
+          "lines":picked
+        },ensure_ascii=False),flush=True)
 
 if __name__=="__main__":
     asyncio.run(main())

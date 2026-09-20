@@ -1,19 +1,38 @@
-"""Read-only Takeda row-boundary diagnostic."""
-import json, httpx, fitz
-URL="https://assets-dam.takeda.com/image/upload/v1785376660/Global/Investor/Financial-Results/FY2026/Q1/qr2026_q1_Pipeline_table_en.pdf"
-r=httpx.get(URL,timeout=45,follow_redirects=True,headers={"User-Agent":"Mozilla/5.0"})
-r.raise_for_status()
-doc=fitz.open(stream=r.content,filetype="pdf")
-for pno,lo,hi in [(2,370,520),(3,55,220),(4,130,380),(7,130,470)]:
-    p=doc[pno]
-    words=p.get_text("words")
-    lines={}
-    for w in words:
-        y=(float(w[1])+float(w[3]))/2
-        if y<lo or y>hi: continue
-        key=round(y/3)*3
-        lines.setdefault(key,[]).append(w)
-    body=[]
-    for y,ws in sorted(lines.items()):
-        body.append({"y":y,"items":[{"x":round(float(w[0]),1),"t":w[4]} for w in sorted(ws,key=lambda q:q[0])]})
-    print("TAKEDA_BOUNDARY "+json.dumps({"page":pno+1,"body":body},ensure_ascii=False),flush=True)
+"""Read-only canary for hardened static pipeline routes."""
+import asyncio, json
+from generic_pdf_pipeline_extension import extract_generic_pdf
+from lilly_static_extension import extract_lilly_pipeline_compat
+
+TAKEDA="https://assets-dam.takeda.com/image/upload/v1785376660/Global/Investor/Financial-Results/FY2026/Q1/qr2026_q1_Pipeline_table_en.pdf"
+ROCHE="https://assets.roche.com/f/176343/x/cb875526bd/pharmahy26.pdf"
+ARGENX="https://argenx.com/content/dam/argenx-corp/pipeline/Pipeline_August2026%201.pdf.coredownload.inline.pdf"
+
+async def test_pdf(company,url):
+    try:
+        r=await extract_generic_pdf(company,url,35.0)
+        payload={
+          "company":company,
+          "readyForDiscovery":r.readyForDiscovery,
+          "rowCount":r.rowCount,
+          "validation":r.validation,
+          "diagnostics":r.diagnostics,
+          "sampleRows":r.rows[:20],
+          "masterWrites":0,
+        }
+    except Exception as exc:
+        payload={"company":company,"readyForDiscovery":False,"error":f"{type(exc).__name__}: {exc}","masterWrites":0}
+    print("STATIC_ROUTE_PDF_CANARY_V3 "+json.dumps(payload,ensure_ascii=False),flush=True)
+
+async def main():
+    await test_pdf("Takeda",TAKEDA)
+    await test_pdf("Roche",ROCHE)
+    await test_pdf("argenx SE",ARGENX)
+    try:
+        r=extract_lilly_pipeline_compat()
+        payload={"company":r.company,"readyForDiscovery":r.readyForDiscovery,"rowCount":r.rowCount,"summary":r.summary,"masterWrites":0}
+    except Exception as exc:
+        payload={"company":"Eli Lilly and Company","readyForDiscovery":False,"error":f"{type(exc).__name__}: {exc}","masterWrites":0}
+    print("STATIC_ROUTE_LILLY_CANARY_V3 "+json.dumps(payload,ensure_ascii=False),flush=True)
+
+if __name__=="__main__":
+    asyncio.run(main())

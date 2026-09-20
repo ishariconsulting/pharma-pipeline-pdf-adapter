@@ -9,6 +9,7 @@ import json
 import re
 
 from generic_pipeline_extension import _fetch_raw_public_html
+from html_fetch_extension import _anchors
 from generic_pipeline_interpreter_canary import (
     PageShapeParser,
     interpret_pipeline_html,
@@ -58,6 +59,19 @@ async def one(company: str, url: str, sem: asyncio.Semaphore):
             )
             validation = validate_source(company, rows, diagnostics)
 
+            artifact_links = []
+            for a in _anchors(html, final_url):
+                label = compact_line(a.get("text", ""))
+                href = str(a.get("url", ""))
+                probe = f"{label} {href}".lower()
+                if (
+                    any(ext in probe for ext in (".pdf", ".xlsx", ".xls", ".csv"))
+                    or any(term in probe for term in ("download", "printable pipeline", "pipeline list", "pipeline pdf"))
+                ):
+                    artifact_links.append({"text": label, "url": href[:500]})
+                    if len(artifact_links) >= 20:
+                        break
+
             signal_lines = []
             for idx, line in enumerate(parser.visible_lines):
                 if SIGNAL_RE.search(line):
@@ -88,6 +102,7 @@ async def one(company: str, url: str, sem: asyncio.Semaphore):
                 "validationPass": validation.get("pass"),
                 "issues": validation.get("issues"),
                 "signalLines": signal_lines,
+                "artifactLinks": artifact_links,
                 "tableSamples": table_samples,
             }
         except Exception as exc:

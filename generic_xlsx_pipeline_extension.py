@@ -81,6 +81,8 @@ class GenericXlsxPipelineResponse(BaseModel):
     readyForDiscovery: bool
     rowCount: int
     rows: List[Dict[str, Any]]
+    summary: Dict[str, Any]
+    issues: List[Dict[str, Any]]
     validation: Dict[str, Any]
     diagnostics: Dict[str, Any]
     guardrails: Dict[str, Any]
@@ -272,7 +274,8 @@ def parse_semantic_workbook(
                 "phaseEvidence": "SOURCE_SPREADSHEET",
                 "programStatus": "",
                 "sponsorOwner": company,
-                "partners": [partner] if norm(partner) not in {"", "no"} else [],
+                "partners": [] if norm(partner) in {"", "yes", "no"} else [partner],
+                "partnerRelationshipDeclared": norm(partner) == "yes",
                 "study": "",
                 "trialIds": [],
                 "therapeuticArea": ta,
@@ -317,6 +320,11 @@ def parse_semantic_workbook(
         "candidateRows": len(candidates),
         "dedupedRows": len(deduped),
         "duplicateRowsRemoved": len(candidates) - len(deduped),
+        "exactDuplicatesRemoved": len(candidates) - len(deduped),
+        "exactDuplicates": 0,
+        "phaseUnresolved": 0,
+        "rowFailures": 0,
+        "boundaryWarnings": 0,
         "companySpecificParserBranch": False,
         "portfolioDependentValidation": False,
         "writes": 0,
@@ -389,6 +397,19 @@ async def extract_generic_xlsx(
             x.get("status") == "PARSED" for x in diagnostics.get("sheets", [])
         ),
     }
+    summary = {
+        "structuralValidationPass": not issues,
+        "actual": {"Total": len(rows)},
+        "productionStatus": (
+            "READY FOR AIRTABLE DELTA COMPARISON"
+            if not issues
+            else "FAIL CLOSED - PARSER/STRUCTURE REVIEW REQUIRED"
+        ),
+        "selectedMethod": "SEMANTIC_XLSX_TABLE",
+        "portfolioDependentValidation": False,
+        "companySpecificParserBranch": False,
+        "writeMode": "READ_ONLY",
+    }
 
     return GenericXlsxPipelineResponse(
         version=ADAPTER_PROFILE,
@@ -401,6 +422,8 @@ async def extract_generic_xlsx(
         readyForDiscovery=not issues,
         rowCount=len(rows),
         rows=rows,
+        summary=summary,
+        issues=[{"issue": issue} for issue in issues],
         validation=validation,
         diagnostics={
             **diagnostics,

@@ -826,28 +826,35 @@ def dedupe_rows(rows: Sequence[DiscoveryRow]) -> List[DiscoveryRow]:
     return out
 
 
-def interpret_pipeline_html(
+def interpret_pipeline_structure(
     company: str,
     source_url: str,
-    raw_html: str,
+    visible_lines: Sequence[str],
+    tables: Sequence[Sequence[Sequence[str]]],
 ) -> Tuple[List[DiscoveryRow], Dict[str, Any]]:
-    parser = PageShapeParser()
-    parser.feed(raw_html)
+    """Interpret an already-retrieved page shape.
+
+    This lets the same company-agnostic parser consume either server HTML or a
+    browser-rendered DOM without using existing Portfolio rows as a validation
+    dependency. Retrieval and interpretation stay separate.
+    """
+
+    clean_lines = [clean(line) for line in visible_lines if clean(line)]
 
     table_rows = extract_rows_from_tables(
         company,
         source_url,
-        parser.tables,
+        tables,
     )
 
     labelled_rows = extract_rows_from_labelled_flow(
         company,
         source_url,
-        parser.visible_lines,
+        clean_lines,
     )
 
     # Reusable strategy selection: choose the structurally stronger extraction.
-    # No company name is used to choose a parser.
+    # No company name or Portfolio state is used to choose a parser.
     candidates = [
         ("SEMANTIC_TABLE", table_rows),
         ("LABELLED_FLOW", labelled_rows),
@@ -863,8 +870,8 @@ def interpret_pipeline_html(
         "version": VERSION,
         "company": company,
         "sourceUrl": source_url,
-        "visibleLineCount": len(parser.visible_lines),
-        "tableCount": len(parser.tables),
+        "visibleLineCount": len(clean_lines),
+        "tableCount": len(tables),
         "semanticTableRows": len(table_rows),
         "labelledFlowRows": len(labelled_rows),
         "selectedMethod": method,
@@ -881,11 +888,27 @@ def interpret_pipeline_html(
         ),
         "methodsEvaluated": [name for name, _ in candidates],
         "companySpecificParserBranch": False,
+        "portfolioDependentValidation": False,
         "writes": 0,
     }
 
     return selected, diagnostics
 
+
+def interpret_pipeline_html(
+    company: str,
+    source_url: str,
+    raw_html: str,
+) -> Tuple[List[DiscoveryRow], Dict[str, Any]]:
+    parser = PageShapeParser()
+    parser.feed(raw_html)
+
+    return interpret_pipeline_structure(
+        company,
+        source_url,
+        parser.visible_lines,
+        parser.tables,
+    )
 
 def validate_source(
     company: str,

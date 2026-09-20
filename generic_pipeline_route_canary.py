@@ -1,27 +1,22 @@
-"""Read-only Amgen table-separator diagnostic."""
-import json, collections, httpx, fitz
+"""Read-only geometry diagnostic for Takeda official pipeline PDF."""
+import json, httpx, fitz
 
-URL="https://www.amgenpipeline.com/-/media/Themes/Amgen/amgenpipeline-com/amgenpipeline-com/PDF/amgen-pipeline-chart.pdf"
-
-def main():
-    with httpx.Client(timeout=45.0,follow_redirects=True,headers={"User-Agent":"Mozilla/5.0 PipelinePdfCanary/1.0"}) as c:
-        r=c.get(URL); r.raise_for_status(); data=r.content
-    doc=fitz.open(stream=data,filetype="pdf")
-    out=[]
-    for pi,p in enumerate(doc):
-        xs=collections.Counter()
-        samples=[]
-        for d in p.get_drawings():
-            rr=d.get("rect")
-            if not rr: continue
-            # Near-vertical table borders / thin rectangles spanning data area.
-            if rr.y1 < 155 or rr.y0 > 650: continue
-            if rr.width <= 1.2 and rr.height >= 3.0:
-                x=round((rr.x0+rr.x1)/2,1)
-                xs[x]+=1
-                if len(samples)<120:
-                    samples.append({"x":x,"y0":round(rr.y0,1),"y1":round(rr.y1,1),"fill":d.get("fill"),"color":d.get("color")})
-        out.append({"page":pi+1,"commonX":[{"x":x,"count":n} for x,n in xs.most_common(20)],"samples":samples})
-    print("AMGEN_SEPARATOR_DIAGNOSTIC "+json.dumps({"pages":out},ensure_ascii=False),flush=True)
-
-if __name__=="__main__": main()
+URL="https://assets-dam.takeda.com/image/upload/v1785376660/Global/Investor/Financial-Results/FY2026/Q1/qr2026_q1_Pipeline_table_en.pdf"
+r=httpx.get(URL,timeout=45,follow_redirects=True,headers={"User-Agent":"Mozilla/5.0"})
+r.raise_for_status()
+doc=fitz.open(stream=r.content,filetype="pdf")
+for pageno in [3,4,5,6,7,8]:
+    if pageno >= len(doc): continue
+    p=doc[pageno]
+    words=p.get_text("words")
+    rows={}
+    for w in words:
+        x0,y0,x1,y1,txt,*_=w
+        key=round(y0/3)*3
+        rows.setdefault(key,[]).append((x0,txt))
+    samples=[]
+    for y,items in sorted(rows.items()):
+        text=" ".join(t for _,t in sorted(items))
+        if any(k.lower() in text.lower() for k in ["development code","indications","stage","tak-","global","p-ii","p-iii","filed","approved"]):
+            samples.append({"y":y,"items":[{"x":round(x,1),"t":t} for x,t in sorted(items)][:80]})
+    print("TAKEDA_GEOMETRY "+json.dumps({"page":pageno+1,"width":p.rect.width,"height":p.rect.height,"samples":samples[:40]},ensure_ascii=False),flush=True)

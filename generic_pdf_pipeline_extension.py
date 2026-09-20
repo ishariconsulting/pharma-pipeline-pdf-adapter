@@ -218,10 +218,20 @@ def _code_anchors(words: List[Tuple[Any, ...]], header: Dict[str, float]) -> Lis
 
 
 def _active_code(anchors: List[Tuple[float, str]], y: float) -> Tuple[Optional[float], str]:
-    eligible = [(cy, text) for cy, text in anchors if cy <= y + 10.0 and y - cy <= 140.0]
+    """Associate a stage row to the nearest plausible development-code anchor.
+
+    PDF tables often place the stage a few points above the code/indication
+    baseline, so a small forward allowance is required. Prefer geometric
+    proximity rather than blindly carrying the previous code forward.
+    """
+    eligible = [
+        (cy, text)
+        for cy, text in anchors
+        if (cy <= y + 24.0 and y - cy <= 140.0)
+    ]
     if not eligible:
         return None, ""
-    return max(eligible, key=lambda item: item[0])
+    return min(eligible, key=lambda item: (abs(item[0] - y), 0 if item[0] <= y else 1))
 
 
 def _generic_name_for_code(
@@ -277,11 +287,13 @@ def parse_semantic_pdf(company: str, source_url: str, data: bytes) -> Tuple[List
             active_header = detected
         elif active_header:
             # Pipeline tables commonly continue onto the next page without
-            # repeating headers. Reuse the prior semantic geometry only when
-            # the continuation page still has several stage signals.
-            probe = _stage_candidates(words, active_header)
+            # repeating headers. Reuse only the X-axis geometry; headerY from
+            # the previous page must not suppress top-of-page code anchors.
+            inherited_header = dict(active_header)
+            inherited_header["headerY"] = 0.0
+            probe = _stage_candidates(words, inherited_header)
             if len(probe) >= 2:
-                detected = active_header
+                detected = inherited_header
                 inherited = True
 
         if not detected:
@@ -304,7 +316,7 @@ def parse_semantic_pdf(company: str, source_url: str, data: bytes) -> Tuple[List
             indication_words = [
                 w for w in words
                 if header["indicationX"] - 6 <= float(w[0]) < header["regionX"] - 3
-                and abs(_word_center_y(w) - y) <= 10.0
+                and abs(_word_center_y(w) - y) <= 19.0
             ]
             indication = _join_words(indication_words)
 
@@ -318,7 +330,7 @@ def parse_semantic_pdf(company: str, source_url: str, data: bytes) -> Tuple[List
             region_words = [
                 w for w in words
                 if header["regionX"] - 3 <= float(w[0]) < header["stageX"] - 3
-                and abs(_word_center_y(w) - y) <= 10.0
+                and abs(_word_center_y(w) - y) <= 7.0
             ]
             region = _join_words(region_words)
             if region == "-":

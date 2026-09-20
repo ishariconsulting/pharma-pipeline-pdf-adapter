@@ -414,7 +414,7 @@ def parse_semantic_pdf(company: str, source_url: str, data: bytes) -> Tuple[List
         "exactDuplicatesRemoved": len(rows) - len(deduped),
         "exactDuplicates": 0,
         "phaseUnresolved": 0,
-        "rowFailures": 0,
+        "rowFailures": sum(int(p.get("rejectedRows", 0)) for p in page_diags),
         "boundaryWarnings": 0,
         "companySpecificParserBranch": False,
         "portfolioDependentValidation": False,

@@ -37,7 +37,7 @@ from generic_pipeline_interpreter_canary import (
 
 
 ADAPTER_PROFILE = "PIPELINE_GENERIC_HTML_V1"
-ROUTE_VERSION = "GENERIC_PIPELINE_EXTRACTION_V1.2_ROUTED_READ_ONLY"
+ROUTE_VERSION = "GENERIC_PIPELINE_EXTRACTION_V1.2.1_BOUNDED_ROUTING_READ_ONLY"
 
 
 class GenericPipelineExtractionResponse(BaseModel):
@@ -277,12 +277,18 @@ async def _extract_generic_pipeline(
             diagnostics,
         )
 
-        # A 200 response can still be only a JavaScript shell. Structural
-        # parser failure is therefore a controlled reason to render once.
-        if not validation.get("pass"):
+        # A successful HTTP response with substantial source text is a parser
+        # problem, not a transport problem. Keep it DIRECT and fail closed so
+        # we do not hide unsupported page structures behind browser rendering.
+        #
+        # Browser escalation is allowed only for a genuinely sparse server
+        # response (typical JS shell) or the bounded transport failures handled
+        # in the HTTPException path below.
+        direct_visible_lines = int(diagnostics.get("visibleLineCount") or 0)
+        if not validation.get("pass") and direct_visible_lines < 20:
             base, key = _browser_config()
             if base and key:
-                routing_reason = "DIRECT_STRUCTURE_FAIL"
+                routing_reason = "SPARSE_SERVER_HTML"
                 browser = await _fetch_browser_structure(
                     source_url,
                     timeout_seconds,
@@ -303,6 +309,8 @@ async def _extract_generic_pipeline(
                     rows,
                     diagnostics,
                 )
+        elif not validation.get("pass"):
+            routing_reason = "DIRECT_STRUCTURE_UNSUPPORTED"
 
     except HTTPException as exc:
         if not _browser_fallback_allowed(exc):

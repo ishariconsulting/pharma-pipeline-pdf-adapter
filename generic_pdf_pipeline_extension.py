@@ -423,6 +423,267 @@ def parse_semantic_pdf(company: str, source_url: str, data: bytes) -> Tuple[List
     return deduped, diagnostics
 
 
+
+def _group_word_lines(words: List[Tuple[Any, ...]], y_tol: float = 3.5) -> List[Dict[str, Any]]:
+    lines: List[Dict[str, Any]] = []
+    for w in sorted(words, key=lambda q: (_word_center_y(q), float(q[0]))):
+        cy = _word_center_y(w)
+        target = None
+        for line in lines[-4:]:
+            if abs(line["y"] - cy) <= y_tol:
+                target = line
+                break
+        if target is None:
+            target = {"y": cy, "words": []}
+            lines.append(target)
+        target["words"].append(w)
+        target["y"] = sum(_word_center_y(x) for x in target["words"]) / len(target["words"])
+    return lines
+
+
+def _stage_bar_header(words: List[Tuple[Any, ...]]) -> Optional[Dict[str, Any]]:
+    """Detect a graphical pipeline matrix with semantic stage headers."""
+    program = [w for w in words if norm(w[4]) == "program"]
+    indication = [w for w in words if norm(w[4]) == "indication"]
+    preclinical = [w for w in words if norm(w[4]) == "preclinical"]
+    registrational = [w for w in words if norm(w[4]) == "registrational"]
+    commercial = [w for w in words if norm(w[4]) == "commercial"]
+    proof = [w for w in words if norm(w[4]) == "proof"]
+    phase = [w for w in words if norm(w[4]) == "phase"]
+
+    if not all([program, indication, preclinical, registrational, commercial, proof, phase]):
+        return None
+
+    # Pick the compact header band where all semantic labels align.
+    candidates = []
+    for pr in program:
+        py = _word_center_y(pr)
+        nearby = {
+            "indication": [w for w in indication if abs(_word_center_y(w) - py) <= 20],
+            "preclinical": [w for w in preclinical if abs(_word_center_y(w) - py) <= 20],
+            "phase": [w for w in phase if abs(_word_center_y(w) - py) <= 20],
+            "proof": [w for w in proof if abs(_word_center_y(w) - py) <= 20],
+            "registrational": [w for w in registrational if abs(_word_center_y(w) - py) <= 20],
+            "commercial": [w for w in commercial if abs(_word_center_y(w) - py) <= 20],
+        }
+        if all(nearby.values()):
+            candidates.append((pr, nearby))
+    if not candidates:
+        return None
+
+    pr, nearby = candidates[0]
+    ind = nearby["indication"][0]
+    pc = nearby["preclinical"][0]
+    ph = nearby["phase"][0]
+    pf = nearby["proof"][0]
+    rg = nearby["registrational"][0]
+    cm = nearby["commercial"][0]
+
+    centers = {
+        "Preclinical": (float(pc[0]) + float(pc[2])) / 2.0,
+        "Phase 1": (float(ph[0]) + float(ph[2])) / 2.0,
+        "Proof of Concept": (float(pf[0]) + float(pf[2])) / 2.0,
+        "Registrational": (float(rg[0]) + float(rg[2])) / 2.0,
+        "Commercial": (float(cm[0]) + float(cm[2])) / 2.0,
+    }
+    if list(centers.values()) != sorted(centers.values()):
+        return None
+
+    return {
+        "headerY": max(
+            _word_center_y(pr), _word_center_y(ind),
+            *[_word_center_y(v[0]) for v in nearby.values()]
+        ),
+        "programX": float(pr[0]),
+        "indicationX": float(ind[0]),
+        "stageStartX": centers["Preclinical"] - 45.0,
+        "stageCenters": centers,
+    }
+
+
+def _canonical_stage_bar(label: str) -> str:
+    return {
+        "Preclinical": "Preclinical",
+        "Phase 1": "Phase 1",
+        "Proof of Concept": "Phase 2",
+        "Registrational": "Phase 3",
+        "Commercial": "Approved",
+    }.get(label, "")
+
+
+def parse_stage_bar_pdf(
+    company: str,
+    source_url: str,
+    data: bytes,
+) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
+    """Parse vector-bar pipeline graphics using semantic headers + geometry.
+
+    No colour meaning is assumed. The stage comes only from the bar endpoint
+    relative to labelled stage columns.
+    """
+    try:
+        doc = fitz.open(stream=data, filetype="pdf")
+    except Exception as exc:
+        raise HTTPException(status_code=422, detail=f"Invalid PDF: {exc}") from exc
+
+    rows: List[Dict[str, Any]] = []
+    page_diags: List[Dict[str, Any]] = []
+    failures: List[Dict[str, Any]] = []
+
+    for page_idx in range(len(doc)):
+        page = doc[page_idx]
+        words = page.get_text("words")
+        header = _stage_bar_header(words)
+        if not header:
+            continue
+
+        # Candidate programme labels are text lines wholly to the left of the
+        # indication column. Logos/images are intentionally not OCR'd.
+        program_lines = []
+        for line in _group_word_lines(words):
+            if line["y"] <= header["headerY"] + 15:
+                continue
+            line_words = [
+                w for w in line["words"]
+                if float(w[0]) < header["indicationX"] - 12
+            ]
+            if not line_words:
+                continue
+            text = _join_words(line_words)
+            if not text or norm(text) in {"program", "key"}:
+                continue
+            # Footer/key text is outside the stage-grid body.
+            if line["y"] > page.rect.height - 55:
+                continue
+            program_lines.append((line["y"], text))
+
+        stage_centers = header["stageCenters"]
+        bars = []
+        for drawing in page.get_drawings():
+            rect = drawing.get("rect")
+            fill = drawing.get("fill")
+            if not rect or fill is None:
+                continue
+            if rect.y0 <= header["headerY"] + 10:
+                continue
+            if rect.height < 3.0 or rect.height > 18.0:
+                continue
+            if rect.width < 45.0:
+                continue
+            if abs(rect.x0 - header["stageStartX"]) > 18.0:
+                continue
+            # Exclude pale table-background rectangles. Stage bars are much
+            # more saturated/darker than the ~0.945 neutral row background.
+            if max(fill) - min(fill) < 0.03 and sum(fill) / 3.0 > 0.85:
+                continue
+            bars.append(rect)
+
+        parsed_here = 0
+        for rect in sorted(bars, key=lambda r: r.y0):
+            y = (rect.y0 + rect.y1) / 2.0
+            label = min(
+                stage_centers,
+                key=lambda key: abs(stage_centers[key] - rect.x1),
+            )
+            phase = _canonical_stage_bar(label)
+
+            indication_words = [
+                w for w in words
+                if header["indicationX"] - 12 <= float(w[0]) < header["stageStartX"] - 8
+                and abs(_word_center_y(w) - y) <= 9.0
+            ]
+            indication = _join_words(indication_words)
+
+            # Programme names can be vertically centred across a block of
+            # several indication rows. Use the nearest explicit programme text.
+            programme = ""
+            if program_lines:
+                py, ptext = min(program_lines, key=lambda item: abs(item[0] - y))
+                if abs(py - y) <= 85.0:
+                    programme = clean(ptext)
+
+            if not programme or not indication or not phase:
+                failures.append({
+                    "page": page_idx + 1,
+                    "y": round(y, 1),
+                    "programme": programme,
+                    "indication": indication,
+                    "sourceStage": label,
+                })
+                continue
+
+            rows.append({
+                "company": company,
+                "sourceFamily": "Company Pipeline",
+                "sourceRecordId": f"pdfbar:p{page_idx+1}:y{int(round(y))}",
+                "sourceUrl": source_url,
+                "asset": programme,
+                "molecule": programme,
+                "developmentCode": "",
+                "brand": "",
+                "indication": indication,
+                "phase": phase,
+                "phaseEvidence": "SOURCE_PDF_STAGE_BAR",
+                "programStatus": "",
+                "sponsorOwner": company,
+                "partners": [],
+                "study": "",
+                "trialIds": [],
+                "therapeuticArea": "",
+                "sourceStageText": label,
+                "sourcePage": page_idx + 1,
+                "sourceOrdinal": len(rows) + 1,
+                "parserMethod": "SEMANTIC_PDF_STAGE_BAR",
+                "sourceAdapter": ADAPTER_PROFILE,
+            })
+            parsed_here += 1
+
+        page_diags.append({
+            "page": page_idx + 1,
+            "header": {
+                "programX": round(header["programX"], 1),
+                "indicationX": round(header["indicationX"], 1),
+                "stageStartX": round(header["stageStartX"], 1),
+                "stageCenters": {k: round(v, 1) for k, v in stage_centers.items()},
+            },
+            "candidateBars": len(bars),
+            "parsedRows": parsed_here,
+        })
+
+    deduped: List[Dict[str, Any]] = []
+    seen = set()
+    for row in rows:
+        key = (
+            norm(row["asset"]),
+            norm(row["indication"]),
+            norm(row["phase"]),
+        )
+        if key in seen:
+            continue
+        seen.add(key)
+        row["sourceOrdinal"] = len(deduped) + 1
+        deduped.append(row)
+
+    diagnostics = {
+        "pageCount": len(doc),
+        "semanticStageBarPages": len(page_diags),
+        "pages": page_diags,
+        "candidateRows": len(rows),
+        "dedupedRows": len(deduped),
+        "exactDuplicatesRemoved": len(rows) - len(deduped),
+        "exactDuplicates": 0,
+        "phaseUnresolved": 0,
+        "rowFailures": len(failures),
+        "failureSamples": failures[:12],
+        "boundaryWarnings": 0,
+        "companySpecificParserBranch": False,
+        "portfolioDependentValidation": False,
+        "writes": 0,
+        "selectedMethod": "SEMANTIC_PDF_STAGE_BAR",
+    }
+    return deduped, diagnostics
+
+
 async def download_pdf(url: str, timeout_seconds: float) -> Tuple[bytes, str]:
     await _assert_public_http_url(url)
     parsed = urlparse(url)
@@ -464,6 +725,14 @@ async def extract_generic_pdf(
 ) -> GenericPdfPipelineResponse:
     data, final_url = await download_pdf(source_url, timeout_seconds)
     rows, diagnostics = parse_semantic_pdf(company, final_url, data)
+    selected_method = "SEMANTIC_PDF_TABLE"
+
+    if not rows:
+        bar_rows, bar_diagnostics = parse_stage_bar_pdf(company, final_url, data)
+        if len(bar_rows) > len(rows):
+            rows = bar_rows
+            diagnostics = bar_diagnostics
+            selected_method = "SEMANTIC_PDF_STAGE_BAR"
 
     incomplete = [r["sourceRecordId"] for r in rows if not (r.get("asset") and r.get("indication") and r.get("phase"))]
     issues: List[str] = []
@@ -471,13 +740,15 @@ async def extract_generic_pdf(
         issues.append(f"too few structured rows: {len(rows)} < {MIN_ROWS}")
     if incomplete:
         issues.append(f"{len(incomplete)} parsed rows missing core fields")
+    if int(diagnostics.get("rowFailures", 0)) > 0:
+        issues.append(f"{diagnostics['rowFailures']} source rows could not be resolved structurally")
 
     ready = not issues
     summary = {
         "structuralValidationPass": ready,
         "actual": {"Total": len(rows)},
         "productionStatus": "READY FOR AIRTABLE DELTA COMPARISON" if ready else "FAIL CLOSED - PARSER/STRUCTURE REVIEW REQUIRED",
-        "selectedMethod": "SEMANTIC_PDF_TABLE",
+        "selectedMethod": selected_method,
         "portfolioDependentValidation": False,
         "companySpecificParserBranch": False,
         "writeMode": "READ_ONLY",

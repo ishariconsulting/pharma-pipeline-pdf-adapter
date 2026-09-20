@@ -1,32 +1,21 @@
-"""Read-only Amgen pipeline transport-endpoint diagnostic."""
-
-import asyncio, json, re
+"""Read-only Amgen endpoint context diagnostic."""
+import asyncio, json
 from generic_pipeline_extension import _fetch_raw_public_html
-
 URL="https://www.amgenpipeline.com/"
-
 async def main():
-    try:
-        html, final_url = await _fetch_raw_public_html(URL, timeout_seconds=30.0)
-        snippets=[]
-        patterns=[
-          r'https?://[^"\'<>\\s]+',
-          r'[^"\'<>\\s]{0,100}(?:api|json|pipeline|graphql|search|molecule)[^"\'<>\\s]{0,160}'
-        ]
-        seen=set()
-        for pat in patterns:
-          for m in re.finditer(pat, html, re.I):
-            s=re.sub(r"\\s+"," ",m.group(0))[:500]
-            if s in seen: continue
-            seen.add(s)
-            if re.search(r"api|json|pipeline|graphql|molecule",s,re.I):
-              snippets.append(s)
-            if len(snippets)>=120: break
-          if len(snippets)>=120: break
-        payload={"finalUrl":final_url,"htmlChars":len(html),"snippets":snippets}
-    except Exception as exc:
-        payload={"error":f"{type(exc).__name__}: {exc}"}
-    print("AMGEN_ENDPOINT_DIAGNOSTIC "+json.dumps(payload,ensure_ascii=False),flush=True)
-
-if __name__=="__main__":
-    asyncio.run(main())
+  try:
+    html,final=await _fetch_raw_public_html(URL,timeout_seconds=30.0)
+    keys=["/XA-API/","pipeline-cu","moleculeLi","amgen-pipeline-chart.pdf"]
+    ctx={}
+    for key in keys:
+      start=0; vals=[]
+      while True:
+        i=html.lower().find(key.lower(),start)
+        if i<0 or len(vals)>=12: break
+        vals.append(html[max(0,i-700):min(len(html),i+1800)])
+        start=i+len(key)
+      ctx[key]=vals
+    print("AMGEN_ENDPOINT_CONTEXT "+json.dumps({"finalUrl":final,"context":ctx},ensure_ascii=False),flush=True)
+  except Exception as exc:
+    print("AMGEN_ENDPOINT_CONTEXT "+json.dumps({"error":f"{type(exc).__name__}: {exc}"}),flush=True)
+if __name__=="__main__": asyncio.run(main())

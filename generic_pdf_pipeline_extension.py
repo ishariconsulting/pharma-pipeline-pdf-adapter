@@ -87,10 +87,20 @@ def _join_words(words: List[Tuple[Any, ...]]) -> str:
 
 
 def _find_header(words: List[Tuple[Any, ...]]) -> Optional[Dict[str, float]]:
+    """Infer semantic PDF-table columns from header labels.
+
+    A production pipeline table must expose Development, Indication,
+    Country/Region and Stage/Phase semantics. Optional Type/Modality headers
+    tighten the left-column boundary but are not required.
+    """
     dev = [w for w in words if norm(w[4]) == "development"]
     indications = [w for w in words if norm(w[4]) in {"indications", "indication"}]
     stages = [w for w in words if norm(w[4]) in {"stage", "phase"}]
-    if not dev or not indications or not stages:
+    regions = [w for w in words if norm(w[4]) in {"country", "country region", "region", "country/"}]
+    type_words = [w for w in words if norm(w[4]) == "type"]
+    modalities = [w for w in words if norm(w[4]) == "modality"]
+
+    if not dev or not indications or not stages or not regions:
         return None
 
     best = None
@@ -99,29 +109,34 @@ def _find_header(words: List[Tuple[Any, ...]]) -> Optional[Dict[str, float]]:
         dy = _word_center_y(d)
         for i in indications:
             iy = _word_center_y(i)
-            if abs(dy - iy) > 35:
+            if abs(dy - iy) > 40:
                 continue
-            for st in stages:
-                sy = _word_center_y(st)
-                if abs(dy - sy) > 35:
+            for rg in regions:
+                ry = _word_center_y(rg)
+                if abs(dy - ry) > 45:
                     continue
-                if not (float(d[0]) < float(i[0]) < float(st[0])):
-                    continue
-                span = max(dy, iy, sy) - min(dy, iy, sy)
-                if span < best_span:
-                    best_span = span
-                    best = {
-                        "headerY": max(dy, iy, sy),
-                        "assetX": float(d[0]),
-                        "indicationX": float(i[0]),
-                        "stageX": float(st[0]),
-                    }
-    if not best:
-        return None
-
-    # Region/country usually sits between indication and stage. We infer the
-    # right edge of indication from the stage column and leave a guard band.
-    best["regionX"] = best["stageX"] - max(32.0, min(55.0, best["stageX"] * 0.08))
+                for st in stages:
+                    sy = _word_center_y(st)
+                    if abs(dy - sy) > 45:
+                        continue
+                    if not (float(d[0]) < float(i[0]) < float(rg[0]) < float(st[0])):
+                        continue
+                    span = max(dy, iy, ry, sy) - min(dy, iy, ry, sy)
+                    if span < best_span:
+                        best_span = span
+                        left_boundaries = [
+                            float(w[0]) for w in [*type_words, *modalities]
+                            if float(d[0]) < float(w[0]) < float(i[0])
+                            and abs(_word_center_y(w) - dy) <= 45
+                        ]
+                        best = {
+                            "headerY": max(dy, iy, ry, sy),
+                            "assetX": float(d[0]),
+                            "assetRightX": min(left_boundaries) if left_boundaries else float(i[0]),
+                            "indicationX": float(i[0]),
+                            "regionX": float(rg[0]),
+                            "stageX": float(st[0]),
+                        }
     return best
 
 
@@ -170,50 +185,64 @@ def _stage_candidates(words: List[Tuple[Any, ...]], header: Dict[str, float]) ->
     return dedup
 
 
-def _nearest_code(words: List[Tuple[Any, ...]], header: Dict[str, float], y: float) -> str:
-    candidates: List[Tuple[float, str]] = []
+def _code_anchors(words: List[Tuple[Any, ...]], header: Dict[str, float]) -> List[Tuple[float, str]]:
+    """Return candidate development-code anchors from the semantic code column."""
     left_min = max(0.0, header["assetX"] - 20.0)
-    left_max = header["indicationX"] - 20.0
+    left_max = header.get("assetRightX", header["indicationX"]) - 5.0
+    by_line: Dict[int, List[Tuple[Any, ...]]] = {}
 
-    # Search the current and immediately preceding visual band. This supports
-    # multi-line rows where the development code is printed above the stage.
     for w in words:
         x0 = float(w[0])
         cy = _word_center_y(w)
+        if cy <= header["headerY"] + 8:
+            continue
         if not (left_min <= x0 < left_max):
             continue
-        if cy > y + 8 or y - cy > 85:
+        by_line.setdefault(int(round(cy / 3.0) * 3), []).append(w)
+
+    anchors: List[Tuple[float, str]] = []
+    for _, line_words in sorted(by_line.items()):
+        text = _join_words(line_words)
+        if not text:
             continue
-        txt = clean(w[4])
-        if _is_code_like(txt):
-            candidates.append((cy, txt))
+        # Explicit generic-name lines are evidence, not development codes.
+        if "<" in text or ">" in text:
+            continue
+        # Country/region suffixes often identify a brand presentation.
+        if re.search(r"\((?:US|U\.S\.|EU|Japan|China|Global)\)", text, re.I):
+            continue
+        if _is_code_like(text):
+            y = sum(_word_center_y(w) for w in line_words) / len(line_words)
+            anchors.append((y, text))
+    return anchors
 
-    if not candidates:
+
+def _active_code(anchors: List[Tuple[float, str]], y: float) -> Tuple[Optional[float], str]:
+    eligible = [(cy, text) for cy, text in anchors if cy <= y + 10.0 and y - cy <= 140.0]
+    if not eligible:
+        return None, ""
+    return max(eligible, key=lambda item: item[0])
+
+
+def _generic_name_for_code(
+    words: List[Tuple[Any, ...]],
+    header: Dict[str, float],
+    code_y: Optional[float],
+    next_code_y: Optional[float],
+) -> str:
+    if code_y is None:
         return ""
-
-    # Combine code fragments sharing the closest code line (e.g. TAK- / 123).
-    closest_y = max(cy for cy, _ in candidates)
-    same_line = [
+    left_min = max(0.0, header["assetX"] - 20.0)
+    left_max = header.get("assetRightX", header["indicationX"]) - 5.0
+    upper = next_code_y if next_code_y is not None else code_y + 90.0
+    selected = [
         w for w in words
         if left_min <= float(w[0]) < left_max
-        and abs(_word_center_y(w) - closest_y) <= 4.5
+        and code_y - 2.0 <= _word_center_y(w) < upper - 2.0
     ]
-    code_text = _join_words(same_line)
-
-    # Strip generic-name / administration-route spillover when the left region
-    # contains multiple semantic subcolumns. Retain the leading code-like run.
-    tokens = code_text.split()
-    kept: List[str] = []
-    for token in tokens:
-        if not kept:
-            if re.search(r"[A-Za-z]", token) and re.search(r"\d", token):
-                kept.append(token)
-        else:
-            if token in {"/", "-"} or re.search(r"\d", token):
-                kept.append(token)
-            else:
-                break
-    return clean(" ".join(kept)) or clean(candidates[-1][1])
+    text = _join_words(selected)
+    matches = re.findall(r"<([^>]{2,100})>", text)
+    return clean(matches[0]) if matches else ""
 
 
 def parse_semantic_pdf(company: str, source_url: str, data: bytes) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
@@ -224,45 +253,99 @@ def parse_semantic_pdf(company: str, source_url: str, data: bytes) -> Tuple[List
 
     rows: List[Dict[str, Any]] = []
     page_diags: List[Dict[str, Any]] = []
+    active_header: Optional[Dict[str, float]] = None
 
     for page_idx in range(len(doc)):
         page = doc[page_idx]
         words = page.get_text("words")
-        header = _find_header(words)
-        if not header:
+        page_text = clean(page.get_text("text", sort=True))
+
+        # Do not treat pipeline-change/removal appendices as the current-state
+        # table even when they contain similar vocabulary.
+        appendix = bool(re.search(
+            r"\brecent\s+pipeline\s+progress\b|\bprojects?\s+removed\s+from\s+pipeline\b|\bdiscontinued\b",
+            page_text[:1800],
+            re.I,
+        ))
+        if appendix:
+            active_header = None
             continue
 
+        detected = _find_header(words)
+        inherited = False
+        if detected:
+            active_header = detected
+        elif active_header:
+            # Pipeline tables commonly continue onto the next page without
+            # repeating headers. Reuse the prior semantic geometry only when
+            # the continuation page still has several stage signals.
+            probe = _stage_candidates(words, active_header)
+            if len(probe) >= 2:
+                detected = active_header
+                inherited = True
+
+        if not detected:
+            continue
+
+        header = detected
         stages = _stage_candidates(words, header)
+        anchors = _code_anchors(words, header)
+        anchor_ys = [y for y, _ in anchors]
         parsed_here = 0
         rejected_here = 0
+        inherited_indication_by_code: Dict[str, str] = {}
 
         for y, phase, stage_text in stages:
+            code_y, development_code = _active_code(anchors, y)
+            if not development_code:
+                rejected_here += 1
+                continue
+
             indication_words = [
                 w for w in words
-                if header["indicationX"] - 6 <= float(w[0]) < header["regionX"]
-                and abs(_word_center_y(w) - y) <= 8.0
+                if header["indicationX"] - 6 <= float(w[0]) < header["regionX"] - 3
+                and abs(_word_center_y(w) - y) <= 10.0
             ]
             indication = _join_words(indication_words)
-            development_code = _nearest_code(words, header, y)
+
+            # If a market/stage continuation line omits the indication, inherit
+            # the most recent indication for the same development code.
+            if indication:
+                inherited_indication_by_code[development_code] = indication
+            else:
+                indication = inherited_indication_by_code.get(development_code, "")
 
             region_words = [
                 w for w in words
-                if header["regionX"] <= float(w[0]) < header["stageX"] - 3
-                and abs(_word_center_y(w) - y) <= 8.0
+                if header["regionX"] - 3 <= float(w[0]) < header["stageX"] - 3
+                and abs(_word_center_y(w) - y) <= 10.0
             ]
             region = _join_words(region_words)
+            if region == "-":
+                region = ""
 
-            if not development_code or not indication:
+            if not indication:
                 rejected_here += 1
                 continue
+
+            next_code_y = None
+            if code_y is not None:
+                future = [ay for ay in anchor_ys if ay > code_y + 2.0]
+                next_code_y = min(future) if future else None
+            molecule = _generic_name_for_code(
+                words,
+                header,
+                code_y,
+                next_code_y,
+            )
 
             rows.append({
                 "company": company,
                 "sourceFamily": "Company Pipeline",
                 "sourceRecordId": f"pdf:p{page_idx+1}:y{int(round(y))}",
                 "sourceUrl": source_url,
-                "asset": development_code,
-                "molecule": "",
+                "asset": molecule or development_code,
+                "molecule": molecule,
                 "developmentCode": development_code,
                 "brand": "",
                 "indication": indication,
@@ -285,7 +368,9 @@ def parse_semantic_pdf(company: str, source_url: str, data: bytes) -> Tuple[List
 
         page_diags.append({
             "page": page_idx + 1,
+            "headerInherited": inherited,
             "header": {k: round(v, 1) for k, v in header.items()},
+            "codeAnchors": len(anchors),
             "stageRows": len(stages),
             "parsedRows": parsed_here,
             "rejectedRows": rejected_here,
@@ -295,7 +380,13 @@ def parse_semantic_pdf(company: str, source_url: str, data: bytes) -> Tuple[List
     deduped: List[Dict[str, Any]] = []
     seen = set()
     for row in rows:
-        key = (norm(row["developmentCode"]), norm(row["indication"]), norm(row["phase"]), norm(row["marketRegion"]))
+        key = (
+            norm(row["developmentCode"]),
+            norm(row["molecule"]),
+            norm(row["indication"]),
+            norm(row["phase"]),
+            norm(row["marketRegion"]),
+        )
         if key in seen:
             continue
         seen.add(key)

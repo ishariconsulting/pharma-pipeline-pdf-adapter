@@ -273,20 +273,30 @@ def _raw_code_anchors(
 
 
 def _active_code(anchors: List[Tuple[float, str]], y: float) -> Tuple[Optional[float], str]:
-    """Associate a stage row to the nearest plausible development-code anchor.
+    """Associate a stage row to the active development-code block.
 
-    PDF tables often place the stage a few points above the code/indication
-    baseline, so a small forward allowance is required. Prefer geometric
-    proximity rather than blindly carrying the previous code forward.
+    Pipeline tables normally carry one development code downward across one or
+    more indication/market rows. Prefer the latest preceding anchor. A small
+    forward allowance is used only when no preceding anchor exists, covering
+    layouts where the code baseline sits just below the stage baseline.
     """
-    eligible = [
+    preceding = [
         (cy, text)
         for cy, text in anchors
-        if (cy <= y + 30.0 and y - cy <= 140.0)
+        if cy <= y + 4.0 and y - cy <= 140.0
     ]
-    if not eligible:
-        return None, ""
-    return min(eligible, key=lambda item: (abs(item[0] - y), 0 if item[0] <= y else 1))
+    if preceding:
+        return max(preceding, key=lambda item: item[0])
+
+    forward = [
+        (cy, text)
+        for cy, text in anchors
+        if y < cy <= y + 18.0
+    ]
+    if forward:
+        return min(forward, key=lambda item: item[0])
+
+    return None, ""
 
 
 def _generic_name_for_code(

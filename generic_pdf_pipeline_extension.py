@@ -282,7 +282,7 @@ def _active_code(anchors: List[Tuple[float, str]], y: float) -> Tuple[Optional[f
     eligible = [
         (cy, text)
         for cy, text in anchors
-        if (cy <= y + 40.0 and y - cy <= 140.0)
+        if (cy <= y + 30.0 and y - cy <= 140.0)
     ]
     if not eligible:
         return None, ""
@@ -318,6 +318,7 @@ def parse_semantic_pdf(company: str, source_url: str, data: bytes) -> Tuple[List
 
     rows: List[Dict[str, Any]] = []
     page_diags: List[Dict[str, Any]] = []
+    failure_samples: List[Dict[str, Any]] = []
     active_header: Optional[Dict[str, float]] = None
 
     for page_idx in range(len(doc)):
@@ -381,6 +382,13 @@ def parse_semantic_pdf(company: str, source_url: str, data: bytes) -> Tuple[List
             code_y, development_code = _active_code(anchors, y)
             if not development_code:
                 rejected_here += 1
+                failure_samples.append({
+                    "page": page_idx + 1,
+                    "y": round(y, 1),
+                    "phase": phase,
+                    "stageText": stage_text,
+                    "reason": "NO_DEVELOPMENT_CODE",
+                })
                 continue
 
             indication_words = [
@@ -410,6 +418,14 @@ def parse_semantic_pdf(company: str, source_url: str, data: bytes) -> Tuple[List
 
             if not indication:
                 rejected_here += 1
+                failure_samples.append({
+                    "page": page_idx + 1,
+                    "y": round(y, 1),
+                    "phase": phase,
+                    "stageText": stage_text,
+                    "developmentCode": development_code,
+                    "reason": "NO_INDICATION",
+                })
                 continue
 
             next_code_y = None
@@ -487,6 +503,7 @@ def parse_semantic_pdf(company: str, source_url: str, data: bytes) -> Tuple[List
         "exactDuplicates": 0,
         "phaseUnresolved": 0,
         "rowFailures": sum(int(p.get("rejectedRows", 0)) for p in page_diags),
+        "failureSamples": failure_samples[:12],
         "boundaryWarnings": 0,
         "companySpecificParserBranch": False,
         "portfolioDependentValidation": False,

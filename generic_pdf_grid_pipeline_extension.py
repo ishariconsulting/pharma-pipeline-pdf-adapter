@@ -191,12 +191,16 @@ def _phase_from_icon(doc: fitz.Document, xref: int) -> Tuple[str, Dict[str, Any]
     }
 
 
-def _row_band_for_marker(page: fitz.Page, marker: fitz.Rect) -> fitz.Rect:
+def _row_band_for_marker(
+    page: fitz.Page,
+    marker: fitz.Rect,
+    drawings: List[Dict[str, Any]],
+) -> fitz.Rect:
     yc = (marker.y0 + marker.y1) / 2
     xc = (marker.x0 + marker.x1) / 2
     candidates: List[fitz.Rect] = []
 
-    for drawing in page.get_drawings():
+    for drawing in drawings:
         rr = drawing.get("rect")
         fill = drawing.get("fill")
         if rr is None or fill is None:
@@ -230,8 +234,9 @@ def _phase_markers(
     unresolved: List[Dict[str, Any]] = []
     seen = set()
 
-    for image in page.get_images(full=True):
-        xref = int(image[0])
+    image_xrefs = sorted({int(image[0]) for image in page.get_images(full=True)})
+
+    for xref in image_xrefs:
         try:
             rects = page.get_image_rects(xref)
         except Exception:
@@ -349,6 +354,7 @@ def parse_semantic_pdf_grid(
 
         header_pages += 1
         markers, unresolved = _phase_markers(doc, page, headers["phase"])
+        drawings = page.get_drawings()
         unresolved_icons.extend([
             {"page": page_index + 1, **x} for x in unresolved
         ])
@@ -365,7 +371,7 @@ def parse_semantic_pdf_grid(
         rejected_here = 0
 
         for marker in markers:
-            band = _row_band_for_marker(page, marker["rect"])
+            band = _row_band_for_marker(page, marker["rect"], drawings)
             # Clip strictly to the data-row band to avoid DESCRIPTION prose.
             raw_asset = _clip_text(page, fitz.Rect(asset_x, band.y0, ta_x, band.y1))
             therapeutic_area = _clip_text(page, fitz.Rect(ta_x, band.y0, ind_x, band.y1))

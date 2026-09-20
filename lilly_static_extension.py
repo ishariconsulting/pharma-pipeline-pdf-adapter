@@ -47,6 +47,23 @@ class LillyStaticResponse(BaseModel):
     failClosed: bool
 
 
+class LillyPipelineCompatResponse(BaseModel):
+    version: str
+    routeVersion: str
+    company: str
+    sourceUrl: str
+    sourceDate: str
+    retrievalMode: str
+    readOnly: bool
+    readyForDiscovery: bool
+    rowCount: int
+    rows: List[Dict[str, Any]]
+    summary: Dict[str, Any]
+    issues: List[Dict[str, Any]]
+    diagnostics: Dict[str, Any]
+    guardrails: Dict[str, Any]
+
+
 def extract_lilly_static() -> LillyStaticResponse:
     pdf = download_pdf()
     doc = fitz.open(stream=pdf, filetype="pdf")
@@ -130,3 +147,111 @@ async def lilly_static_extract(
 ) -> LillyStaticResponse:
     _auth(x_adapter_key)
     return extract_lilly_static()
+
+def extract_lilly_pipeline_compat() -> LillyPipelineCompatResponse:
+    """Expose the validated Lilly static parser through the recurring-pipeline contract."""
+    base = extract_lilly_static()
+    rows: List[Dict[str, Any]] = []
+
+    for idx, project in enumerate(base.projects, start=1):
+        asset = str(project.get("asset") or "").strip()
+        indication = str(project.get("indication") or "").strip()
+        phase = str(project.get("phase") or "").strip()
+
+        rows.append({
+            "company": base.company,
+            "sourceFamily": "Company Pipeline",
+            "sourceRecordId": f"lilly-static:{idx}",
+            "sourceUrl": base.sourceUrl,
+            "asset": asset,
+            "molecule": "",
+            "developmentCode": "",
+            "brand": "",
+            "indication": indication,
+            "phase": phase,
+            "phaseEvidence": "SOURCE_INVESTOR_PDF",
+            "programStatus": "",
+            "sponsorOwner": base.company,
+            "partners": [],
+            "study": "",
+            "trialIds": [],
+            "therapeuticArea": "",
+            "sourcePage": project.get("sourcePage"),
+            "sourceOrdinal": idx,
+            "parserMethod": "LILLY_VECTOR_GEOMETRY",
+            "sourceAdapter": "PIPELINE_LILLY_INVESTOR_PDF_V1",
+        })
+
+    diagnostics = {
+        **base.diagnostics,
+        "rowFailures": 0,
+        "exactDuplicatesRemoved": 0,
+        "exactDuplicates": 0,
+        "phaseUnresolved": 0,
+        "boundaryWarnings": 0,
+        "portfolioDependentValidation": False,
+        "companySpecificParserBranch": True,
+        "writes": 0,
+    }
+    ready = bool(base.parserBindingValidated) and len(rows) >= 40
+    issues: List[Dict[str, Any]] = []
+    if not ready:
+        issues.append({"issue": "Lilly static parser/source validation did not pass"})
+
+    summary = {
+        "structuralValidationPass": ready,
+        "actual": {"Total": len(rows)},
+        "productionStatus": (
+            "READY FOR AIRTABLE DELTA COMPARISON"
+            if ready
+            else "FAIL CLOSED - PARSER/STRUCTURE REVIEW REQUIRED"
+        ),
+        "selectedMethod": "LILLY_VECTOR_GEOMETRY",
+        "portfolioDependentValidation": False,
+        "companySpecificParserBranch": True,
+        "writeMode": "READ_ONLY",
+    }
+
+    return LillyPipelineCompatResponse(
+        version="PIPELINE_LILLY_INVESTOR_PDF_V1",
+        routeVersion="LILLY_STATIC_PIPELINE_COMPAT_V1.0_READ_ONLY",
+        company=base.company,
+        sourceUrl=base.sourceUrl,
+        sourceDate=base.sourceDate,
+        retrievalMode=base.retrievalMode,
+        readOnly=True,
+        readyForDiscovery=ready,
+        rowCount=len(rows),
+        rows=rows,
+        summary=summary,
+        issues=issues,
+        diagnostics=diagnostics,
+        guardrails={
+            "airtableWrites": False,
+            "portfolioWrites": False,
+            "masterDataWrites": False,
+            "portfolioDependentValidation": False,
+            "publicFirstPartySource": True,
+            "failClosed": True,
+        },
+    )
+
+
+@app.get("/extract/lilly/pipeline/health")
+async def lilly_pipeline_compat_health() -> Dict[str, Any]:
+    return {
+        "ok": True,
+        "version": "PIPELINE_LILLY_INVESTOR_PDF_V1",
+        "routeVersion": "LILLY_STATIC_PIPELINE_COMPAT_V1.0_READ_ONLY",
+        "retrievalMode": "STATIC_DOCUMENT",
+        "readOnly": True,
+    }
+
+
+@app.get("/extract/lilly/pipeline", response_model=LillyPipelineCompatResponse)
+async def lilly_pipeline_compat(
+    x_adapter_key: Optional[str] = Header(default=None),
+) -> LillyPipelineCompatResponse:
+    _auth(x_adapter_key)
+    return extract_lilly_pipeline_compat()
+

@@ -346,6 +346,8 @@ def parse_semantic_pdf(company: str, source_url: str, data: bytes) -> Tuple[List
     carry_code: str = ""
     carry_molecule: str = ""
     carry_uses = 0
+    page_anchor_maps: Dict[int, List[Tuple[float, str]]] = {}
+    page_anchor_molecules: Dict[Tuple[int, str], str] = {}
 
     for page_idx in range(len(doc)):
         page = doc[page_idx]
@@ -405,6 +407,17 @@ def parse_semantic_pdf(company: str, source_url: str, data: bytes) -> Tuple[List
             carry_uses += 1
 
         anchor_ys = [y for y, _ in anchors]
+        page_anchor_maps[page_idx + 1] = list(anchors)
+        for anchor_y, anchor_code in anchors:
+            future = [ay for ay in anchor_ys if ay > anchor_y + 2.0]
+            next_anchor_y = min(future) if future else None
+            page_anchor_molecules[(page_idx + 1, norm(anchor_code))] = _generic_name_for_code(
+                words,
+                header,
+                anchor_y,
+                next_anchor_y,
+            )
+
         parsed_here = 0
         rejected_here = 0
         inherited_indication_by_code: Dict[str, str] = {}
@@ -534,7 +547,11 @@ def parse_semantic_pdf(company: str, source_url: str, data: bytes) -> Tuple[List
             carry_code = clean(page_rows[-1].get("developmentCode"))
             carry_molecule = clean(page_rows[-1].get("molecule"))
 
-    boundary_samples: List[Dict[str, Any]] = []
+    # Repair only high-confidence multi-market / continuation groups. When
+    # consecutive rows have exactly the same indication and phase, select the
+    # code anchor nearest to the group's vertical span. A repair is allowed
+    # only when that anchor is clearly closer than the runner-up.
+    boundary_repairs: List[Dict[str, Any]] = []
     ordered_rows = sorted(
         rows,
         key=lambda r: (
@@ -542,6 +559,74 @@ def parse_semantic_pdf(company: str, source_url: str, data: bytes) -> Tuple[List
             float(r.get("sourceStageY") or 0),
         ),
     )
+    groups: List[List[Dict[str, Any]]] = []
+    current_group: List[Dict[str, Any]] = []
+    for row in ordered_rows:
+        if not current_group:
+            current_group = [row]
+            continue
+        prev = current_group[-1]
+        same_group = (
+            row.get("sourcePage") == prev.get("sourcePage")
+            and norm(row.get("indication")) == norm(prev.get("indication"))
+            and norm(row.get("phase")) == norm(prev.get("phase"))
+            and abs(float(row.get("sourceStageY") or 0) - float(prev.get("sourceStageY") or 0)) <= 24.0
+        )
+        if same_group:
+            current_group.append(row)
+        else:
+            groups.append(current_group)
+            current_group = [row]
+    if current_group:
+        groups.append(current_group)
+
+    for group in groups:
+        if len(group) < 2:
+            continue
+        page_no = int(group[0].get("sourcePage") or 0)
+        anchors_for_page = page_anchor_maps.get(page_no, [])
+        if not anchors_for_page:
+            continue
+        low_y = min(float(r.get("sourceStageY") or 0) for r in group)
+        high_y = max(float(r.get("sourceStageY") or 0) for r in group)
+
+        scored: List[Tuple[float, float, str]] = []
+        for anchor_y, anchor_code in anchors_for_page:
+            if low_y <= anchor_y <= high_y:
+                distance = 0.0
+            else:
+                distance = min(abs(anchor_y - low_y), abs(anchor_y - high_y))
+            scored.append((distance, anchor_y, anchor_code))
+        scored.sort(key=lambda item: (item[0], item[1]))
+        if not scored:
+            continue
+        best = scored[0]
+        second_distance = scored[1][0] if len(scored) > 1 else 999.0
+        if best[0] > 35.0 or best[0] + 12.0 > second_distance:
+            continue
+
+        chosen_code = best[2]
+        existing_codes = {norm(r.get("developmentCode")) for r in group if norm(r.get("developmentCode"))}
+        if len(existing_codes) <= 1 and norm(chosen_code) in existing_codes:
+            continue
+
+        chosen_molecule = page_anchor_molecules.get((page_no, norm(chosen_code)), "")
+        for row in group:
+            row["developmentCode"] = chosen_code
+            row["molecule"] = chosen_molecule
+            row["asset"] = chosen_molecule or chosen_code
+            row["sourceCodeY"] = round(best[1], 1)
+        boundary_repairs.append({
+            "page": page_no,
+            "indication": group[0].get("indication"),
+            "phase": group[0].get("phase"),
+            "rowCount": len(group),
+            "selectedCode": chosen_code,
+            "anchorDistance": round(best[0], 1),
+            "runnerUpDistance": round(second_distance, 1),
+        })
+
+    boundary_samples: List[Dict[str, Any]] = []
     for prev, cur in zip(ordered_rows, ordered_rows[1:]):
         if prev.get("sourcePage") != cur.get("sourcePage"):
             continue
@@ -597,6 +682,8 @@ def parse_semantic_pdf(company: str, source_url: str, data: bytes) -> Tuple[List
         "failureSamples": failure_samples[:12],
         "boundaryWarnings": len(boundary_samples),
         "boundarySamples": boundary_samples[:12],
+        "boundaryRepairs": len(boundary_repairs),
+        "boundaryRepairSamples": boundary_repairs[:12],
         "crossPageCarryUses": carry_uses,
         "companySpecificParserBranch": False,
         "portfolioDependentValidation": False,

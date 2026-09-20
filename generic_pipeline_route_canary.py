@@ -1,33 +1,35 @@
-"""Read-only canary for generic PDF table + stage-bar parser families."""
-import asyncio, json
-from generic_pdf_pipeline_extension import extract_generic_pdf
+"""Read-only Roche phase-section PDF layout diagnostic."""
+import json, re, httpx, fitz
 
-SOURCES=[
- ("Takeda","https://assets-dam.takeda.com/image/upload/v1785376660/Global/Investor/Financial-Results/FY2026/Q1/qr2026_q1_Pipeline_table_en.pdf"),
- ("argenx SE","https://argenx.com/content/dam/argenx-corp/pipeline/Pipeline_August2026%201.pdf.coredownload.inline.pdf"),
- ("Roche","https://assets.roche.com/f/176343/x/cb875526bd/pharmahy26.pdf"),
-]
+URL="https://assets.roche.com/f/176343/x/cb875526bd/pharmahy26.pdf"
+r=httpx.get(URL,timeout=45,follow_redirects=True,headers={"User-Agent":"Mozilla/5.0"})
+r.raise_for_status()
+doc=fitz.open(stream=r.content,filetype="pdf")
 
-async def one(company,url):
-    try:
-        r=await extract_generic_pdf(company,url,35.0)
-        payload={
-          "company":company,
-          "readyForDiscovery":r.readyForDiscovery,
-          "rowCount":r.rowCount,
-          "summary":r.summary,
-          "validation":r.validation,
-          "diagnostics":r.diagnostics,
-          "sampleRows":r.rows[:24],
-          "masterWrites":0,
-        }
-    except Exception as exc:
-        payload={"company":company,"readyForDiscovery":False,"error":f"{type(exc).__name__}: {exc}","masterWrites":0}
-    print("GENERIC_PDF_FAMILY_CANARY "+json.dumps(payload,ensure_ascii=False),flush=True)
+for pno in [1,2]:
+    p=doc[pno]
+    words=p.get_text("words")
+    lines={}
+    for w in words:
+        y=(float(w[1])+float(w[3]))/2
+        key=round(y/3)*3
+        lines.setdefault(key,[]).append(w)
 
-async def main():
-    for company,url in SOURCES:
-        await one(company,url)
-
-if __name__=="__main__":
-    asyncio.run(main())
+    useful=[]
+    for y,ws in sorted(lines.items()):
+        text=" ".join(str(w[4]) for w in sorted(ws,key=lambda q:q[0]))
+        if (
+            re.search(r"Phase\s+[I1-3]|Registration|RG\d|giredestrant|prasinezumab|fenebrutinib|tiragolumab",text,re.I)
+            or (55 <= y <= 220)
+        ):
+            useful.append({
+                "y":y,
+                "items":[{"x":round(float(w[0]),1),"t":w[4]} for w in sorted(ws,key=lambda q:q[0])][:80]
+            })
+    print("ROCHE_SECTION_LAYOUT "+json.dumps({
+        "page":pno+1,
+        "width":p.rect.width,
+        "height":p.rect.height,
+        "textHead":p.get_text("text",sort=True)[:2500],
+        "lines":useful[:100],
+    },ensure_ascii=False),flush=True)

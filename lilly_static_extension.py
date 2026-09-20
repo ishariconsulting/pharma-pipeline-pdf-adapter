@@ -157,6 +157,8 @@ def extract_lilly_pipeline_compat() -> LillyPipelineCompatResponse:
         asset = str(project.get("asset") or "").strip()
         indication = str(project.get("indication") or "").strip()
         phase = str(project.get("phase") or "").strip()
+        if norm(phase) == "reg review":
+            phase = "Filed / Registration"
 
         rows.append({
             "company": base.company,

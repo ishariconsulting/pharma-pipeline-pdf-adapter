@@ -811,7 +811,12 @@
                ------------------------------------------------------------ */
 
             const external = await getJson(adapterRequestPath);
-            const sourceRows = Array.isArray(external.rows) ? external.rows : [];
+            const allSourceRows = Array.isArray(external.rows) ? external.rows : [];
+            // The pipeline monitor owns active development only. Approved /
+            // commercial rows are handled by Products + Regulatory truth and
+            // must not become "new development programme" queue candidates.
+            const sourceRows = allSourceRows.filter(r => stageRank(r.phase) < 5);
+            const outOfScopeApprovedRows = allSourceRows.length - sourceRows.length;
 
             const counts = {"Phase 1":0,"Phase 2":0,"Phase 3":0,"Filed / Registration":0};
             for (const r of sourceRows) if (counts[r.phase] !== undefined) counts[r.phase]++;
@@ -851,6 +856,7 @@
                     retrievalMode,
                     sourceGuardrailPass: false,
                     officialRows: sourceRows.length,
+                    outOfScopeApprovedRows,
                     counts,
                     adapterVersion: external.version || "",
                     adapterProductionStatus: externalSummary.productionStatus || "",
@@ -1592,6 +1598,7 @@
                 sourceUrl: external.sourceUrl || "",
 
                 officialRows: sourceRows.length,
+                outOfScopeApprovedRows,
                 sourceCounts: counts,
                 historicalBaselineCoverageMatches:
                     externalSummary.baselineCoverageMatches === true,
@@ -2032,7 +2039,8 @@
                 [swf.nextCheck.id]: nextCheck,
                 [swf.confidence.id]: {name: "High"},
                 [swf.stateNotes.id]:
-                    `${ROUTER_VERSION}: ${sourceRows.length} official ${companyName} programmes parsed via ${adapterProfile}; ` +
+                    `${ROUTER_VERSION}: ${sourceRows.length} active-development ${companyName} programmes parsed via ${adapterProfile}; ` +
+                    `${outOfScopeApprovedRows} approved/commercial source row(s) kept out of pipeline-delta routing; ` +
                     `${noChange.length} unchanged, ${laterStagePreserved.length} later-stage preserved, ` +
                     `${phaseChanges.length} phase changes, ${programmeChanges.length} programme changes, ` +
                     `${newProgrammes.length} new programmes, ${sourceDisappearances.length} source disappearances. ` +

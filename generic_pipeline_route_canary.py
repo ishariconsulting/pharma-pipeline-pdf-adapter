@@ -1,94 +1,120 @@
-"""Read-only V1.2 generic pipeline route canary.
+"""Read-only direct source-shape diagnostics for generic pipeline onboarding.
 
-Runs the outstanding Source Watch pipeline URLs through the same generic
-extraction function that production would call. Prints compact structural
-results only. No Airtable or master-data writes.
+No Airtable writes. No browser fallback. Captures enough structural evidence
+from the official source HTML to improve the reusable parser safely.
 """
 
 import asyncio
 import json
+import re
 
-from generic_pipeline_extension import _extract_generic_pipeline
+from generic_pipeline_extension import _fetch_raw_public_html
+from generic_pipeline_interpreter_canary import (
+    PageShapeParser,
+    interpret_pipeline_html,
+    validate_source,
+)
 
 
 SOURCES = [
-    ("AbbVie", "https://www.abbvie.com/science/pipeline.html"),
     ("Gilead Sciences", "https://www.gilead.com/science/pipeline"),
     ("Amgen", "https://www.amgen.com/science/clinical-trials"),
     ("Ionis Pharmaceuticals", "https://ionis.com/science-and-innovation/pipeline"),
     ("Johnson & Johnson Key Events", "https://www.investor.jnj.com/pipeline/2026-key-events/default.aspx"),
-    ("Verve Therapeutics", "https://www.vervetx.com/our-programs/our-pipeline"),
     ("GSK", "https://www.gsk.com/en-gb/innovation/pipeline/"),
     ("Biogen", "https://www.biogen.com/science-and-innovation/pipeline.html"),
     ("Johnson & Johnson Innovative Medicine", "https://www.investor.jnj.com/pipeline/Innovative-Medicine-pipeline/default.aspx"),
     ("Merck KGaA", "https://www.emdgroup.com/en/research/our-approach-to-research-and-development/healthcare.html"),
     ("Menarini Group", "https://www.menarini.com/en-us/innovation-research/our-pipeline-and-products.html"),
-    ("Vertex Pharmaceuticals", "https://www.vrtx.com/our-science/pipeline/"),
     ("Takeda", "https://www.takeda.com/science/pipeline/"),
     ("argenx SE", "https://argenx.com/pipeline"),
-    ("Bayer", "https://www.bayer.com/en/pharma/development-pipeline"),
     ("Roche", "https://www.roche.com/solutions/pipeline"),
-    ("Boehringer Ingelheim", "https://www.boehringer-ingelheim.com/science-innovation/human-health-innovation/pipeline"),
     ("BioNTech SE", "https://www.biontech.com/int/en/home/pipeline-and-products/pipeline.html"),
     ("Wave Life Sciences", "https://wavelifesciences.com/pipeline/research-and-development/"),
-    ("Sobi", "https://www.sobi.com/en/pipeline"),
+    ("Boehringer Ingelheim", "https://www.boehringer-ingelheim.com/science-innovation/human-health-innovation/pipeline"),
 ]
+
+SIGNAL_RE = re.compile(
+    r"phase\s*[1-4]|phase\s*i{1,3}|preclinical|registration|regulatory|indication|pipeline|program|programme|candidate",
+    re.I,
+)
+
+
+def compact_line(line: str) -> str:
+    return " ".join(str(line).split())[:300]
 
 
 async def one(company: str, url: str, sem: asyncio.Semaphore):
     async with sem:
         try:
-            result = await _extract_generic_pipeline(
-                company=company,
-                source_url=url,
-                timeout_seconds=22.0,
+            html, final_url = await _fetch_raw_public_html(url, timeout_seconds=25.0)
+            parser = PageShapeParser()
+            parser.feed(html)
+            rows, diagnostics = await asyncio.to_thread(
+                interpret_pipeline_html,
+                company,
+                final_url,
+                html,
             )
+            validation = validate_source(company, rows, diagnostics)
+
+            signal_lines = []
+            for idx, line in enumerate(parser.visible_lines):
+                if SIGNAL_RE.search(line):
+                    signal_lines.append({"i": idx, "text": compact_line(line)})
+                    if len(signal_lines) >= 18:
+                        break
+
+            table_samples = []
+            for ti, table in enumerate(parser.tables[:5]):
+                sample_rows = []
+                for raw_row in table[:5]:
+                    cells = [compact_line(c) for c in raw_row if compact_line(c)]
+                    if cells:
+                        sample_rows.append(cells[:10])
+                if sample_rows:
+                    table_samples.append({"table": ti, "rows": sample_rows})
+
             payload = {
                 "company": company,
-                "readyForDiscovery": result.readyForDiscovery,
-                "rowCount": result.rowCount,
-                "retrievalMode": result.summary.get("retrievalMode"),
-                "routingReason": result.summary.get("routingReason"),
-                "selectedMethod": result.summary.get("selectedMethod"),
-                "portfolioDependentValidation": result.summary.get("portfolioDependentValidation"),
-                "issues": [x.get("issue") for x in result.issues],
-                "sample": [
-                    {
-                        "asset": r.get("asset"),
-                        "indication": r.get("indication"),
-                        "phase": r.get("phase"),
-                    }
-                    for r in result.rows[:2]
-                ],
+                "finalUrl": final_url,
+                "htmlChars": len(html),
+                "visibleLineCount": len(parser.visible_lines),
+                "tableCount": len(parser.tables),
+                "semanticTableRows": diagnostics.get("semanticTableRows"),
+                "labelledFlowRows": diagnostics.get("labelledFlowRows"),
+                "selectedRows": diagnostics.get("selectedRows"),
+                "selectedMethod": diagnostics.get("selectedMethod"),
+                "validationPass": validation.get("pass"),
+                "issues": validation.get("issues"),
+                "signalLines": signal_lines,
+                "tableSamples": table_samples,
             }
         except Exception as exc:
             payload = {
                 "company": company,
-                "readyForDiscovery": False,
-                "rowCount": 0,
-                "retrievalMode": None,
-                "routingReason": "EXCEPTION",
-                "selectedMethod": None,
-                "portfolioDependentValidation": False,
+                "validationPass": False,
                 "issues": [f"{type(exc).__name__}: {exc}"],
-                "sample": [],
             }
 
-        print("GENERIC_PIPELINE_CANARY", json.dumps(payload, ensure_ascii=False), flush=True)
+        print("PIPELINE_SHAPE_DIAGNOSTIC", json.dumps(payload, ensure_ascii=False), flush=True)
         return payload
 
 
 async def main():
     sem = asyncio.Semaphore(4)
     results = await asyncio.gather(*(one(company, url, sem) for company, url in SOURCES))
-    summary = {
-        "tested": len(results),
-        "pass": sum(1 for r in results if r["readyForDiscovery"]),
-        "fail": sum(1 for r in results if not r["readyForDiscovery"]),
-        "browser": sum(1 for r in results if r.get("retrievalMode") == "BROWSER_REQUIRED"),
-        "portfolioDependentValidation": any(r.get("portfolioDependentValidation") for r in results),
-    }
-    print("GENERIC_PIPELINE_CANARY_SUMMARY", json.dumps(summary), flush=True)
+    print(
+        "PIPELINE_SHAPE_SUMMARY",
+        json.dumps(
+            {
+                "tested": len(results),
+                "structuralPass": sum(1 for r in results if r.get("validationPass")),
+                "failed": sum(1 for r in results if not r.get("validationPass")),
+            }
+        ),
+        flush=True,
+    )
 
 
 if __name__ == "__main__":

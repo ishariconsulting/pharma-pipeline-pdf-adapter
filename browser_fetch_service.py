@@ -22,7 +22,7 @@ from pydantic import BaseModel
 from playwright.async_api import Browser, BrowserContext, Page, async_playwright
 
 
-BROWSER_FETCH_VERSION = "BROWSER_RETRIEVAL_V1.0"
+BROWSER_FETCH_VERSION = "BROWSER_RETRIEVAL_V1.1_STRUCTURED_DOM"
 MAX_VISIBLE_TEXT = 200_000
 MAX_HTML_BYTES = 2_500_000
 MAX_ANCHORS = 400

@@ -203,7 +203,7 @@ def _row_band_for_marker(page: fitz.Page, marker: fitz.Rect) -> fitz.Rect:
             continue
         if not (rr.x0 <= xc <= rr.x1 and rr.y0 <= yc <= rr.y1):
             continue
-        if rr.width < 18 or rr.height < 14 or rr.height > 55:
+        if rr.width < 18 or rr.height < 20 or rr.height > 55:
             continue
         vals = [float(x) for x in fill]
         if max(vals) - min(vals) > 0.05:

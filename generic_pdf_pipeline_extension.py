@@ -377,6 +377,22 @@ def parse_semantic_pdf(company: str, source_url: str, data: bytes) -> Tuple[List
         parsed_here = 0
         rejected_here = 0
         inherited_indication_by_code: Dict[str, str] = {}
+        direct_indications_by_code: Dict[str, set[str]] = {}
+
+        for probe_y, _, _ in stages:
+            _, probe_code = _active_code(anchors, probe_y)
+            if not probe_code:
+                continue
+            probe_words = [
+                w for w in words
+                if header["indicationX"] - 6 <= float(w[0]) < header["regionX"] - 3
+                and abs(_word_center_y(w) - probe_y) <= 19.0
+            ]
+            probe_indication = _join_words(probe_words)
+            if clean(probe_indication) == "-":
+                probe_indication = "Undisclosed"
+            if probe_indication:
+                direct_indications_by_code.setdefault(probe_code, set()).add(probe_indication)
 
         for y, phase, stage_text in stages:
             code_y, development_code = _active_code(anchors, y)
@@ -406,6 +422,10 @@ def parse_semantic_pdf(company: str, source_url: str, data: bytes) -> Tuple[List
                 inherited_indication_by_code[development_code] = indication
             else:
                 indication = inherited_indication_by_code.get(development_code, "")
+                if not indication:
+                    source_indications = direct_indications_by_code.get(development_code, set())
+                    if len(source_indications) == 1:
+                        indication = next(iter(source_indications))
 
             region_words = [
                 w for w in words
@@ -647,7 +667,7 @@ def parse_stage_bar_pdf(
             program_lines.append((line["y"], text))
 
         stage_centers = header["stageCenters"]
-        bars = []
+        bars: List[Dict[str, Any]] = []
         for drawing in page.get_drawings():
             rect = drawing.get("rect")
             fill = drawing.get("fill")
@@ -665,10 +685,12 @@ def parse_stage_bar_pdf(
             # more saturated/darker than the ~0.945 neutral row background.
             if max(fill) - min(fill) < 0.03 and sum(fill) / 3.0 > 0.85:
                 continue
-            bars.append(rect)
+            fill_key = tuple(round(float(v), 3) for v in fill)
+            bars.append({"rect": rect, "fillKey": fill_key})
 
-        parsed_here = 0
-        for rect in sorted(bars, key=lambda r: r.y0):
+        candidates: List[Dict[str, Any]] = []
+        for bar in sorted(bars, key=lambda item: item["rect"].y0):
+            rect = bar["rect"]
             y = (rect.y0 + rect.y1) / 2.0
             label = min(
                 stage_centers,
@@ -684,12 +706,48 @@ def parse_stage_bar_pdf(
             indication = _join_words(indication_words)
 
             # Programme names can be vertically centred across a block of
-            # several indication rows. Use the nearest explicit programme text.
+            # several indication rows. Start with nearby explicit text.
             programme = ""
             if program_lines:
                 py, ptext = min(program_lines, key=lambda item: abs(item[0] - y))
                 if abs(py - y) <= 85.0:
                     programme = clean(ptext)
+
+            candidates.append({
+                "rect": rect,
+                "fillKey": bar["fillKey"],
+                "y": y,
+                "label": label,
+                "phase": phase,
+                "indication": indication,
+                "programme": programme,
+            })
+
+        # Dynamically learn the document's own colour semantics from rows that
+        # have both an explicit programme label and a vector-bar fill. No
+        # hard-coded colour or company legend is used.
+        fill_programmes: Dict[Tuple[float, ...], set[str]] = {}
+        for candidate in candidates:
+            if candidate["programme"]:
+                fill_programmes.setdefault(candidate["fillKey"], set()).add(
+                    candidate["programme"]
+                )
+
+        for candidate in candidates:
+            if candidate["programme"]:
+                continue
+            programmes = fill_programmes.get(candidate["fillKey"], set())
+            if len(programmes) == 1:
+                candidate["programme"] = next(iter(programmes))
+
+        parsed_here = 0
+        for candidate in candidates:
+            rect = candidate["rect"]
+            y = candidate["y"]
+            label = candidate["label"]
+            phase = candidate["phase"]
+            indication = candidate["indication"]
+            programme = candidate["programme"]
 
             if not programme or not indication or not phase:
                 failures.append({
@@ -698,6 +756,7 @@ def parse_stage_bar_pdf(
                     "programme": programme,
                     "indication": indication,
                     "sourceStage": label,
+                    "fillKey": list(candidate["fillKey"]),
                 })
                 continue
 

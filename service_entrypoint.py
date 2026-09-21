@@ -18,3 +18,4 @@ import generic_pdf_pipeline_extension  # noqa: E402,F401
 import sitecore_sxa_pipeline_extension  # noqa: E402,F401
 import ionis_json_pipeline_extension  # noqa: E402,F401
 import amgen_json_pipeline_extension  # noqa: E402,F401
+import abbvie_pdf_pipeline_extension  # noqa: E402,F401

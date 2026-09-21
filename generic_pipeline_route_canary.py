@@ -1,23 +1,38 @@
-"""Read-only Roche targeted word-coordinate diagnostic."""
-import asyncio, json, fitz
-from generic_pdf_pipeline_extension import download_pdf, _word_center_y
+"""Read-only Roche final semantic PDF canary."""
+import asyncio, json
+from collections import Counter
+from generic_pdf_pipeline_extension import extract_generic_pdf
 
 URL="https://assets.roche.com/f/176343/x/cb875526bd/pharmahy26.pdf"
 
 async def main():
-    data,final=await download_pdf(URL,35.0)
-    page=fitz.open(stream=data,filetype="pdf")[3]
-    words=page.get_text("words")
-    targets=[144,150,156,182,194,198,204,216,240,246,252,178,190,196,200,212]
-    out=[]
-    for target in targets:
-        ws=[w for w in words if abs(_word_center_y(w)-target)<=3.0]
-        if ws:
-            out.append({
-              "target":target,
-              "words":[{"x0":round(float(w[0]),1),"x1":round(float(w[2]),1),"t":str(w[4])} for w in sorted(ws,key=lambda q:float(q[0]))]
-            })
-    print("ROCHE_TARGET_COORDS "+json.dumps({"rows":out,"masterWrites":0},ensure_ascii=False),flush=True)
+    try:
+        r=await extract_generic_pdf("Roche",URL,35.0)
+        phases=Counter(x.get("phase","") for x in r.rows)
+        methods=Counter(x.get("parserMethod","") for x in r.rows)
+        blank_codes=sum(1 for x in r.rows if not x.get("developmentCode"))
+        print("ROCHE_FINAL_PDF_CANARY "+json.dumps({
+          "readyForDiscovery":r.readyForDiscovery,
+          "rowCount":r.rowCount,
+          "issues":[x.get("issue") for x in r.issues],
+          "selectedMethod":r.summary.get("selectedMethod"),
+          "phaseCounts":dict(phases),
+          "parserMethods":dict(methods),
+          "blankDevelopmentCodes":blank_codes,
+          "declaredProgrammes":r.diagnostics.get("declaredProgrammes"),
+          "rowFailures":r.diagnostics.get("rowFailures"),
+          "coverageWarnings":r.diagnostics.get("coverageWarnings"),
+          "boundaryWarnings":r.diagnostics.get("boundaryWarnings"),
+          "pageDiagnostics":r.diagnostics.get("pages"),
+          "sampleRows":r.rows[:15],
+          "masterWrites":0,
+        },ensure_ascii=False),flush=True)
+    except Exception as exc:
+        print("ROCHE_FINAL_PDF_CANARY "+json.dumps({
+          "readyForDiscovery":False,
+          "error":f"{type(exc).__name__}: {exc}",
+          "masterWrites":0
+        },ensure_ascii=False),flush=True)
 
 if __name__=="__main__":
     asyncio.run(main())

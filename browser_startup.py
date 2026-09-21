@@ -2,6 +2,7 @@
 
 import asyncio
 import os
+import hashlib
 
 import httpx
 
@@ -39,6 +40,16 @@ async def _probe(url: str) -> None:
 
 
 async def main() -> None:
+    key = os.getenv("BROWSER_FETCH_KEY", "")
+    print(
+        "BROWSER_KEY_FINGERPRINT",
+        {
+            "configured": bool(key),
+            "sha256_12": hashlib.sha256(key.encode("utf-8")).hexdigest()[:12] if key else None,
+            "length": len(key),
+        },
+        flush=True,
+    )
     if os.getenv("RUN_BROWSER_PROBES_ON_START", "").strip().lower() in TRUE_VALUES:
         for url in [
             LILLY_CANARY_URL,

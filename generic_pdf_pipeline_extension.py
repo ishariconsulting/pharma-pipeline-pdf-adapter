@@ -1204,21 +1204,34 @@ def _visual_phase_column_rows(
         if code:
             code_anchors.append((y, code))
 
+        full_line_text = _join_words(col_words)
+        # Filing notes / keys are metadata, not programme rows.
+        if re.search(
+            r"[†*].*\bFiled\s+in\b|\bFiled\s+in\s+(?:US|EU|UK|Japan|China)\b",
+            full_line_text,
+            re.I,
+        ):
+            continue
+
         content = [
             w for w in col_words
             if float(w[0]) >= code_x + 38.0
             and float(w[0]) < right_bound - 3.0
         ]
-        asset = _join_words([w for w in content if float(w[0]) < split_x])
-        indication = _join_words([w for w in content if float(w[0]) >= split_x])
 
-        # Filing footnotes are metadata, not programme rows.
-        if (
-            not asset
-            and indication
-            and re.match(r"^[†*]+\s*Filed\b|^Filed\s+in\b", indication, re.I)
-        ):
-            continue
+        # Prefer an obvious row-specific whitespace split. Fall back to the
+        # source-column alignment only when the line itself has no clear gap.
+        line_asset, line_indication, line_split = _split_asset_indication(
+            col_words,
+            code_x,
+            right_bound,
+        )
+        if line_split is not None and line_asset and line_indication:
+            asset = line_asset
+            indication = line_indication
+        else:
+            asset = _join_words([w for w in content if float(w[0]) < split_x])
+            indication = _join_words([w for w in content if float(w[0]) >= split_x])
 
         if not asset and not indication and not code:
             continue
@@ -1230,6 +1243,16 @@ def _visual_phase_column_rows(
             "code": code,
             "complete": bool(asset and indication),
         })
+
+    # Keep the dense programme block only. A large vertical gap after parsed
+    # rows marks a footer/key region, not another pipeline row.
+    if fragments:
+        primary = [fragments[0]]
+        for frag in fragments[1:]:
+            if frag["y"] - primary[-1]["y"] > 60.0 and len(primary) >= 3:
+                break
+            primary.append(frag)
+        fragments = primary
 
     assembled: List[Dict[str, Any]] = []
     unresolved = 0
@@ -1255,6 +1278,20 @@ def _visual_phase_column_rows(
                     row["asset"] = clean(f"{row['asset']} {nxt['asset']}")
                     row["indication"] = clean(f"{row['indication']} {nxt['indication']}")
                     row["code"] = row["code"] or nxt["code"]
+                    row["y1"] = nxt["y"]
+                    i += 1
+
+            # A tightly following indication-only line is a wrapped
+            # continuation of the current row.
+            if i + 1 < len(fragments):
+                nxt = fragments[i + 1]
+                if (
+                    nxt["y"] - row["y1"] <= 9.0
+                    and not nxt["asset"]
+                    and nxt["indication"]
+                    and not nxt["code"]
+                ):
+                    row["indication"] = clean(f"{row['indication']} {nxt['indication']}")
                     row["y1"] = nxt["y"]
                     i += 1
 

@@ -1002,6 +1002,761 @@ def parse_stage_bar_pdf(
     return deduped, diagnostics
 
 
+def _phase_section_headers(words: List[Tuple[Any, ...]]) -> List[Dict[str, Any]]:
+    """Find horizontally separated semantic phase-section headers.
+
+    Supports PDFs where phase is encoded by the column/section containing a
+    programme rather than repeated on every row.
+    """
+    lines = _group_word_lines(words, y_tol=4.0)
+    candidates: List[Dict[str, Any]] = []
+
+    for line in lines:
+        line_words = sorted(line["words"], key=lambda w: float(w[0]))
+        tokens = [clean(w[4]) for w in line_words]
+        joined = clean(" ".join(tokens))
+        if not re.search(r"\bPhase\s+(?:I{1,3}|IV|[1-4])\b|\bRegistration\b", joined, re.I):
+            continue
+
+        i = 0
+        while i < len(line_words):
+            token = clean(line_words[i][4])
+            label = ""
+            used = [line_words[i]]
+
+            if norm(token) == "phase" and i + 1 < len(line_words):
+                nxt = clean(line_words[i + 1][4])
+                if re.fullmatch(r"I{1,3}|IV|[1-4]", nxt, re.I):
+                    label = f"Phase {nxt}"
+                    used.append(line_words[i + 1])
+                    i += 1
+            elif norm(token) in {"registration", "registrational"}:
+                label = "Registration"
+
+            if label:
+                phase = phase_canonical(label)
+                x0 = min(float(w[0]) for w in used)
+                x1 = max(float(w[2]) for w in used)
+                candidates.append({
+                    "label": clean(label),
+                    "phase": phase,
+                    "x": (x0 + x1) / 2.0,
+                    "y": float(line["y"]),
+                })
+            i += 1
+
+    # Keep the highest compact phase-header band on each page and de-duplicate.
+    if not candidates:
+        return []
+    top_y = min(c["y"] for c in candidates)
+    band = [c for c in candidates if abs(c["y"] - top_y) <= 14.0]
+    dedup: List[Dict[str, Any]] = []
+    for c in sorted(band, key=lambda q: q["x"]):
+        if dedup and abs(dedup[-1]["x"] - c["x"]) <= 18.0 and dedup[-1]["phase"] == c["phase"]:
+            continue
+        dedup.append(c)
+    return dedup
+
+
+def _strong_code_token(value: Any) -> bool:
+    s = clean(value)
+    # Generic development-code signal: short uppercase prefix plus a run of at
+    # least three digits. This avoids mistaking ordinary molecule names for
+    # code-column anchors while covering RG6026, TAK-279, BNT122, BI123456 etc.
+    return bool(re.fullmatch(r"[A-Z]{1,6}[- ]?[A-Z]{0,4}\d{3,}[A-Za-z0-9+._-]*", s))
+
+
+def _cluster_x(values: List[float], tolerance: float = 24.0) -> List[Dict[str, Any]]:
+    clusters: List[List[float]] = []
+    for x in sorted(values):
+        placed = False
+        for group in clusters:
+            center = sum(group) / len(group)
+            if abs(x - center) <= tolerance:
+                group.append(x)
+                placed = True
+                break
+        if not placed:
+            clusters.append([x])
+    return [
+        {"x": sum(group) / len(group), "count": len(group)}
+        for group in clusters
+    ]
+
+
+def _projected_segments(words: List[Tuple[Any, ...]], min_x: float, max_x: float) -> List[Tuple[float, float]]:
+    spans = sorted(
+        (float(w[0]), float(w[2]))
+        for w in words
+        if float(w[2]) > min_x and float(w[0]) < max_x
+    )
+    merged: List[List[float]] = []
+    for x0, x1 in spans:
+        x0 = max(x0, min_x)
+        x1 = min(x1, max_x)
+        if not merged or x0 - merged[-1][1] > 9.0:
+            merged.append([x0, x1])
+        else:
+            merged[-1][1] = max(merged[-1][1], x1)
+    return [(a, b) for a, b in merged]
+
+
+def _split_asset_indication(
+    block_words: List[Tuple[Any, ...]],
+    code_x: float,
+    column_right: float,
+) -> Tuple[str, str, Optional[float]]:
+    """Split molecule/programme text from indication using source whitespace.
+
+    No disease dictionary or company-specific coordinate is used. The split is
+    accepted only when the source itself exposes a material horizontal gap.
+    """
+    content_left = code_x + 38.0
+    content = [
+        w for w in block_words
+        if float(w[0]) >= content_left and float(w[0]) < column_right - 3.0
+    ]
+    if not content:
+        return "", "", None
+
+    segments = _projected_segments(content, content_left, column_right - 3.0)
+    gaps: List[Tuple[float, float]] = []
+    for left, right in zip(segments, segments[1:]):
+        gap = right[0] - left[1]
+        split = (left[1] + right[0]) / 2.0
+        # Ignore an early gap inside the molecule-name region. Indication text
+        # in this layout is aligned toward the right side of the programme cell.
+        if gap >= 14.0 and split >= content_left + 55.0:
+            gaps.append((gap, split))
+    if not gaps:
+        return "", "", None
+
+    _, split_x = max(gaps, key=lambda item: item[0])
+    asset_words = [w for w in content if float(w[0]) < split_x]
+    indication_words = [w for w in content if float(w[0]) >= split_x]
+    asset = _join_words(asset_words)
+    indication = _join_words(indication_words)
+    return asset, indication, split_x
+
+
+
+def _placeholder_code_token(value: Any) -> bool:
+    s = clean(value)
+    n = norm(s)
+    if not s or n in {"phase", "nme", "nmes", "ai", "ais", "us", "eu"}:
+        return False
+    if _strong_code_token(s):
+        return True
+    # Source-redacted management codes such as ABCxxxx+ remain useful anchors.
+    if re.fullmatch(r"[A-Z]{1,6}[xX]{2,}\+?", s):
+        return True
+    # Some pipeline tables use a short management-code placeholder.
+    return bool(re.fullmatch(r"[A-Z]{2,6}", s))
+
+
+def _asset_root(value: Any) -> str:
+    tokens = re.findall(r"[A-Za-z0-9]+", clean(value))
+    return norm(tokens[0]) if tokens else ""
+
+
+def _visual_phase_column_rows(
+    *,
+    company: str,
+    source_url: str,
+    page_idx: int,
+    body_words: List[Tuple[Any, ...]],
+    code_x: float,
+    left_bound: float,
+    right_bound: float,
+    split_x: Optional[float],
+    phase: str,
+    phase_label: str,
+) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
+    """Recover visual programme rows independently of development-code anchors.
+
+    Complete source lines become rows directly. Tight runs of incomplete
+    source lines are combined only when their source geometry supplies
+    complementary asset/indication parts. A trailing '+' explicitly allows
+    one complete row to continue onto the next visual line.
+    """
+    if split_x is None:
+        return [], {"fragments": 0, "rows": 0, "unresolved": 0, "codeAnchors": 0}
+
+    fragments: List[Dict[str, Any]] = []
+    code_anchors: List[Tuple[float, str]] = []
+
+    for line in _group_word_lines(body_words, y_tol=3.5):
+        col_words = [
+            w for w in line["words"]
+            if left_bound <= float(w[0]) < right_bound
+        ]
+        if not col_words:
+            continue
+
+        y = float(line["y"])
+        codes = [
+            clean(w[4])
+            for w in col_words
+            if abs(float(w[0]) - code_x) <= 22.0
+            and _placeholder_code_token(w[4])
+        ]
+        code = codes[0] if codes else ""
+        if code:
+            code_anchors.append((y, code))
+
+        full_line_text = _join_words(col_words)
+        # Filing notes / keys are metadata, not programme rows.
+        if re.search(
+            r"[†*].*\bFiled\s+in\b|\bFiled\s+in\s+(?:US|EU|UK|Japan|China)\b",
+            full_line_text,
+            re.I,
+        ):
+            continue
+
+        content = [
+            w for w in col_words
+            if float(w[0]) >= code_x + 38.0
+            and float(w[0]) < right_bound - 3.0
+        ]
+
+        # Prefer an obvious row-specific whitespace split. Fall back to the
+        # source-column alignment only when the line itself has no clear gap.
+        line_asset, line_indication, line_split = _split_asset_indication(
+            col_words,
+            code_x,
+            right_bound,
+        )
+        if line_split is not None and line_asset and line_indication:
+            asset = line_asset
+            indication = line_indication
+        else:
+            asset = _join_words([w for w in content if float(w[0]) < split_x])
+            indication = _join_words([w for w in content if float(w[0]) >= split_x])
+
+        if not asset and not indication and not code:
+            continue
+
+        fragments.append({
+            "y": y,
+            "asset": asset,
+            "indication": indication,
+            "code": code,
+            "complete": bool(asset and indication),
+        })
+
+    # Keep the dense programme block only. A large vertical gap after parsed
+    # rows marks a footer/key region, not another pipeline row.
+    if fragments:
+        primary = [fragments[0]]
+        for frag in fragments[1:]:
+            if frag["y"] - primary[-1]["y"] > 60.0 and len(primary) >= 3:
+                break
+            primary.append(frag)
+        fragments = primary
+
+    assembled: List[Dict[str, Any]] = []
+    unresolved = 0
+    i = 0
+
+    while i < len(fragments):
+        frag = fragments[i]
+
+        if frag["complete"]:
+            row = {
+                "y0": frag["y"],
+                "y1": frag["y"],
+                "asset": frag["asset"],
+                "indication": frag["indication"],
+                "code": frag["code"],
+            }
+
+            # A trailing plus sign is explicit source evidence that the asset
+            # identity continues on the next visual line.
+            if re.search(r"\+\s*$", row["asset"]) and i + 1 < len(fragments):
+                nxt = fragments[i + 1]
+                if nxt["y"] - row["y1"] <= 14.5 and (nxt["asset"] or nxt["indication"]):
+                    row["asset"] = clean(f"{row['asset']} {nxt['asset']}")
+                    row["indication"] = clean(f"{row['indication']} {nxt['indication']}")
+                    row["code"] = row["code"] or nxt["code"]
+                    row["y1"] = nxt["y"]
+                    i += 1
+
+            # A tightly following indication-only line is a wrapped
+            # continuation of the current row.
+            if i + 1 < len(fragments):
+                nxt = fragments[i + 1]
+                if (
+                    nxt["y"] - row["y1"] <= 9.0
+                    and not nxt["asset"]
+                    and nxt["indication"]
+                    and not nxt["code"]
+                ):
+                    row["indication"] = clean(f"{row['indication']} {nxt['indication']}")
+                    row["y1"] = nxt["y"]
+                    i += 1
+
+            assembled.append(row)
+            i += 1
+            continue
+
+        # Ignore isolated code-only anchors as rows; retain them for later
+        # high-confidence development-code association.
+        if frag["code"] and not frag["asset"] and not frag["indication"]:
+            i += 1
+            continue
+
+        # Combine a tight run of incomplete fragments. This handles source
+        # layouts such as asset / indication / asset continuation or
+        # indication / code+asset / indication continuation.
+        run = [frag]
+        j = i + 1
+        while j < len(fragments):
+            nxt = fragments[j]
+            if nxt["complete"]:
+                break
+            if nxt["y"] - run[-1]["y"] > 8.5:
+                break
+            # Permit code-only fragments inside a tight visual row.
+            run.append(nxt)
+            j += 1
+
+        assets = [x["asset"] for x in run if x["asset"]]
+        indications = [x["indication"] for x in run if x["indication"]]
+        codes = [x["code"] for x in run if x["code"]]
+
+        if assets and indications:
+            assembled.append({
+                "y0": run[0]["y"],
+                "y1": run[-1]["y"],
+                "asset": clean(" ".join(assets)),
+                "indication": clean(" ".join(indications)),
+                "code": codes[0] if codes else "",
+            })
+        else:
+            unresolved += 1
+
+        i = max(j, i + 1)
+
+    # Attach code-only anchors only when source geometry and repeated asset
+    # identity make the association deterministic. Leaving developmentCode
+    # blank is safer than guessing and does not affect the core row contract.
+    for idx, row in enumerate(assembled):
+        if row["code"]:
+            continue
+        root = _asset_root(row["asset"])
+        if not root:
+            continue
+
+        left = idx
+        while left > 0 and _asset_root(assembled[left - 1]["asset"]) == root:
+            left -= 1
+        right = idx
+        while right + 1 < len(assembled) and _asset_root(assembled[right + 1]["asset"]) == root:
+            right += 1
+
+        group = assembled[left:right + 1]
+        low_y = min(float(r["y0"]) for r in group) - 8.5
+        high_y = max(float(r["y1"]) for r in group) + 8.5
+        nearby = [
+            (y, code)
+            for y, code in code_anchors
+            if low_y <= y <= high_y
+        ]
+        unique_codes = []
+        for _, code in nearby:
+            if norm(code) and norm(code) not in {norm(x) for x in unique_codes}:
+                unique_codes.append(code)
+        if len(unique_codes) == 1:
+            for group_row in group:
+                if not group_row["code"]:
+                    group_row["code"] = unique_codes[0]
+
+    out: List[Dict[str, Any]] = []
+    for row in assembled:
+        asset = clean(row["asset"])
+        indication = clean(row["indication"])
+        if not asset or not indication:
+            unresolved += 1
+            continue
+
+        out.append({
+            "company": company,
+            "sourceFamily": "Company Pipeline",
+            "sourceRecordId": (
+                f"pdfphasevisual:p{page_idx+1}:"
+                f"x{int(round(code_x))}:y{int(round(float(row['y0'])))}"
+            ),
+            "sourceUrl": source_url,
+            "asset": asset,
+            "molecule": asset,
+            "developmentCode": clean(row["code"]),
+            "brand": "",
+            "indication": indication,
+            "phase": phase,
+            "phaseEvidence": "SOURCE_PDF_PHASE_SECTION",
+            "programStatus": "",
+            "sponsorOwner": company,
+            "partners": [],
+            "study": "",
+            "trialIds": [],
+            "therapeuticArea": "",
+            "marketRegion": "",
+            "sourceStageText": clean(phase_label),
+            "sourcePage": page_idx + 1,
+            "sourceOrdinal": len(out) + 1,
+            "parserMethod": "SEMANTIC_PDF_PHASE_COLUMN_VISUAL_ROW",
+            "sourceAdapter": ADAPTER_PROFILE,
+        })
+
+    return out, {
+        "fragments": len(fragments),
+        "rows": len(out),
+        "unresolved": unresolved,
+        "codeAnchors": len(code_anchors),
+    }
+
+def parse_phase_column_pdf(
+    company: str,
+    source_url: str,
+    data: bytes,
+) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
+    """Parse multi-column PDFs where each horizontal section declares a phase.
+
+    The parser infers code-column clusters, maps each cluster to the nearest
+    semantic phase header, and splits programme vs indication using visible
+    whitespace. It has no company-specific names, coordinates or Portfolio
+    dependencies.
+    """
+    try:
+        doc = fitz.open(stream=data, filetype="pdf")
+    except Exception as exc:
+        raise HTTPException(status_code=422, detail=f"Invalid PDF: {exc}") from exc
+
+    rows: List[Dict[str, Any]] = []
+    page_diags: List[Dict[str, Any]] = []
+    failures: List[Dict[str, Any]] = []
+    coverage_warnings: List[Dict[str, Any]] = []
+    declared_programmes = 0
+
+    for page_idx in range(len(doc)):
+        page = doc[page_idx]
+        words = page.get_text("words")
+        headers = _phase_section_headers(words)
+        if not headers:
+            continue
+
+        # Phase-section pipeline tables expose a small number of wide stage
+        # bands. Dense four-stage overview graphics and closely packed chart
+        # legends are different structures and are intentionally rejected.
+        header_xs = sorted(float(h["x"]) for h in headers)
+        if len(headers) != 2 or header_xs[1] - header_xs[0] < 140.0:
+            continue
+
+        header_y = min(float(h["y"]) for h in headers)
+        body_words = [
+            w for w in words
+            if _word_center_y(w) > header_y + 8.0
+            and _word_center_y(w) < page.rect.height - 45.0
+        ]
+
+        seed_words = [w for w in body_words if _strong_code_token(w[4])]
+        clusters = [
+            c for c in _cluster_x([float(w[0]) for w in seed_words])
+            if int(c["count"]) >= 3
+        ]
+        if len(clusters) < 2:
+            continue
+
+        cluster_xs = sorted(float(c["x"]) for c in clusters)
+        # Reject implausibly close duplicate clusters.
+        filtered_xs: List[float] = []
+        for x in cluster_xs:
+            if not filtered_xs or x - filtered_xs[-1] >= 70.0:
+                filtered_xs.append(x)
+        cluster_xs = filtered_xs
+        if len(cluster_xs) < 2:
+            continue
+
+        # Parse any source-declared programme counts for completeness diagnostics.
+        top_text = clean(" ".join(
+            clean(w[4]) for w in words
+            if abs(_word_center_y(w) - header_y) <= 12.0
+        ))
+        page_declared = 0
+        for a, b in re.findall(
+            r"\((\d+)\s+NMEs?\s*\+\s*(\d+)\s+AIs?\)",
+            top_text,
+            flags=re.I,
+        ):
+            count = int(a) + int(b)
+            page_declared += count
+            declared_programmes += count
+
+        page_row_start = len(rows)
+        parsed_here = 0
+        page_failures = 0
+        column_diags: List[Dict[str, Any]] = []
+        visual_page_rows: List[Dict[str, Any]] = []
+        visual_unresolved = 0
+
+        for ci, code_x in enumerate(cluster_xs):
+            # Each code anchor starts a horizontal programme cell. The cell
+            # extends almost to the next code anchor; using midpoint bounds
+            # would truncate right-aligned indication text.
+            left_bound = max(18.0, code_x - 12.0)
+            right_bound = (
+                page.rect.width - 18.0 if ci == len(cluster_xs) - 1
+                else cluster_xs[ci + 1] - 10.0
+            )
+
+            phase_header = min(headers, key=lambda h: abs(float(h["x"]) - code_x))
+            phase = clean(phase_header["phase"])
+            if not phase:
+                continue
+
+            # After the x clusters are established, allow short uppercase source
+            # management codes (e.g. a non-numeric code prefix) at the same x.
+            anchor_candidates: List[Tuple[float, str]] = []
+            for w in body_words:
+                x = float(w[0])
+                if abs(x - code_x) > 22.0:
+                    continue
+                token = clean(w[4])
+                if _strong_code_token(token) or (
+                    re.fullmatch(r"[A-Z]{2,6}", token)
+                    and norm(token) not in {"phase", "nme", "nmes", "ai", "ais", "us", "eu"}
+                ):
+                    anchor_candidates.append((_word_center_y(w), token))
+
+            anchors: List[Tuple[float, str]] = []
+            for y, token in sorted(anchor_candidates):
+                if anchors and abs(anchors[-1][0] - y) <= 3.5:
+                    # Prefer the more informative/numeric code on the same line.
+                    if _strong_code_token(token) and not _strong_code_token(anchors[-1][1]):
+                        anchors[-1] = (y, token)
+                    continue
+                anchors.append((y, token))
+
+            # Learn the source column's programme/indication separator from
+            # rows where whitespace makes the split explicit. This lets a small
+            # number of dense rows reuse the document's own alignment rather
+            # than introducing disease- or company-specific rules.
+            split_samples: List[float] = []
+            for ai, (anchor_y, code) in enumerate(anchors):
+                next_y = anchors[ai + 1][0] if ai + 1 < len(anchors) else min(page.rect.height - 45.0, anchor_y + 32.0)
+                if next_y - anchor_y > 44.0:
+                    next_y = anchor_y + 32.0
+                block_words = [
+                    w for w in body_words
+                    if left_bound <= float(w[0]) < right_bound
+                    and anchor_y - 3.5 <= _word_center_y(w) < next_y - 2.0
+                ]
+                probe_asset, probe_indication, probe_split = _split_asset_indication(
+                    block_words, code_x, right_bound
+                )
+                if probe_split is not None and probe_asset and probe_indication:
+                    split_samples.append(float(probe_split))
+
+            column_split_x: Optional[float] = None
+            if len(split_samples) >= 3:
+                ordered_splits = sorted(split_samples)
+                mid = len(ordered_splits) // 2
+                column_split_x = (
+                    ordered_splits[mid]
+                    if len(ordered_splits) % 2
+                    else (ordered_splits[mid - 1] + ordered_splits[mid]) / 2.0
+                )
+
+            column_parsed = 0
+            fallback_splits = 0
+            for ai, (anchor_y, code) in enumerate(anchors):
+                next_y = anchors[ai + 1][0] if ai + 1 < len(anchors) else min(page.rect.height - 45.0, anchor_y + 32.0)
+                if next_y - anchor_y > 44.0:
+                    next_y = anchor_y + 32.0
+
+                block_words = [
+                    w for w in body_words
+                    if left_bound <= float(w[0]) < right_bound
+                    and anchor_y - 3.5 <= _word_center_y(w) < next_y - 2.0
+                ]
+                asset, indication, split_x = _split_asset_indication(
+                    block_words,
+                    code_x,
+                    right_bound,
+                )
+
+                if (not asset or not indication or split_x is None) and column_split_x is not None:
+                    content = [
+                        w for w in block_words
+                        if float(w[0]) >= code_x + 38.0
+                        and float(w[0]) < right_bound - 3.0
+                    ]
+                    asset = _join_words([w for w in content if float(w[0]) < column_split_x])
+                    indication = _join_words([w for w in content if float(w[0]) >= column_split_x])
+                    if asset and indication:
+                        split_x = column_split_x
+                        fallback_splits += 1
+
+                if clean(asset) == "-":
+                    asset = code
+                if not asset or not indication or split_x is None:
+                    page_failures += 1
+                    failures.append({
+                        "page": page_idx + 1,
+                        "code": code,
+                        "y": round(anchor_y, 1),
+                        "phase": phase,
+                        "reason": "PROGRAMME_INDICATION_SPLIT_UNRESOLVED",
+                    })
+                    continue
+
+                # Remove the development code when it leaks into the programme
+                # text because the source prints it on the same baseline.
+                if norm(asset).startswith(norm(code) + " "):
+                    asset = clean(asset[len(code):])
+
+                if not asset or not indication:
+                    page_failures += 1
+                    continue
+
+                rows.append({
+                    "company": company,
+                    "sourceFamily": "Company Pipeline",
+                    "sourceRecordId": f"pdfphase:p{page_idx+1}:x{int(round(code_x))}:y{int(round(anchor_y))}",
+                    "sourceUrl": source_url,
+                    "asset": asset,
+                    "molecule": asset,
+                    "developmentCode": code,
+                    "brand": "",
+                    "indication": indication,
+                    "phase": phase,
+                    "phaseEvidence": "SOURCE_PDF_PHASE_SECTION",
+                    "programStatus": "",
+                    "sponsorOwner": company,
+                    "partners": [],
+                    "study": "",
+                    "trialIds": [],
+                    "therapeuticArea": "",
+                    "marketRegion": "",
+                    "sourceStageText": clean(phase_header["label"]),
+                    "sourcePage": page_idx + 1,
+                    "sourceOrdinal": len(rows) + 1,
+                    "parserMethod": "SEMANTIC_PDF_PHASE_COLUMN",
+                    "sourceAdapter": ADAPTER_PROFILE,
+                })
+                parsed_here += 1
+                column_parsed += 1
+
+            visual_rows, visual_diag = _visual_phase_column_rows(
+                company=company,
+                source_url=source_url,
+                page_idx=page_idx,
+                body_words=body_words,
+                code_x=code_x,
+                left_bound=left_bound,
+                right_bound=right_bound,
+                split_x=column_split_x,
+                phase=phase,
+                phase_label=clean(phase_header["label"]),
+            )
+            visual_page_rows.extend(visual_rows)
+            visual_unresolved += int(visual_diag.get("unresolved", 0))
+
+            column_diags.append({
+                "codeX": round(code_x, 1),
+                "left": round(left_bound, 1),
+                "right": round(right_bound, 1),
+                "phase": phase,
+                "headerX": round(float(phase_header["x"]), 1),
+                "anchors": len(anchors),
+                "parsedRows": column_parsed,
+                "learnedSplitX": round(column_split_x, 1) if column_split_x is not None else None,
+                "fallbackSplits": fallback_splits,
+                "visualRows": len(visual_rows),
+                "visualUnresolved": int(visual_diag.get("unresolved", 0)),
+            })
+
+        parser_variant = "ANCHOR_ROWS"
+        if (
+            page_declared > 0
+            and parsed_here != page_declared
+            and len(visual_page_rows) == page_declared
+            and visual_unresolved == 0
+        ):
+            # Replace only this page's anchor-derived rows. The source-declared
+            # count acts as an independent completeness gate.
+            del rows[page_row_start:]
+            for visual_row in visual_page_rows:
+                visual_row["sourceOrdinal"] = len(rows) + 1
+                rows.append(visual_row)
+            parsed_here = len(visual_page_rows)
+            page_failures = 0
+            # Remove failures that belong to the replaced page.
+            failures = [x for x in failures if int(x.get("page", -1)) != page_idx + 1]
+            parser_variant = "VISUAL_ROWS"
+
+        if page_declared > 0 and parsed_here != page_declared:
+            coverage_warnings.append({
+                "page": page_idx + 1,
+                "declaredRows": page_declared,
+                "parsedRows": parsed_here,
+                "anchorRows": len(rows[page_row_start:]) if parser_variant == "ANCHOR_ROWS" else None,
+                "visualRows": len(visual_page_rows),
+                "visualUnresolved": visual_unresolved,
+            })
+
+        page_diags.append({
+            "page": page_idx + 1,
+            "headerY": round(header_y, 1),
+            "phaseHeaders": [
+                {"label": h["label"], "phase": h["phase"], "x": round(float(h["x"]), 1)}
+                for h in headers
+            ],
+            "columns": column_diags,
+            "declaredRows": page_declared,
+            "parsedRows": parsed_here,
+            "parserVariant": parser_variant,
+            "visualRows": len(visual_page_rows),
+            "visualUnresolved": visual_unresolved,
+            "rejectedRows": page_failures,
+        })
+
+    deduped: List[Dict[str, Any]] = []
+    seen = set()
+    for row in rows:
+        key = (
+            norm(row["developmentCode"]),
+            norm(row["asset"]),
+            norm(row["indication"]),
+            norm(row["phase"]),
+        )
+        if key in seen:
+            continue
+        seen.add(key)
+        row["sourceOrdinal"] = len(deduped) + 1
+        deduped.append(row)
+
+    diagnostics = {
+        "pageCount": len(doc),
+        "semanticPhaseColumnPages": len(page_diags),
+        "pages": page_diags,
+        "candidateRows": len(rows),
+        "dedupedRows": len(deduped),
+        "exactDuplicatesRemoved": len(rows) - len(deduped),
+        "declaredProgrammes": declared_programmes,
+        "rowFailures": len(failures),
+        "failureSamples": failures[:20],
+        "coverageWarnings": len(coverage_warnings),
+        "coverageWarningSamples": coverage_warnings[:12],
+        "boundaryWarnings": 0,
+        "companySpecificParserBranch": False,
+        "portfolioDependentValidation": False,
+        "writes": 0,
+        "selectedMethod": "SEMANTIC_PDF_PHASE_COLUMN",
+    }
+    return deduped, diagnostics
+
+
 async def download_pdf(url: str, timeout_seconds: float) -> Tuple[bytes, str]:
     await _assert_public_http_url(url)
     parsed = urlparse(url)
@@ -1052,6 +1807,13 @@ async def extract_generic_pdf(
             diagnostics = bar_diagnostics
             selected_method = "SEMANTIC_PDF_STAGE_BAR"
 
+    if not rows:
+        phase_rows, phase_diagnostics = parse_phase_column_pdf(company, final_url, data)
+        if len(phase_rows) > len(rows):
+            rows = phase_rows
+            diagnostics = phase_diagnostics
+            selected_method = "SEMANTIC_PDF_PHASE_COLUMN"
+
     incomplete = [r["sourceRecordId"] for r in rows if not (r.get("asset") and r.get("indication") and r.get("phase"))]
     issues: List[str] = []
     if len(rows) < MIN_ROWS:
@@ -1062,6 +1824,8 @@ async def extract_generic_pdf(
         issues.append(f"{diagnostics['rowFailures']} source rows could not be resolved structurally")
     if int(diagnostics.get("boundaryWarnings", 0)) > 0:
         issues.append(f"{diagnostics['boundaryWarnings']} possible PDF row-boundary ambiguities require review")
+    if int(diagnostics.get("coverageWarnings", 0)) > 0:
+        issues.append(f"{diagnostics['coverageWarnings']} PDF source-declared coverage mismatches require review")
 
     ready = not issues
     summary = {
@@ -1081,6 +1845,7 @@ async def extract_generic_pdf(
         "semanticTableFound": (
             int(diagnostics.get("semanticTablePages", 0)) > 0
             or int(diagnostics.get("semanticStageBarPages", 0)) > 0
+            or int(diagnostics.get("semanticPhaseColumnPages", 0)) > 0
         ),
     }
 

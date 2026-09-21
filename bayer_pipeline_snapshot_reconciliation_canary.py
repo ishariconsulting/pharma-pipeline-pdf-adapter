@@ -193,6 +193,20 @@ async def run_canary() -> Dict[str, Any]:
 
     in_scope = [c for c in result.candidates if c.get("commercialInclusionDecision") == "Include"]
     unresolved = [c for c in in_scope if c.get("classification") not in {"MATCHED", "EXCLUDED BY RULE"}]
+    review_candidates = [
+        {
+            "classification": c.get("classification"),
+            "asset": c.get("asset"),
+            "indication": c.get("indication"),
+            "phase": c.get("phase"),
+            "existingPortfolioRecordIds": c.get("existingPortfolioRecordIds") or [],
+            "matchMethod": c.get("matchMethod"),
+            "matchConfidence": c.get("matchConfidence"),
+            "reviewReason": c.get("reviewReason"),
+        }
+        for c in result.candidates
+        if c.get("classification") == "POSSIBLE DUPLICATE"
+    ]
     phase_deltas = []
     for c in result.candidates:
         for d in c.get("fieldDeltas") or []:
@@ -234,6 +248,8 @@ async def run_canary() -> Dict[str, Any]:
         "inScopeRows": len(in_scope),
         "unresolvedInScopeCount": len(unresolved),
         "unresolvedInScopeSample": [compact(c) for c in unresolved[:20]],
+        "possibleDuplicateCount": len(review_candidates),
+        "possibleDuplicateSample": review_candidates[:10],
         "phaseDeltaCount": len(phase_deltas),
         "phaseDeltaSample": phase_deltas[:20],
         "sourceIssues": snap.issues,

@@ -22,7 +22,7 @@ from pydantic import BaseModel
 from playwright.async_api import Browser, BrowserContext, Page, async_playwright
 
 
-BROWSER_FETCH_VERSION = "BROWSER_RETRIEVAL_V1.1_STRUCTURED_DOM"
+BROWSER_FETCH_VERSION = "BROWSER_RETRIEVAL_V1.2_STRUCTURED_DOM_EXPAND"
 MAX_VISIBLE_TEXT = 200_000
 MAX_HTML_BYTES = 2_500_000
 MAX_ANCHORS = 400
@@ -62,6 +62,7 @@ class BrowserFetchResponse(BaseModel):
     anchors: List[Dict[str, str]]
     transport: str = "PLAYWRIGHT_CHROMIUM"
     retrievalMode: str = "BROWSER_REQUIRED"
+    expansionClicks: int = 0
 
 
 def _auth(x_browser_key: Optional[str]) -> None:
@@ -158,7 +159,12 @@ async def _install_request_guard(page: Page) -> None:
     await page.route("**/*", guard)
 
 
-async def _extract_rendered(page: Page, source_url: str, response_status: int) -> BrowserFetchResponse:
+async def _extract_rendered(
+    page: Page,
+    source_url: str,
+    response_status: int,
+    expansion_clicks: int = 0,
+) -> BrowserFetchResponse:
     raw_html = await page.content()
     encoded = raw_html.encode("utf-8", errors="ignore")
     if len(encoded) > MAX_HTML_BYTES:
@@ -273,10 +279,59 @@ async def _extract_rendered(page: Page, source_url: str, response_status: int) -
         tables=tables,
         headings=headings,
         anchors=anchors,
+        expansionClicks=expansion_clicks,
     )
 
 
-async def _browser_fetch(url: str, timeout_seconds: float = DEFAULT_TIMEOUT_SECONDS) -> BrowserFetchResponse:
+async def _expand_load_more_buttons(page: Page, max_clicks: int = 30) -> int:
+    """Expand read-only cards hidden behind literal Load more buttons."""
+    clicks = 0
+    unchanged = 0
+
+    for _ in range(max_clicks):
+        locator = page.get_by_role(
+            "button",
+            name=re.compile(r"^\s*load\s+more\s*$", re.I),
+        )
+        count = await locator.count()
+        target = None
+        for idx in range(min(count, 12)):
+            candidate = locator.nth(idx)
+            try:
+                if await candidate.is_visible():
+                    target = candidate
+                    break
+            except Exception:
+                continue
+
+        if target is None:
+            break
+
+        try:
+            before = await page.locator("body").inner_text(timeout=3_000)
+            await target.scroll_into_view_if_needed(timeout=2_000)
+            await target.click(timeout=3_000)
+            clicks += 1
+            await page.wait_for_timeout(650)
+            after = await page.locator("body").inner_text(timeout=3_000)
+        except Exception:
+            break
+
+        if len(after or "") <= len(before or ""):
+            unchanged += 1
+            if unchanged >= 2:
+                break
+        else:
+            unchanged = 0
+
+    return clicks
+
+
+async def _browser_fetch(
+    url: str,
+    timeout_seconds: float = DEFAULT_TIMEOUT_SECONDS,
+    expand_load_more: bool = False,
+) -> BrowserFetchResponse:
     await _assert_public_http_url(url)
     timeout_ms = int(timeout_seconds * 1000)
 
@@ -318,7 +373,15 @@ async def _browser_fetch(url: str, timeout_seconds: float = DEFAULT_TIMEOUT_SECO
                 pass
 
             await page.wait_for_timeout(1_000)
-            return await _extract_rendered(page, url, status)
+            expansion_clicks = 0
+            if expand_load_more:
+                expansion_clicks = await _expand_load_more_buttons(page)
+            return await _extract_rendered(
+                page,
+                url,
+                status,
+                expansion_clicks=expansion_clicks,
+            )
         finally:
             if context is not None:
                 await context.close()
@@ -339,10 +402,15 @@ async def health() -> Dict[str, Any]:
 async def fetch_browser(
     url: str = Query(..., min_length=8),
     timeout_seconds: float = Query(DEFAULT_TIMEOUT_SECONDS, ge=5.0, le=35.0),
+    expand_load_more: bool = Query(default=False),
     x_browser_key: Optional[str] = Header(default=None),
 ) -> BrowserFetchResponse:
     _auth(x_browser_key)
-    return await _browser_fetch(url, timeout_seconds=timeout_seconds)
+    return await _browser_fetch(
+        url,
+        timeout_seconds=timeout_seconds,
+        expand_load_more=expand_load_more,
+    )
 
 
 async def _run_canary(url: str, expected_terms: List[str]) -> Dict[str, Any]:

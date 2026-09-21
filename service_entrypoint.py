@@ -25,3 +25,4 @@ import menarini_graphql_pipeline_extension  # noqa: E402,F401
 import drupal_views_pipeline_extension  # noqa: E402,F401
 import merck_kgaa_js_pipeline_extension  # noqa: E402,F401
 import biontech_graphql_pipeline_extension  # noqa: E402,F401
+import biontech_reconciliation_canary  # noqa: E402,F401

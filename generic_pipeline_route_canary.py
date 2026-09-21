@@ -38,7 +38,10 @@ async def main():
             if any(term in blob for term in wanted):
                 focus.append(n)
             y=float(n.get("y") or 0)
-            if 620 <= y <= 1720 and any(term in blob for term in ("pipeline","progress","stage","phase","bar","track","grid","row","column")):
+            if 620 <= y <= 1720 and (
+                n.get("inPipelineRow")
+                or any(term in blob for term in ("pipeline","progress","stage","phase","bar","track","grid","row","column"))
+            ):
                 structural.append(n)
         out.update({
             "version":p.get("version"),

@@ -68,7 +68,6 @@ query GetPipelineContent($pipelinePath: String!, $directoryPath: ID!) {
               _path
               longName
               shortName
-              abbreviation
             }
             platformRef {
               _path

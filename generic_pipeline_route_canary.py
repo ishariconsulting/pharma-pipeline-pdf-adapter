@@ -1,57 +1,66 @@
-"""Read-only Wave rendered layout diagnostic using generic browser layout extraction."""
-import asyncio, json, os
+"""Read-only Wave graphical pipeline row-summary diagnostic."""
+import asyncio, json, os, re
 import httpx
 
 URL="https://wavelifesciences.com/pipeline/research-and-development/"
 BASE=os.environ.get("BROWSER_FETCH_BASE_URL","").rstrip("/")
 KEY=os.environ.get("BROWSER_FETCH_KEY","")
 
+def clean(v):
+    return re.sub(r"\s+"," ",str(v or "")).strip()
+
 async def main():
     out={"configured":bool(BASE and KEY),"masterWrites":0}
     if not BASE or not KEY:
-        print("WAVE_LAYOUT_DIAGNOSTIC "+json.dumps(out),flush=True)
-        return
+        print("WAVE_ROW_SUMMARY "+json.dumps(out),flush=True); return
     async with httpx.AsyncClient(timeout=60.0,follow_redirects=False) as c:
         r=await c.get(
             BASE+"/fetch/browser",
             params={"url":URL,"timeout_seconds":35.0,"include_layout":"true"},
             headers={"X-Browser-Key":KEY,"Accept":"application/json"},
         )
-        out["status"]=r.status_code
-        out["bodyHead"]=r.text[:1200]
-        try:
-            p=r.json()
-        except Exception:
-            p={}
+        p=r.json() if r.status_code==200 else {}
         nodes=p.get("layoutTextNodes") or []
-        focus=[]
-        wanted=("program","discovery","ind / cta","clinical","patient population","wve-","rna editing","rnai","splicing","silencing","inhbe","serpina1","pnpla3","dmd","mhtt")
-        structural=[]
-        for n in nodes:
-            text=str(n.get("text") or "")
-            blob=" ".join([
-                text,
-                str(n.get("className") or ""),
-                str(n.get("id") or ""),
-                str(n.get("style") or ""),
-            ]).lower()
-            if any(term in blob for term in wanted):
-                focus.append(n)
-            y=float(n.get("y") or 0)
-            if 620 <= y <= 1720 and (
-                n.get("inPipelineRow")
-                or any(term in blob for term in ("pipeline","progress","stage","phase","bar","track","grid","row","column"))
-            ):
-                structural.append(n)
+        row_containers=[n for n in nodes if "rows flex w-full items-center" in clean(n.get("className"))]
+        summaries=[]
+        for row in row_containers:
+            y=float(row.get("y") or 0)
+            h=float(row.get("height") or 0)
+            members=[n for n in nodes if n.get("inPipelineRow") and abs(float(n.get("y") or 0)-y) <= max(16,h)]
+            titles=[]
+            indications=[]
+            population=[]
+            status=[]
+            for n in members:
+                txt=clean(n.get("text"))
+                cls=clean(n.get("className"))
+                parent=clean(n.get("parentClassName"))
+                if txt and (re.search(r"\bWVE[-A-Z0-9]+",txt,re.I) or "rows-title" in parent):
+                    if txt not in titles: titles.append(txt)
+                if txt and "sub-title" in cls and txt not in indications:
+                    indications.append(txt)
+                if txt and "population" in parent and txt not in population:
+                    population.append(txt)
+                if "rounded-block-stat" in cls:
+                    status.append({
+                      "class":cls,
+                      "x":n.get("x"),"width":n.get("width"),
+                      "height":n.get("height")
+                    })
+            summaries.append({
+              "rowY":y,
+              "titles":titles,
+              "indications":indications,
+              "population":population,
+              "status":status
+            })
         out.update({
-            "version":p.get("version"),
-            "finalUrl":p.get("finalUrl"),
-            "visibleLineCount":len(p.get("visibleLines") or []),
-            "layoutNodeCount":len(nodes),
-            "focusNodes":focus[:500],
-            "structuralBoxes":structural[:800],
+          "status":r.status_code,
+          "version":p.get("version"),
+          "rowCount":len(summaries),
+          "rows":summaries,
         })
-    print("WAVE_LAYOUT_DIAGNOSTIC "+json.dumps(out,ensure_ascii=False),flush=True)
+    print("WAVE_ROW_SUMMARY "+json.dumps(out,ensure_ascii=False),flush=True)
 
 if __name__=="__main__":
     asyncio.run(main())

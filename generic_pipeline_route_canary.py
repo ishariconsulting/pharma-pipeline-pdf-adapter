@@ -1,31 +1,29 @@
-"""Read-only Boehringer 2025 annual-report snapshot adapter canary."""
+"""Read-only Vertex generic pipeline extraction probe."""
 import asyncio, json
-import boehringer_annual_report_pipeline_extension as bi
+import generic_pipeline_extension as g
+
+URL="https://www.vrtx.com/our-science/pipeline/"
 
 async def main():
     try:
-        r=await bi.extract_boehringer_annual_pipeline()
-        sample=[{
-          "ta":x.get("therapeuticArea"),
-          "asset":x.get("asset"),
-          "code":x.get("developmentCode"),
-          "indication":x.get("indication"),
-          "phase":x.get("phase"),
-        } for x in r.rows[:60]]
-        print("BOEHRINGER_ANNUAL_ADAPTER_CANARY "+json.dumps({
+        r=await g._extract_generic_pipeline(
+            company="Vertex Pharmaceuticals",
+            source_url=URL,
+            timeout_seconds=35.0,
+        )
+        print("VERTEX_GENERIC_PIPELINE_PROBE "+json.dumps({
           "version":r.version,
+          "routeVersion":r.routeVersion,
           "readyForDiscovery":r.readyForDiscovery,
-          "sourceDate":r.sourceDate,
-          "sourceProvenance":r.sourceProvenance,
-          "retrievalMode":r.retrievalMode,
           "rowCount":r.rowCount,
+          "summary":r.summary,
           "issues":r.issues,
           "diagnostics":r.diagnostics,
-          "sample":sample,
+          "sample":r.rows[:50],
           "masterWrites":0,
         },ensure_ascii=False),flush=True)
     except Exception as exc:
-        print("BOEHRINGER_ANNUAL_ADAPTER_CANARY "+json.dumps({
+        print("VERTEX_GENERIC_PIPELINE_PROBE "+json.dumps({
           "readyForDiscovery":False,
           "error":f"{type(exc).__name__}: {exc}",
           "masterWrites":0,

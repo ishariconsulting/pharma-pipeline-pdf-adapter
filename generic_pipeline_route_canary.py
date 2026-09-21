@@ -26,16 +26,27 @@ async def main():
         nodes=p.get("layoutTextNodes") or []
         focus=[]
         wanted=("program","discovery","ind / cta","clinical","patient population","wve-","rna editing","rnai","splicing","silencing","inhbe","serpina1","pnpla3","dmd","mhtt")
+        structural=[]
         for n in nodes:
             text=str(n.get("text") or "")
-            if any(term in text.lower() for term in wanted):
+            blob=" ".join([
+                text,
+                str(n.get("className") or ""),
+                str(n.get("id") or ""),
+                str(n.get("style") or ""),
+            ]).lower()
+            if any(term in blob for term in wanted):
                 focus.append(n)
+            y=float(n.get("y") or 0)
+            if 620 <= y <= 1720 and any(term in blob for term in ("pipeline","progress","stage","phase","bar","track","grid","row","column")):
+                structural.append(n)
         out.update({
             "version":p.get("version"),
             "finalUrl":p.get("finalUrl"),
             "visibleLineCount":len(p.get("visibleLines") or []),
             "layoutNodeCount":len(nodes),
             "focusNodes":focus[:500],
+            "structuralBoxes":structural[:800],
         })
     print("WAVE_LAYOUT_DIAGNOSTIC "+json.dumps(out,ensure_ascii=False),flush=True)
 

@@ -671,3 +671,135 @@ async def diagnostic_dom_context(
         [x for x in terms.split("|") if x.strip()],
         timeout_seconds=timeout_seconds,
     )
+
+
+async def _browser_network_sources(
+    url: str,
+    timeout_seconds: float = DEFAULT_TIMEOUT_SECONDS,
+) -> Dict[str, Any]:
+    """Capture bounded public network response metadata to discover page data sources."""
+    await _assert_public_http_url(url)
+    timeout_ms = int(timeout_seconds * 1000)
+    captured: List[Dict[str, Any]] = []
+
+    async with async_playwright() as pw:
+        browser: Browser = await pw.chromium.launch(
+            headless=True,
+            args=["--no-sandbox", "--disable-dev-shm-usage", "--disable-gpu"],
+        )
+        context: Optional[BrowserContext] = None
+        try:
+            context = await browser.new_context(
+                user_agent=(
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                    "AppleWebKit/537.36 (KHTML, like Gecko) "
+                    "Chrome/124.0.0.0 Safari/537.36"
+                ),
+                locale="en-GB",
+                viewport={"width": 1365, "height": 900},
+                java_script_enabled=True,
+            )
+            page = await context.new_page()
+            await _install_request_guard(page)
+
+            async def on_response(response) -> None:
+                if len(captured) >= 160:
+                    return
+                try:
+                    req = response.request
+                    rtype = str(req.resource_type or "")
+                    ctype = str((response.headers or {}).get("content-type") or "")
+                    rurl = str(response.url or "")
+                    low = (rurl + " " + ctype).lower()
+                    interesting = (
+                        rtype in {"xhr", "fetch"}
+                        or "json" in ctype.lower()
+                        or any(token in low for token in (
+                            "api", "graphql", "pipeline", "content", "ajax",
+                            "json", "search", "query", "data"
+                        ))
+                    )
+                    if not interesting:
+                        return
+                    item = {
+                        "url": rurl[:1200],
+                        "status": int(response.status),
+                        "resourceType": rtype,
+                        "contentType": ctype[:200],
+                    }
+                    if (
+                        int(response.status) < 400
+                        and len(captured) < 80
+                        and any(x in ctype.lower() for x in ("json", "text/plain", "text/html"))
+                    ):
+                        try:
+                            body = await response.text()
+                            item["bodyHead"] = re.sub(r"\s+", " ", body or "").strip()[:1200]
+                        except Exception:
+                            pass
+                    captured.append(item)
+                except Exception:
+                    return
+
+            page.on("response", on_response)
+            try:
+                response = await page.goto(url, wait_until="domcontentloaded", timeout=timeout_ms)
+            except Exception as exc:
+                raise HTTPException(
+                    status_code=504,
+                    detail=f"Browser navigation failed: {type(exc).__name__}",
+                ) from exc
+            if response is None:
+                raise HTTPException(status_code=502, detail="Browser navigation returned no document response")
+            if int(response.status) >= 400:
+                raise HTTPException(
+                    status_code=502,
+                    detail=f"Browser source returned HTTP {int(response.status)}",
+                )
+            try:
+                await page.wait_for_load_state("networkidle", timeout=min(12_000, timeout_ms))
+            except Exception:
+                pass
+            await page.wait_for_timeout(2_000)
+
+            try:
+                visible = await page.locator("body").inner_text(timeout=3_000)
+            except Exception:
+                visible = ""
+
+            # Dedupe exact URL/status/type tuples while preserving order.
+            deduped: List[Dict[str, Any]] = []
+            seen = set()
+            for item in captured:
+                key = (item.get("url"), item.get("status"), item.get("resourceType"))
+                if key in seen:
+                    continue
+                seen.add(key)
+                deduped.append(item)
+
+            return {
+                "ok": True,
+                "version": BROWSER_FETCH_VERSION,
+                "sourceUrl": url,
+                "finalUrl": page.url,
+                "documentStatus": int(response.status),
+                "title": (await page.title()).strip() or None,
+                "visibleTextLength": len((visible or "").strip()),
+                "responses": deduped[:120],
+                "responseCount": len(deduped),
+                "readOnly": True,
+            }
+        finally:
+            if context is not None:
+                await context.close()
+            await browser.close()
+
+
+@app.get("/diagnostic/network-sources")
+async def diagnostic_network_sources(
+    url: str = Query(..., min_length=8),
+    timeout_seconds: float = Query(DEFAULT_TIMEOUT_SECONDS, ge=5.0, le=35.0),
+    x_browser_key: Optional[str] = Header(default=None),
+) -> Dict[str, Any]:
+    _auth(x_browser_key)
+    return await _browser_network_sources(url, timeout_seconds=timeout_seconds)

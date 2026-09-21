@@ -1139,6 +1139,245 @@ def _split_asset_indication(
     return asset, indication, split_x
 
 
+
+def _placeholder_code_token(value: Any) -> bool:
+    s = clean(value)
+    n = norm(s)
+    if not s or n in {"phase", "nme", "nmes", "ai", "ais", "us", "eu"}:
+        return False
+    if _strong_code_token(s):
+        return True
+    # Source-redacted management codes such as ABCxxxx+ remain useful anchors.
+    if re.fullmatch(r"[A-Z]{1,6}[xX]{2,}\+?", s):
+        return True
+    # Some pipeline tables use a short management-code placeholder.
+    return bool(re.fullmatch(r"[A-Z]{2,6}", s))
+
+
+def _asset_root(value: Any) -> str:
+    tokens = re.findall(r"[A-Za-z0-9]+", clean(value))
+    return norm(tokens[0]) if tokens else ""
+
+
+def _visual_phase_column_rows(
+    *,
+    company: str,
+    source_url: str,
+    page_idx: int,
+    body_words: List[Tuple[Any, ...]],
+    code_x: float,
+    left_bound: float,
+    right_bound: float,
+    split_x: Optional[float],
+    phase: str,
+    phase_label: str,
+) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
+    """Recover visual programme rows independently of development-code anchors.
+
+    Complete source lines become rows directly. Tight runs of incomplete
+    source lines are combined only when their source geometry supplies
+    complementary asset/indication parts. A trailing '+' explicitly allows
+    one complete row to continue onto the next visual line.
+    """
+    if split_x is None:
+        return [], {"fragments": 0, "rows": 0, "unresolved": 0, "codeAnchors": 0}
+
+    fragments: List[Dict[str, Any]] = []
+    code_anchors: List[Tuple[float, str]] = []
+
+    for line in _group_word_lines(body_words, y_tol=3.5):
+        col_words = [
+            w for w in line["words"]
+            if left_bound <= float(w[0]) < right_bound
+        ]
+        if not col_words:
+            continue
+
+        y = float(line["y"])
+        codes = [
+            clean(w[4])
+            for w in col_words
+            if abs(float(w[0]) - code_x) <= 22.0
+            and _placeholder_code_token(w[4])
+        ]
+        code = codes[0] if codes else ""
+        if code:
+            code_anchors.append((y, code))
+
+        content = [
+            w for w in col_words
+            if float(w[0]) >= code_x + 38.0
+            and float(w[0]) < right_bound - 3.0
+        ]
+        asset = _join_words([w for w in content if float(w[0]) < split_x])
+        indication = _join_words([w for w in content if float(w[0]) >= split_x])
+
+        # Filing footnotes are metadata, not programme rows.
+        if (
+            not asset
+            and indication
+            and re.match(r"^[†*]+\s*Filed\b|^Filed\s+in\b", indication, re.I)
+        ):
+            continue
+
+        if not asset and not indication and not code:
+            continue
+
+        fragments.append({
+            "y": y,
+            "asset": asset,
+            "indication": indication,
+            "code": code,
+            "complete": bool(asset and indication),
+        })
+
+    assembled: List[Dict[str, Any]] = []
+    unresolved = 0
+    i = 0
+
+    while i < len(fragments):
+        frag = fragments[i]
+
+        if frag["complete"]:
+            row = {
+                "y0": frag["y"],
+                "y1": frag["y"],
+                "asset": frag["asset"],
+                "indication": frag["indication"],
+                "code": frag["code"],
+            }
+
+            # A trailing plus sign is explicit source evidence that the asset
+            # identity continues on the next visual line.
+            if re.search(r"\+\s*$", row["asset"]) and i + 1 < len(fragments):
+                nxt = fragments[i + 1]
+                if nxt["y"] - row["y1"] <= 14.5 and (nxt["asset"] or nxt["indication"]):
+                    row["asset"] = clean(f"{row['asset']} {nxt['asset']}")
+                    row["indication"] = clean(f"{row['indication']} {nxt['indication']}")
+                    row["code"] = row["code"] or nxt["code"]
+                    row["y1"] = nxt["y"]
+                    i += 1
+
+            assembled.append(row)
+            i += 1
+            continue
+
+        # Ignore isolated code-only anchors as rows; retain them for later
+        # high-confidence development-code association.
+        if frag["code"] and not frag["asset"] and not frag["indication"]:
+            i += 1
+            continue
+
+        # Combine a tight run of incomplete fragments. This handles source
+        # layouts such as asset / indication / asset continuation or
+        # indication / code+asset / indication continuation.
+        run = [frag]
+        j = i + 1
+        while j < len(fragments):
+            nxt = fragments[j]
+            if nxt["complete"]:
+                break
+            if nxt["y"] - run[-1]["y"] > 8.5:
+                break
+            # Permit code-only fragments inside a tight visual row.
+            run.append(nxt)
+            j += 1
+
+        assets = [x["asset"] for x in run if x["asset"]]
+        indications = [x["indication"] for x in run if x["indication"]]
+        codes = [x["code"] for x in run if x["code"]]
+
+        if assets and indications:
+            assembled.append({
+                "y0": run[0]["y"],
+                "y1": run[-1]["y"],
+                "asset": clean(" ".join(assets)),
+                "indication": clean(" ".join(indications)),
+                "code": codes[0] if codes else "",
+            })
+        else:
+            unresolved += 1
+
+        i = max(j, i + 1)
+
+    # Attach code-only anchors only when source geometry and repeated asset
+    # identity make the association deterministic. Leaving developmentCode
+    # blank is safer than guessing and does not affect the core row contract.
+    for idx, row in enumerate(assembled):
+        if row["code"]:
+            continue
+        root = _asset_root(row["asset"])
+        if not root:
+            continue
+
+        left = idx
+        while left > 0 and _asset_root(assembled[left - 1]["asset"]) == root:
+            left -= 1
+        right = idx
+        while right + 1 < len(assembled) and _asset_root(assembled[right + 1]["asset"]) == root:
+            right += 1
+
+        group = assembled[left:right + 1]
+        low_y = min(float(r["y0"]) for r in group) - 8.5
+        high_y = max(float(r["y1"]) for r in group) + 8.5
+        nearby = [
+            (y, code)
+            for y, code in code_anchors
+            if low_y <= y <= high_y
+        ]
+        unique_codes = []
+        for _, code in nearby:
+            if norm(code) and norm(code) not in {norm(x) for x in unique_codes}:
+                unique_codes.append(code)
+        if len(unique_codes) == 1:
+            for group_row in group:
+                if not group_row["code"]:
+                    group_row["code"] = unique_codes[0]
+
+    out: List[Dict[str, Any]] = []
+    for row in assembled:
+        asset = clean(row["asset"])
+        indication = clean(row["indication"])
+        if not asset or not indication:
+            unresolved += 1
+            continue
+
+        out.append({
+            "company": company,
+            "sourceFamily": "Company Pipeline",
+            "sourceRecordId": (
+                f"pdfphasevisual:p{page_idx+1}:"
+                f"x{int(round(code_x))}:y{int(round(float(row['y0'])))}"
+            ),
+            "sourceUrl": source_url,
+            "asset": asset,
+            "molecule": asset,
+            "developmentCode": clean(row["code"]),
+            "brand": "",
+            "indication": indication,
+            "phase": phase,
+            "phaseEvidence": "SOURCE_PDF_PHASE_SECTION",
+            "programStatus": "",
+            "sponsorOwner": company,
+            "partners": [],
+            "study": "",
+            "trialIds": [],
+            "therapeuticArea": "",
+            "marketRegion": "",
+            "sourceStageText": clean(phase_label),
+            "sourcePage": page_idx + 1,
+            "sourceOrdinal": len(out) + 1,
+            "parserMethod": "SEMANTIC_PDF_PHASE_COLUMN_VISUAL_ROW",
+            "sourceAdapter": ADAPTER_PROFILE,
+        })
+
+    return out, {
+        "fragments": len(fragments),
+        "rows": len(out),
+        "unresolved": unresolved,
+        "codeAnchors": len(code_anchors),
+    }
+
 def parse_phase_column_pdf(
     company: str,
     source_url: str,
@@ -1159,6 +1398,7 @@ def parse_phase_column_pdf(
     rows: List[Dict[str, Any]] = []
     page_diags: List[Dict[str, Any]] = []
     failures: List[Dict[str, Any]] = []
+    coverage_warnings: List[Dict[str, Any]] = []
     declared_programmes = 0
 
     for page_idx in range(len(doc)):
@@ -1205,16 +1445,22 @@ def parse_phase_column_pdf(
             clean(w[4]) for w in words
             if abs(_word_center_y(w) - header_y) <= 12.0
         ))
+        page_declared = 0
         for a, b in re.findall(
             r"\((\d+)\s+NMEs?\s*\+\s*(\d+)\s+AIs?\)",
             top_text,
             flags=re.I,
         ):
-            declared_programmes += int(a) + int(b)
+            count = int(a) + int(b)
+            page_declared += count
+            declared_programmes += count
 
+        page_row_start = len(rows)
         parsed_here = 0
         page_failures = 0
         column_diags: List[Dict[str, Any]] = []
+        visual_page_rows: List[Dict[str, Any]] = []
+        visual_unresolved = 0
 
         for ci, code_x in enumerate(cluster_xs):
             # Each code anchor starts a horizontal programme cell. The cell
@@ -1364,6 +1610,21 @@ def parse_phase_column_pdf(
                 parsed_here += 1
                 column_parsed += 1
 
+            visual_rows, visual_diag = _visual_phase_column_rows(
+                company=company,
+                source_url=source_url,
+                page_idx=page_idx,
+                body_words=body_words,
+                code_x=code_x,
+                left_bound=left_bound,
+                right_bound=right_bound,
+                split_x=column_split_x,
+                phase=phase,
+                phase_label=clean(phase_header["label"]),
+            )
+            visual_page_rows.extend(visual_rows)
+            visual_unresolved += int(visual_diag.get("unresolved", 0))
+
             column_diags.append({
                 "codeX": round(code_x, 1),
                 "left": round(left_bound, 1),
@@ -1374,6 +1635,37 @@ def parse_phase_column_pdf(
                 "parsedRows": column_parsed,
                 "learnedSplitX": round(column_split_x, 1) if column_split_x is not None else None,
                 "fallbackSplits": fallback_splits,
+                "visualRows": len(visual_rows),
+                "visualUnresolved": int(visual_diag.get("unresolved", 0)),
+            })
+
+        parser_variant = "ANCHOR_ROWS"
+        if (
+            page_declared > 0
+            and parsed_here != page_declared
+            and len(visual_page_rows) == page_declared
+            and visual_unresolved == 0
+        ):
+            # Replace only this page's anchor-derived rows. The source-declared
+            # count acts as an independent completeness gate.
+            del rows[page_row_start:]
+            for visual_row in visual_page_rows:
+                visual_row["sourceOrdinal"] = len(rows) + 1
+                rows.append(visual_row)
+            parsed_here = len(visual_page_rows)
+            page_failures = 0
+            # Remove failures that belong to the replaced page.
+            failures = [x for x in failures if int(x.get("page", -1)) != page_idx + 1]
+            parser_variant = "VISUAL_ROWS"
+
+        if page_declared > 0 and parsed_here != page_declared:
+            coverage_warnings.append({
+                "page": page_idx + 1,
+                "declaredRows": page_declared,
+                "parsedRows": parsed_here,
+                "anchorRows": len(rows[page_row_start:]) if parser_variant == "ANCHOR_ROWS" else None,
+                "visualRows": len(visual_page_rows),
+                "visualUnresolved": visual_unresolved,
             })
 
         page_diags.append({
@@ -1384,7 +1676,11 @@ def parse_phase_column_pdf(
                 for h in headers
             ],
             "columns": column_diags,
+            "declaredRows": page_declared,
             "parsedRows": parsed_here,
+            "parserVariant": parser_variant,
+            "visualRows": len(visual_page_rows),
+            "visualUnresolved": visual_unresolved,
             "rejectedRows": page_failures,
         })
 
@@ -1413,6 +1709,8 @@ def parse_phase_column_pdf(
         "declaredProgrammes": declared_programmes,
         "rowFailures": len(failures),
         "failureSamples": failures[:20],
+        "coverageWarnings": len(coverage_warnings),
+        "coverageWarningSamples": coverage_warnings[:12],
         "boundaryWarnings": 0,
         "companySpecificParserBranch": False,
         "portfolioDependentValidation": False,
@@ -1489,6 +1787,8 @@ async def extract_generic_pdf(
         issues.append(f"{diagnostics['rowFailures']} source rows could not be resolved structurally")
     if int(diagnostics.get("boundaryWarnings", 0)) > 0:
         issues.append(f"{diagnostics['boundaryWarnings']} possible PDF row-boundary ambiguities require review")
+    if int(diagnostics.get("coverageWarnings", 0)) > 0:
+        issues.append(f"{diagnostics['coverageWarnings']} PDF source-declared coverage mismatches require review")
 
     ready = not issues
     summary = {

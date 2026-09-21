@@ -22,11 +22,17 @@ from pydantic import BaseModel
 from playwright.async_api import Browser, BrowserContext, Page, async_playwright
 
 
-BROWSER_FETCH_VERSION = "BROWSER_RETRIEVAL_V1.0"
+BROWSER_FETCH_VERSION = "BROWSER_RETRIEVAL_V1.1_STRUCTURED_DOM"
 MAX_VISIBLE_TEXT = 200_000
 MAX_HTML_BYTES = 2_500_000
 MAX_ANCHORS = 400
 MAX_HEADINGS = 100
+MAX_VISIBLE_LINES = 5000
+MAX_LINE_CHARS = 1200
+MAX_TABLES = 40
+MAX_TABLE_ROWS = 1000
+MAX_TABLE_CELLS = 40
+MAX_TABLE_CELL_CHARS = 800
 DEFAULT_TIMEOUT_SECONDS = 35.0
 
 LILLY_CANARY_URL = "https://www.lilly.com/science/research-development/pipeline"
@@ -50,6 +56,8 @@ class BrowserFetchResponse(BaseModel):
     metaDescription: Optional[str] = None
     visibleTextLength: int
     visibleText: str
+    visibleLines: List[str] = []
+    tables: List[List[List[str]]] = []
     headings: List[Dict[str, Any]]
     anchors: List[Dict[str, str]]
     transport: str = "PLAYWRIGHT_CHROMIUM"
@@ -161,10 +169,48 @@ async def _extract_rendered(page: Page, source_url: str, response_status: int) -
     await _assert_public_http_url(final_url)
 
     try:
-        visible_text = await page.locator("body").inner_text(timeout=5_000)
+        raw_visible_text = await page.locator("body").inner_text(timeout=5_000)
     except Exception:
-        visible_text = _strip_html(raw_html)
-    visible_text = re.sub(r"\s+", " ", visible_text or "").strip()
+        raw_visible_text = _strip_html(raw_html)
+
+    visible_lines: List[str] = []
+    for raw_line in (raw_visible_text or "").splitlines():
+        line = re.sub(r"\s+", " ", raw_line).strip()
+        if not line:
+            continue
+        visible_lines.append(line[:MAX_LINE_CHARS])
+        if len(visible_lines) >= MAX_VISIBLE_LINES:
+            break
+
+    visible_text = re.sub(r"\s+", " ", raw_visible_text or "").strip()
+
+    tables = await page.evaluate(
+        """({maxTables, maxRows, maxCells, maxChars}) =>
+          Array.from(document.querySelectorAll('table'))
+            .slice(0, maxTables)
+            .map((table) =>
+              Array.from(table.querySelectorAll('tr'))
+                .slice(0, maxRows)
+                .map((row) =>
+                  Array.from(row.querySelectorAll(':scope > th, :scope > td'))
+                    .slice(0, maxCells)
+                    .map((cell) =>
+                      (cell.innerText || cell.textContent || '')
+                        .replace(/\\s+/g, ' ')
+                        .trim()
+                        .slice(0, maxChars)
+                    )
+                )
+                .filter((row) => row.some((cell) => cell))
+            )
+            .filter((table) => table.length > 0)""",
+        {
+            "maxTables": MAX_TABLES,
+            "maxRows": MAX_TABLE_ROWS,
+            "maxCells": MAX_TABLE_CELLS,
+            "maxChars": MAX_TABLE_CELL_CHARS,
+        },
+    )
 
     try:
         meta_description = await page.locator('meta[name="description"]').get_attribute("content", timeout=2_000)
@@ -223,6 +269,8 @@ async def _extract_rendered(page: Page, source_url: str, response_status: int) -
         metaDescription=meta_description,
         visibleTextLength=len(visible_text),
         visibleText=visible_text[:MAX_VISIBLE_TEXT],
+        visibleLines=visible_lines,
+        tables=tables,
         headings=headings,
         anchors=anchors,
     )

@@ -195,6 +195,7 @@ async def _fetch_browser_structure(
                 params={
                     "url": url,
                     "timeout_seconds": timeout_seconds,
+                    "expand_load_more": "true",
                 },
                 headers={
                     "X-Browser-Key": key,
@@ -345,6 +346,11 @@ async def _extract_generic_pipeline(
             "retrievalMode": retrieval_mode,
             "routingReason": routing_reason,
             "browserVersion": browser_version,
+            "browserExpansionClicks": (
+                int(browser.get("expansionClicks") or 0)
+                if "browser" in locals() and isinstance(browser, dict)
+                else 0
+            ),
             "directFailure": direct_failure,
             "portfolioDependentValidation": False,
         }

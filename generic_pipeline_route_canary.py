@@ -1,40 +1,41 @@
-"""Read-only BioNTech Webpack pipeline-module discovery.
+"""Read-only rendered-line diagnostics for current pipeline pages.
 
-Finds the runtime chunk URL builder in the current official site bundle,
-resolves the chunks used by pipelinev2.2, and inspects only those JavaScript
-chunks for first-party pipeline data endpoints/configuration. No writes.
+Captures numbered browser-visible lines for BioNTech, J&J and Wave so reusable
+semantic card/flow parsers can be built from source structure rather than
+Portfolio aliases or company-specific row values.
 """
-import asyncio, json, re
-from urllib.parse import urljoin
+import asyncio, json, os
 import httpx
 
-MAIN="https://www.biontech.com/etc.clientlibs/biontech-xp-nova/clientlibs/clientlib-site-main.lc-b59be832b3008ea78c75ca1f1589206c-lc.min.js"
-CHUNK_IDS=[491,961,290,957,463]
-HEADERS={"User-Agent":"Mozilla/5.0 BioNTechPipelineDiscovery/1.0","Accept":"application/javascript,text/javascript,*/*;q=0.8"}
-
-def compact(s): return re.sub(r"\s+"," ",str(s or "")).strip()
+SOURCES=[
+ ("BioNTech SE","https://www.biontech.com/int/en/home/pipeline-and-products/pipeline.html"),
+ ("Johnson & Johnson","https://www.investor.jnj.com/pipeline/development-pipeline/default.aspx"),
+ ("Wave Life Sciences","https://wavelifesciences.com/pipeline/research-and-development/"),
+]
 
 async def main():
-  async with httpx.AsyncClient(timeout=35.0,follow_redirects=True,headers=HEADERS) as c:
-    r=await c.get(MAIN); r.raise_for_status(); text=r.text
-    snippets=[]
-    for pat in [r"\.u\s*=\s*function",r"\.u\s*=\s*\(",r"__webpack_require__\.u",r"chunkFilename",r"491",r"pipelinev2\.2"]:
-      for m in re.finditer(pat,text,re.I):
-        snippets.append({"pattern":pat,"offset":m.start(),"text":compact(text[max(0,m.start()-1500):m.start()+5500])[:7000]})
-        if len(snippets)>=25: break
-      if len(snippets)>=25: break
-    print("BIONTECH_WEBPACK_RUNTIME "+json.dumps({"chars":len(text),"snippets":snippets},ensure_ascii=False),flush=True)
-
-    # Collect any literal or templated script references around the pipeline map
-    # and runtime. This intentionally does not guess a chunk URL.
-    candidate_strings=[]
-    for m in re.finditer(r'''["']([^"'\s]{2,500})["']''',text):
-      v=m.group(1)
-      low=v.lower()
-      if any(k in low for k in ["pipelinev2","clientlib-site-main",".js","chunk"]):
-        if v not in candidate_strings: candidate_strings.append(v)
-      if len(candidate_strings)>=250: break
-    print("BIONTECH_WEBPACK_STRINGS "+json.dumps({"strings":candidate_strings[:250]},ensure_ascii=False),flush=True)
+    base=os.getenv("BROWSER_FETCH_BASE_URL","").strip().rstrip("/")
+    key=os.getenv("BROWSER_FETCH_KEY","").strip()
+    if not base or not key:
+        print("RENDERED_LINE_DIAGNOSTIC "+json.dumps({"configured":False}),flush=True)
+        return
+    async with httpx.AsyncClient(timeout=55.0,follow_redirects=True) as c:
+      for company,url in SOURCES:
+        try:
+          r=await c.get(base+"/fetch/browser",params={"url":url,"timeout_seconds":30},headers={"X-Browser-Key":key})
+          data=r.json()
+          lines=data.get("visibleLines") or []
+          numbered=[{"i":i,"text":str(v)} for i,v in enumerate(lines)]
+          print("RENDERED_LINE_DIAGNOSTIC "+json.dumps({
+            "company":company,"status":r.status_code,"browserVersion":data.get("version"),
+            "httpStatus":data.get("httpStatus"),"title":data.get("title"),
+            "visibleTextLength":data.get("visibleTextLength"),
+            "lineCount":len(lines),"lines":numbered
+          },ensure_ascii=False),flush=True)
+        except Exception as exc:
+          print("RENDERED_LINE_DIAGNOSTIC "+json.dumps({
+            "company":company,"error":f"{type(exc).__name__}: {exc}"
+          },ensure_ascii=False),flush=True)
 
 if __name__=="__main__":
-  asyncio.run(main())
+    asyncio.run(main())

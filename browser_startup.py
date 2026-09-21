@@ -57,6 +57,16 @@ async def main() -> None:
     bayer = await _run_canary(BAYER_CANARY_URL, ["pipeline", "phase"])
     print("BROWSER_CANARY_BAYER", bayer, flush=True)
 
+    extra_canaries = [
+        ("ABBVIE", "https://www.abbvie.com/science/pipeline.html", ["pipeline"]),
+        ("VERVE", "https://www.vervetx.com/our-programs/our-pipeline", ["pipeline"]),
+        ("BOEHRINGER", "https://www.boehringer-ingelheim.com/science-innovation/human-health-innovation/pipeline", ["pipeline"]),
+        ("SOBI", "https://www.sobi.com/en/pipeline", ["pipeline", "phase"]),
+    ]
+    for label, url, terms in extra_canaries:
+        result = await _run_canary(url, terms)
+        print(f"BROWSER_CANARY_{label}", result, flush=True)
+
 
 if __name__ == "__main__":
     asyncio.run(main())

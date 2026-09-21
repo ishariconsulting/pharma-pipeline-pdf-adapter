@@ -1,56 +1,66 @@
-"""Read-only Menarini official GraphQL pipeline canary."""
-import asyncio, json, re
+"""Read-only Menarini adapter validation + browser structural probes."""
+import asyncio, json, os, re
 import httpx
+from menarini_graphql_pipeline_extension import extract_menarini_pipeline
 
-BASE="https://www.menarini.com"
-PATHS=[
- "/content/dam/menarini-com/content-fragments/en_us/pipeline-tables/pipeline-and-products/oncology-(focus-on-compound)",
- "/content/dam/menarini-com/content-fragments/en_us/pipeline-tables/pipeline-and-products/oncology-(focus-on-indication)",
- "/content/dam/menarini-com/content-fragments/en_us/pipeline-tables/pipeline-and-products/anti-infectives-table-1",
- "/content/dam/menarini-com/content-fragments/en_us/pipeline-tables/pipeline-and-products/anti-infectives-table-2",
- "/content/dam/menarini-com/content-fragments/en_us/pipeline-tables/pipeline-and-products/cardio-metabolic-table-focus-on-compound",
- "/content/dam/menarini-com/content-fragments/en_us/pipeline-tables/pipeline-and-products/cardio-metabolic-table-focus-on-indication",
+MENARINI="https://www.menarini.com/en-us/innovation-research/our-pipeline-and-products.html"
+BROWSER_SOURCES=[
+ ("BioNTech SE","https://www.biontech.com/int/en/home/pipeline-and-products/pipeline.html"),
+ ("Menarini Group",MENARINI),
+ ("Johnson & Johnson","https://www.investor.jnj.com/pipeline/development-pipeline/default.aspx"),
+ ("Wave Life Sciences","https://wavelifesciences.com/pipeline/research-and-development/"),
+ ("Vertex Pharmaceuticals","https://www.vrtx.com/our-science/pipeline/"),
 ]
-HEADERS={"User-Agent":"Mozilla/5.0 MenariniGraphQLPipelineCanary/1.0","Accept":"application/json,*/*;q=0.8"}
+SIG=re.compile(r"phase\s*[123]|registration|approved|pipeline|indication|oncology|program|programme",re.I)
 
 def clean(x): return re.sub(r"\s+"," ",str(x or "")).strip()
 
-async def main():
-  async with httpx.AsyncClient(timeout=30.0,follow_redirects=True,headers=HEADERS) as c:
-    all_rows=[]
-    for path in PATHS:
-      url=BASE+"/graphql/execute.json/menarini-com/pipeline-table;path="+path
-      try:
-        r=await c.get(url)
-        payload={"path":path,"status":r.status_code,"contentType":r.headers.get("content-type"),"chars":len(r.text)}
-        data=None
-        try: data=r.json()
-        except Exception: pass
-        item=((data or {}).get("data") or {}).get("pipelineTableByPath") or {}
-        item=item.get("item") if isinstance(item,dict) else None
-        rows=(item or {}).get("pipelineItems") if isinstance(item,dict) else None
-        rows=rows if isinstance(rows,list) else []
-        payload["groupByFirstColumn"]=(item or {}).get("groupByFirstColumn") if isinstance(item,dict) else None
-        payload["rowCount"]=len(rows)
-        payload["keys"]=sorted({k for x in rows if isinstance(x,dict) for k in x.keys()})
-        payload["sample"]=rows[:4]
-        all_rows.extend(rows)
-        print("MENARINI_GRAPHQL_TABLE "+json.dumps(payload,ensure_ascii=False),flush=True)
-      except Exception as exc:
-        print("MENARINI_GRAPHQL_TABLE "+json.dumps({"path":path,"error":f"{type(exc).__name__}: {exc}"},ensure_ascii=False),flush=True)
+async def menarini():
+    try:
+        r=await extract_menarini_pipeline("Menarini Group",MENARINI,35.0)
+        print("MENARINI_ADAPTER_CANARY "+json.dumps({
+          "readyForDiscovery":r.readyForDiscovery,"rowCount":r.rowCount,
+          "issues":[x.get("issue") for x in r.issues],
+          "summary":r.summary,"diagnostics":r.diagnostics,
+          "sample":r.rows[:12],"masterWrites":0
+        },ensure_ascii=False),flush=True)
+    except Exception as exc:
+        print("MENARINI_ADAPTER_CANARY "+json.dumps({"readyForDiscovery":False,"error":f"{type(exc).__name__}: {exc}","masterWrites":0},ensure_ascii=False),flush=True)
 
-    compound_rows=[]
-    for x in all_rows:
-      if not isinstance(x,dict): continue
-      compound=clean(x.get("compound")); indication=clean(x.get("indication")); stage=clean(x.get("developmentStage"))
-      if compound and indication and stage:
-        compound_rows.append((compound,indication,stage))
-    unique=list(dict.fromkeys(compound_rows))
-    print("MENARINI_GRAPHQL_SUMMARY "+json.dumps({
-      "rawRows":len(all_rows),"coreCompleteRows":len(compound_rows),"uniqueCoreRows":len(unique),
-      "sampleUnique":[{"compound":a,"indication":b,"developmentStage":c} for a,b,c in unique[:15]],
-      "masterWrites":0
-    },ensure_ascii=False),flush=True)
+async def browser():
+    base=os.getenv("BROWSER_FETCH_BASE_URL","").strip().rstrip("/")
+    key=os.getenv("BROWSER_FETCH_KEY","").strip()
+    if not base or not key:
+        print("BROWSER_PIPELINE_PROBE "+json.dumps({"configured":False}),flush=True); return
+    async with httpx.AsyncClient(timeout=50.0,follow_redirects=True) as c:
+      for company,url in BROWSER_SOURCES:
+        try:
+          rr=await c.get(base+"/fetch/browser",params={"url":url,"timeout_seconds":28},headers={"X-Browser-Key":key})
+          data=None
+          try:data=rr.json()
+          except Exception:pass
+          if not isinstance(data,dict):
+            print("BROWSER_PIPELINE_PROBE "+json.dumps({"company":company,"status":rr.status_code,"contentType":rr.headers.get("content-type"),"head":clean(rr.text[:800])},ensure_ascii=False),flush=True)
+            continue
+          lines=data.get("visibleLines") or []
+          tables=data.get("tables") or []
+          signal=[clean(x) for x in lines if SIG.search(str(x))][:35]
+          table_samples=[]
+          for ti,t in enumerate(tables[:8]):
+            table_samples.append({"table":ti,"rows":[[clean(c) for c in row[:12]] for row in t[:8]]})
+          print("BROWSER_PIPELINE_PROBE "+json.dumps({
+            "company":company,"status":rr.status_code,"browserVersion":data.get("version"),
+            "httpStatus":data.get("httpStatus"),"finalUrl":data.get("finalUrl"),
+            "title":data.get("title"),"visibleTextLength":data.get("visibleTextLength"),
+            "visibleLines":len(lines),"tables":len(tables),
+            "signalLines":signal,"tableSamples":table_samples,
+          },ensure_ascii=False),flush=True)
+        except Exception as exc:
+          print("BROWSER_PIPELINE_PROBE "+json.dumps({"company":company,"error":f"{type(exc).__name__}: {exc}"},ensure_ascii=False),flush=True)
+
+async def main():
+    await menarini()
+    await browser()
 
 if __name__=="__main__":
-  asyncio.run(main())
+    asyncio.run(main())

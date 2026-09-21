@@ -387,8 +387,12 @@ class PageShapeParser(HTMLParser):
             self._current_cell = None
 
         elif tag == "tr" and self._current_row is not None:
-            if any(clean(cell) for cell in self._current_row):
-                assert self._current_table is not None
+            # Public pages can contain malformed or nested table markup where an
+            # outer </table> closes before a trailing </tr>. Treat that as a
+            # recoverable table-shape defect: retain visible text, discard only
+            # the orphan semantic row, and continue parsing instead of crashing
+            # the whole source adapter.
+            if self._current_table is not None and any(clean(cell) for cell in self._current_row):
                 self._current_table.append(self._current_row)
             self._current_row = None
 

@@ -7,6 +7,7 @@ No Airtable or master-data writes.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import math
 import re
 from typing import Any, Dict, List, Optional, Tuple
@@ -281,6 +282,80 @@ def _parse_entry(text: str) -> Tuple[str, str, str]:
     return asset, indication, code
 
 
+def _pdf_bullet_spans(page: fitz.Page) -> List[Dict[str, Any]]:
+    out: List[Dict[str, Any]] = []
+    info = page.get_text("dict")
+    for block in info.get("blocks", []):
+        for line in block.get("lines", []):
+            for span in line.get("spans", []):
+                if clean(span.get("text")) != "■":
+                    continue
+                bbox = span.get("bbox") or [0, 0, 0, 0]
+                out.append({
+                    "x0": float(bbox[0]),
+                    "y0": float(bbox[1]),
+                    "x1": float(bbox[2]),
+                    "y1": float(bbox[3]),
+                    "cx": (float(bbox[0]) + float(bbox[2])) / 2.0,
+                    "cy": (float(bbox[1]) + float(bbox[3])) / 2.0,
+                    "size": float(span.get("size") or 0.0),
+                    "color": int(span.get("color") or 0),
+                })
+    return out
+
+
+def _legend_from_bullet_spans(page: fitz.Page, bullet_spans: List[Dict[str, Any]]) -> Dict[int, str]:
+    words = page.get_text("words")
+    lines = line_groups(words, 3.5)
+    expected = {
+        "immunology": "Immunology",
+        "oncology": "Oncology",
+        "neuroscience": "Neuroscience",
+        "aesthetics": "Aesthetics",
+        "eye care": "Eye Care",
+        "targeted investment": "Targeted Investment",
+    }
+    mapping: Dict[int, str] = {}
+    for bullet in bullet_spans:
+        if bullet["size"] < 15.0:
+            continue
+        candidates = [
+            line for line in lines
+            if float(line["x0"]) > bullet["x1"] + 2.0
+            and abs(float(line["y"]) - bullet["cy"]) <= 10.0
+            and norm(line["text"]) in expected
+        ]
+        if not candidates:
+            continue
+        chosen = min(candidates, key=lambda line: abs(float(line["y"]) - bullet["cy"]))
+        mapping[bullet["color"]] = expected[norm(chosen["text"])]
+    return mapping
+
+
+def _ta_for_anchor(
+    anchor_word: Tuple[Any, ...],
+    bullet_spans: List[Dict[str, Any]],
+    legend: Dict[int, str],
+) -> str:
+    x = float(anchor_word[0])
+    y = word_y(anchor_word)
+    candidates = [
+        b for b in bullet_spans
+        if b["size"] < 15.0
+        and abs(b["x0"] - x) <= 4.0
+        and abs(b["cy"] - y) <= 6.0
+    ]
+    if not candidates:
+        return ""
+    bullet = min(candidates, key=lambda b: abs(b["cy"] - y) + abs(b["x0"] - x))
+    return legend.get(int(bullet["color"]), "")
+
+
+def _stable_source_record_id(phase: str, asset: str, indication: str) -> str:
+    raw = "|".join([norm(phase), norm(asset), norm(indication)])
+    return "abbvie:" + hashlib.sha1(raw.encode("utf-8")).hexdigest()[:18]
+
+
 def _source_date(page_text: str) -> Optional[str]:
     m = re.search(r"As of\s+([A-Za-z]+\s+\d{1,2},\s+\d{4})", page_text, re.I)
     return clean(m.group(1)) if m else None
@@ -308,6 +383,8 @@ def parse_pdf(company: str, source_url: str, data: bytes) -> Tuple[List[Dict[str
     page = selected_page
     words = page.get_text("words")
     page_text = page.get_text("text", sort=True)
+    bullet_spans = _pdf_bullet_spans(page)
+    ta_legend = _legend_from_bullet_spans(page, bullet_spans)
 
     header_y = min(float(c["headerY"]) for c in columns)
     footer_y_candidates = []
@@ -382,10 +459,12 @@ def parse_pdf(company: str, source_url: str, data: bytes) -> Tuple[List[Dict[str
                 else col["phase"]
             )
 
+            therapeutic_area = _ta_for_anchor(anchor_word, bullet_spans, ta_legend)
+
             rows.append({
                 "company": company,
                 "sourceFamily": "Company Pipeline",
-                "sourceRecordId": f"abbviepdf:p{page_index+1}:c{col_idx}:r{i+1}",
+                "sourceRecordId": _stable_source_record_id(phase, asset, indication),
                 "sourceUrl": source_url,
                 "asset": asset,
                 "molecule": "",
@@ -399,7 +478,7 @@ def parse_pdf(company: str, source_url: str, data: bytes) -> Tuple[List[Dict[str
                 "partners": [],
                 "study": "",
                 "trialIds": [],
-                "therapeuticArea": "",
+                "therapeuticArea": therapeutic_area,
                 "sourceStageText": col["phase"],
                 "sourceOrdinal": len(rows) + 1,
                 "parserMethod": "ABBVIE_PDF_BULLET_ROW",
@@ -428,6 +507,8 @@ def parse_pdf(company: str, source_url: str, data: bytes) -> Tuple[List[Dict[str
         row["sourceOrdinal"] = len(deduped) + 1
         deduped.append(row)
 
+    ta_missing = sum(1 for row in deduped if not clean(row.get("therapeuticArea")))
+
     diag = {
         "pageCount": len(doc),
         "pipelinePage": page_index + 1,
@@ -438,6 +519,8 @@ def parse_pdf(company: str, source_url: str, data: bytes) -> Tuple[List[Dict[str
         "rowFailures": len(failures),
         "failureSamples": failures[:12],
         "phaseCounts": phase_counts,
+        "therapeuticAreaLegend": ta_legend,
+        "therapeuticAreaMissing": ta_missing,
         "portfolioDependentValidation": False,
         "companySpecificParserBranch": True,
         "writes": 0,
@@ -470,6 +553,8 @@ async def extract_abbvie_pipeline(company: str, source_url: str, timeout_seconds
         issues.append(f"{diagnostics['rowFailures']} PDF rows could not be split into asset and indication")
     if diagnostics.get("exactDuplicates", 0) > 0:
         issues.append(f"{diagnostics['exactDuplicates']} exact duplicate PDF rows detected")
+    if diagnostics.get("therapeuticAreaMissing", 0) > 0:
+        issues.append(f"{diagnostics['therapeuticAreaMissing']} PDF rows are missing source therapeutic-area mapping")
     if len(diagnostics.get("phaseCounts", {})) < 4:
         issues.append("not all four source phase columns produced rows")
     ready = not issues

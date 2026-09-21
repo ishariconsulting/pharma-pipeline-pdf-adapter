@@ -1,63 +1,56 @@
-"""Focused machine-contract discovery for Merck, BioNTech, Vertex."""
-import asyncio, html as html_lib, json, re
+"""Read-only canary for Drupal Views parser plus source endpoints."""
+import asyncio, json, re, html as html_lib
 from urllib.parse import urljoin
 import httpx
+from drupal_views_pipeline_extension import extract_drupal_views
 
-HEADERS={"User-Agent":"Mozilla/5.0 MachineContractCanary/1.0","Accept":"text/html,application/javascript,*/*;q=0.8"}
-PAGES={
- "MERCK":"https://www.emdgroup.com/en/research/healthcare-pipeline.html",
- "BIONTECH":"https://www.biontech.com/int/en/home/pipeline-and-products/pipeline.html",
- "VERTEX":"https://www.vrtx.com/our-science/pipeline/",
-}
+VERTEX="https://www.vrtx.com/our-science/pipeline/"
+MERCK_DATA_CANDIDATES=[
+ "https://www.emdgroup.com/content/dam/scripts/group/en/pipeline/data.js",
+ "https://www.emdgroup.com/content/dam/scripts/group/en/pipeline/data/data.js",
+ "https://www.emdgroup.com/content/dam/web/corporate/scripts/group/en/pipeline/data.js",
+]
+BIONTECH_PAGE="https://www.biontech.com/int/en/home/pipeline-and-products/pipeline.html"
 
-def compact(v):
-    return re.sub(r"\s+"," ",html_lib.unescape(str(v or ""))).strip()
-
-def around(text,key,before=900,after=2200,limit=8):
-    low=text.lower(); k=key.lower(); out=[]; pos=0
-    for _ in range(limit):
-      i=low.find(k,pos)
-      if i<0: break
-      out.append(compact(text[max(0,i-before):i+after])[:before+after])
-      pos=i+len(k)
-    return out
+def compact(v): return re.sub(r"\s+"," ",html_lib.unescape(str(v or ""))).strip()
 
 async def main():
-  async with httpx.AsyncClient(timeout=35,follow_redirects=True,headers=HEADERS) as c:
-    merck=await c.get(PAGES["MERCK"])
-    print("MERCK_PATH_DISCOVERY "+json.dumps({
-      "status":merck.status_code,
-      "contentdiv":around(merck.text,"contentdiv",1200,2600,10),
-      "filepath":around(merck.text,"filePath",1200,2600,10),
-      "datajs":around(merck.text,"data.js",1200,2600,10),
+  try:
+    r=await extract_drupal_views("Vertex Pharmaceuticals",VERTEX,35.0)
+    print("VERTEX_DRUPAL_CANARY "+json.dumps({
+      "readyForDiscovery":r.readyForDiscovery,"rowCount":r.rowCount,
+      "issues":[x.get("issue") for x in r.issues],"diagnostics":r.diagnostics,
+      "phaseCounts":{p:sum(1 for x in r.rows if x["phase"]==p) for p in sorted(set(x["phase"] for x in r.rows))},
+      "sample":r.rows[:15],"masterWrites":0
     },ensure_ascii=False),flush=True)
+  except Exception as exc:
+    print("VERTEX_DRUPAL_CANARY "+json.dumps({"readyForDiscovery":False,"error":f"{type(exc).__name__}: {exc}","masterWrites":0}),flush=True)
 
-    bio=await c.get(PAGES["BIONTECH"])
-    scripts=[urljoin(str(bio.url),html_lib.unescape(x)) for x in re.findall(r'<script[^>]+src=["\']([^"\']+)["\']',bio.text,re.I)]
-    js_hits=[]
-    for s in list(dict.fromkeys(scripts)):
+  async with httpx.AsyncClient(timeout=35,follow_redirects=True,headers={"User-Agent":"Mozilla/5.0 ContractCanary/1.0","Accept":"*/*"}) as c:
+    merck=[]
+    for url in MERCK_DATA_CANDIDATES:
       try:
-        r=await c.get(s)
-        txt=r.text
-        low=txt.lower()
-        if any(k in low for k in ["pipelinecfref","pipelinedirectoryref","pipelinev2","contentfragment","content-fragment","graphql"]):
-          snippets=[]
-          for key in ["pipelineCfRef","pipelineDirectoryRef","pipelinev2","contentFragment","graphql",".model.json","assets.json"]:
-            snippets += [{"key":key,"text":x} for x in around(txt,key,700,1900,8)]
-          js_hits.append({"url":s,"status":r.status_code,"chars":len(txt),"snippets":snippets[:35]})
+        rr=await c.get(url)
+        merck.append({"url":url,"status":rr.status_code,"contentType":rr.headers.get("content-type"),"chars":len(rr.text),"head":compact(rr.text[:3500])[:3500]})
       except Exception as exc:
-        pass
-    print("BIONTECH_JS_CONTRACT "+json.dumps({"scripts":js_hits},ensure_ascii=False),flush=True)
+        merck.append({"url":url,"error":f"{type(exc).__name__}: {exc}"})
+    print("MERCK_DATA_PROBE "+json.dumps(merck,ensure_ascii=False),flush=True)
 
-    vx=await c.get(PAGES["VERTEX"])
-    phase_hits=around(vx.text,"views-field-field-phase",1800,2600,12)
-    asset_keys=[]
-    for key in ["views-field-title","views-field-field-indication","views-field-field-therapeutic","views-field-field-program","views-field-field-molecule","VX-993","VX-407"]:
-      vals=around(vx.text,key,1400,2200,6)
-      if vals: asset_keys.append({"key":key,"hits":vals})
-    print("VERTEX_ROW_CONTRACT "+json.dumps({
-      "status":vx.status_code,"phaseHits":phase_hits[:12],"semanticHits":asset_keys
-    },ensure_ascii=False),flush=True)
+    bio=await c.get(BIONTECH_PAGE)
+    scripts=[urljoin(str(bio.url),html_lib.unescape(x)) for x in re.findall(r'<script[^>]+src=["\']([^"\']+)["\']',bio.text,re.I)]
+    mainjs=next((x for x in scripts if "clientlib-site-main" in x),None)
+    result={"mainJs":mainjs}
+    if mainjs:
+      jr=await c.get(mainjs); txt=jr.text
+      result["publicPathHits"]=[]
+      for key in ["n.u=function","__webpack_require__.u","function(t){return","pipelinev2.2/index","957","463"]:
+        low=txt.lower(); k=key.lower(); pos=0
+        for _ in range(5):
+          i=low.find(k,pos)
+          if i<0: break
+          result["publicPathHits"].append({"key":key,"text":compact(txt[max(0,i-900):i+2600])[:3500]})
+          pos=i+len(k)
+    print("BIONTECH_BUNDLE_DISCOVERY "+json.dumps(result,ensure_ascii=False),flush=True)
 
 if __name__=="__main__":
   asyncio.run(main())

@@ -63,6 +63,7 @@ class BrowserFetchResponse(BaseModel):
     transport: str = "PLAYWRIGHT_CHROMIUM"
     retrievalMode: str = "BROWSER_REQUIRED"
     expansionClicks: int = 0
+    layoutTextNodes: List[Dict[str, Any]] = []
 
 
 def _auth(x_browser_key: Optional[str]) -> None:
@@ -164,6 +165,7 @@ async def _extract_rendered(
     source_url: str,
     response_status: int,
     expansion_clicks: int = 0,
+    include_layout: bool = False,
 ) -> BrowserFetchResponse:
     raw_html = await page.content()
     encoded = raw_html.encode("utf-8", errors="ignore")
@@ -246,6 +248,46 @@ async def _extract_rendered(
         MAX_ANCHORS * 2,
     )
 
+    layout_text_nodes: List[Dict[str, Any]] = []
+    if include_layout:
+        try:
+            layout_text_nodes = await page.evaluate(
+                """(limit) => {
+                  const nodes = [];
+                  const all = Array.from(document.querySelectorAll('body *'));
+                  for (const el of all) {
+                    if (nodes.length >= limit) break;
+                    const style = window.getComputedStyle(el);
+                    if (!style || style.display === 'none' || style.visibility === 'hidden') continue;
+                    const rect = el.getBoundingClientRect();
+                    if (!rect || rect.width <= 0 || rect.height <= 0) continue;
+                    const ownText = Array.from(el.childNodes)
+                      .filter(n => n.nodeType === Node.TEXT_NODE)
+                      .map(n => n.textContent || '')
+                      .join(' ')
+                      .replace(/\\s+/g, ' ')
+                      .trim();
+                    if (!ownText) continue;
+                    nodes.push({
+                      tag: (el.tagName || '').toLowerCase(),
+                      text: ownText.slice(0, 500),
+                      x: Math.round(rect.x * 10) / 10,
+                      y: Math.round(rect.y * 10) / 10,
+                      width: Math.round(rect.width * 10) / 10,
+                      height: Math.round(rect.height * 10) / 10,
+                      className: String(el.className || '').slice(0, 300),
+                      id: String(el.id || '').slice(0, 160),
+                      ariaLabel: String(el.getAttribute('aria-label') || '').slice(0, 240),
+                      role: String(el.getAttribute('role') || '').slice(0, 120),
+                    });
+                  }
+                  return nodes;
+                }""",
+                1800,
+            )
+        except Exception:
+            layout_text_nodes = []
+
     anchors: List[Dict[str, str]] = []
     seen = set()
     for item in raw_anchors:
@@ -280,6 +322,7 @@ async def _extract_rendered(
         headings=headings,
         anchors=anchors,
         expansionClicks=expansion_clicks,
+        layoutTextNodes=layout_text_nodes,
     )
 
 
@@ -331,6 +374,7 @@ async def _browser_fetch(
     url: str,
     timeout_seconds: float = DEFAULT_TIMEOUT_SECONDS,
     expand_load_more: bool = False,
+    include_layout: bool = False,
 ) -> BrowserFetchResponse:
     await _assert_public_http_url(url)
     timeout_ms = int(timeout_seconds * 1000)
@@ -381,6 +425,7 @@ async def _browser_fetch(
                 url,
                 status,
                 expansion_clicks=expansion_clicks,
+                include_layout=include_layout,
             )
         finally:
             if context is not None:
@@ -403,6 +448,7 @@ async def fetch_browser(
     url: str = Query(..., min_length=8),
     timeout_seconds: float = Query(DEFAULT_TIMEOUT_SECONDS, ge=5.0, le=35.0),
     expand_load_more: bool = Query(default=False),
+    include_layout: bool = Query(default=False),
     x_browser_key: Optional[str] = Header(default=None),
 ) -> BrowserFetchResponse:
     _auth(x_browser_key)
@@ -410,6 +456,7 @@ async def fetch_browser(
         url,
         timeout_seconds=timeout_seconds,
         expand_load_more=expand_load_more,
+        include_layout=include_layout,
     )
 
 

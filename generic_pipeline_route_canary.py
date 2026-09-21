@@ -1,66 +1,40 @@
-"""Read-only Menarini adapter validation + browser structural probes."""
-import asyncio, json, os, re
+"""Read-only BioNTech Webpack pipeline-module discovery.
+
+Finds the runtime chunk URL builder in the current official site bundle,
+resolves the chunks used by pipelinev2.2, and inspects only those JavaScript
+chunks for first-party pipeline data endpoints/configuration. No writes.
+"""
+import asyncio, json, re
+from urllib.parse import urljoin
 import httpx
-from menarini_graphql_pipeline_extension import extract_menarini_pipeline
 
-MENARINI="https://www.menarini.com/en-us/innovation-research/our-pipeline-and-products.html"
-BROWSER_SOURCES=[
- ("BioNTech SE","https://www.biontech.com/int/en/home/pipeline-and-products/pipeline.html"),
- ("Menarini Group",MENARINI),
- ("Johnson & Johnson","https://www.investor.jnj.com/pipeline/development-pipeline/default.aspx"),
- ("Wave Life Sciences","https://wavelifesciences.com/pipeline/research-and-development/"),
- ("Vertex Pharmaceuticals","https://www.vrtx.com/our-science/pipeline/"),
-]
-SIG=re.compile(r"phase\s*[123]|registration|approved|pipeline|indication|oncology|program|programme",re.I)
+MAIN="https://www.biontech.com/etc.clientlibs/biontech-xp-nova/clientlibs/clientlib-site-main.lc-b59be832b3008ea78c75ca1f1589206c-lc.min.js"
+CHUNK_IDS=[491,961,290,957,463]
+HEADERS={"User-Agent":"Mozilla/5.0 BioNTechPipelineDiscovery/1.0","Accept":"application/javascript,text/javascript,*/*;q=0.8"}
 
-def clean(x): return re.sub(r"\s+"," ",str(x or "")).strip()
-
-async def menarini():
-    try:
-        r=await extract_menarini_pipeline("Menarini Group",MENARINI,35.0)
-        print("MENARINI_ADAPTER_CANARY "+json.dumps({
-          "readyForDiscovery":r.readyForDiscovery,"rowCount":r.rowCount,
-          "issues":[x.get("issue") for x in r.issues],
-          "summary":r.summary,"diagnostics":r.diagnostics,
-          "sample":r.rows[:12],"masterWrites":0
-        },ensure_ascii=False),flush=True)
-    except Exception as exc:
-        print("MENARINI_ADAPTER_CANARY "+json.dumps({"readyForDiscovery":False,"error":f"{type(exc).__name__}: {exc}","masterWrites":0},ensure_ascii=False),flush=True)
-
-async def browser():
-    base=os.getenv("BROWSER_FETCH_BASE_URL","").strip().rstrip("/")
-    key=os.getenv("BROWSER_FETCH_KEY","").strip()
-    if not base or not key:
-        print("BROWSER_PIPELINE_PROBE "+json.dumps({"configured":False}),flush=True); return
-    async with httpx.AsyncClient(timeout=50.0,follow_redirects=True) as c:
-      for company,url in BROWSER_SOURCES:
-        try:
-          rr=await c.get(base+"/fetch/browser",params={"url":url,"timeout_seconds":28},headers={"X-Browser-Key":key})
-          data=None
-          try:data=rr.json()
-          except Exception:pass
-          if not isinstance(data,dict):
-            print("BROWSER_PIPELINE_PROBE "+json.dumps({"company":company,"status":rr.status_code,"contentType":rr.headers.get("content-type"),"head":clean(rr.text[:800])},ensure_ascii=False),flush=True)
-            continue
-          lines=data.get("visibleLines") or []
-          tables=data.get("tables") or []
-          signal=[clean(x) for x in lines if SIG.search(str(x))][:35]
-          table_samples=[]
-          for ti,t in enumerate(tables[:8]):
-            table_samples.append({"table":ti,"rows":[[clean(c) for c in row[:12]] for row in t[:8]]})
-          print("BROWSER_PIPELINE_PROBE "+json.dumps({
-            "company":company,"status":rr.status_code,"browserVersion":data.get("version"),
-            "httpStatus":data.get("httpStatus"),"finalUrl":data.get("finalUrl"),
-            "title":data.get("title"),"visibleTextLength":data.get("visibleTextLength"),
-            "visibleLines":len(lines),"tables":len(tables),
-            "signalLines":signal,"tableSamples":table_samples,
-          },ensure_ascii=False),flush=True)
-        except Exception as exc:
-          print("BROWSER_PIPELINE_PROBE "+json.dumps({"company":company,"error":f"{type(exc).__name__}: {exc}"},ensure_ascii=False),flush=True)
+def compact(s): return re.sub(r"\s+"," ",str(s or "")).strip()
 
 async def main():
-    await menarini()
-    await browser()
+  async with httpx.AsyncClient(timeout=35.0,follow_redirects=True,headers=HEADERS) as c:
+    r=await c.get(MAIN); r.raise_for_status(); text=r.text
+    snippets=[]
+    for pat in [r"\.u\s*=\s*function",r"\.u\s*=\s*\(",r"__webpack_require__\.u",r"chunkFilename",r"491",r"pipelinev2\.2"]:
+      for m in re.finditer(pat,text,re.I):
+        snippets.append({"pattern":pat,"offset":m.start(),"text":compact(text[max(0,m.start()-1500):m.start()+5500])[:7000]})
+        if len(snippets)>=25: break
+      if len(snippets)>=25: break
+    print("BIONTECH_WEBPACK_RUNTIME "+json.dumps({"chars":len(text),"snippets":snippets},ensure_ascii=False),flush=True)
+
+    # Collect any literal or templated script references around the pipeline map
+    # and runtime. This intentionally does not guess a chunk URL.
+    candidate_strings=[]
+    for m in re.finditer(r'''["']([^"'\s]{2,500})["']''',text):
+      v=m.group(1)
+      low=v.lower()
+      if any(k in low for k in ["pipelinev2","clientlib-site-main",".js","chunk"]):
+        if v not in candidate_strings: candidate_strings.append(v)
+      if len(candidate_strings)>=250: break
+    print("BIONTECH_WEBPACK_STRINGS "+json.dumps({"strings":candidate_strings[:250]},ensure_ascii=False),flush=True)
 
 if __name__=="__main__":
-    asyncio.run(main())
+  asyncio.run(main())

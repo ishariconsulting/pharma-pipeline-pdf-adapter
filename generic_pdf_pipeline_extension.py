@@ -1002,6 +1002,371 @@ def parse_stage_bar_pdf(
     return deduped, diagnostics
 
 
+def _phase_section_headers(words: List[Tuple[Any, ...]]) -> List[Dict[str, Any]]:
+    """Find horizontally separated semantic phase-section headers.
+
+    Supports PDFs where phase is encoded by the column/section containing a
+    programme rather than repeated on every row.
+    """
+    lines = _group_word_lines(words, y_tol=4.0)
+    candidates: List[Dict[str, Any]] = []
+
+    for line in lines:
+        line_words = sorted(line["words"], key=lambda w: float(w[0]))
+        tokens = [clean(w[4]) for w in line_words]
+        joined = clean(" ".join(tokens))
+        if not re.search(r"\bPhase\s+(?:I{1,3}|IV|[1-4])\b|\bRegistration\b", joined, re.I):
+            continue
+
+        i = 0
+        while i < len(line_words):
+            token = clean(line_words[i][4])
+            label = ""
+            used = [line_words[i]]
+
+            if norm(token) == "phase" and i + 1 < len(line_words):
+                nxt = clean(line_words[i + 1][4])
+                if re.fullmatch(r"I{1,3}|IV|[1-4]", nxt, re.I):
+                    label = f"Phase {nxt}"
+                    used.append(line_words[i + 1])
+                    i += 1
+            elif norm(token) in {"registration", "registrational"}:
+                label = "Registration"
+
+            if label:
+                phase = phase_canonical(label)
+                x0 = min(float(w[0]) for w in used)
+                x1 = max(float(w[2]) for w in used)
+                candidates.append({
+                    "label": clean(label),
+                    "phase": phase,
+                    "x": (x0 + x1) / 2.0,
+                    "y": float(line["y"]),
+                })
+            i += 1
+
+    # Keep the highest compact phase-header band on each page and de-duplicate.
+    if not candidates:
+        return []
+    top_y = min(c["y"] for c in candidates)
+    band = [c for c in candidates if abs(c["y"] - top_y) <= 14.0]
+    dedup: List[Dict[str, Any]] = []
+    for c in sorted(band, key=lambda q: q["x"]):
+        if dedup and abs(dedup[-1]["x"] - c["x"]) <= 18.0 and dedup[-1]["phase"] == c["phase"]:
+            continue
+        dedup.append(c)
+    return dedup
+
+
+def _strong_code_token(value: Any) -> bool:
+    s = clean(value)
+    # Generic development-code signal: short uppercase prefix plus a run of at
+    # least three digits. This avoids mistaking ordinary molecule names for
+    # code-column anchors while covering RG6026, TAK-279, BNT122, BI123456 etc.
+    return bool(re.fullmatch(r"[A-Z]{1,6}[- ]?[A-Z]{0,4}\d{3,}[A-Za-z0-9+._-]*", s))
+
+
+def _cluster_x(values: List[float], tolerance: float = 24.0) -> List[Dict[str, Any]]:
+    clusters: List[List[float]] = []
+    for x in sorted(values):
+        placed = False
+        for group in clusters:
+            center = sum(group) / len(group)
+            if abs(x - center) <= tolerance:
+                group.append(x)
+                placed = True
+                break
+        if not placed:
+            clusters.append([x])
+    return [
+        {"x": sum(group) / len(group), "count": len(group)}
+        for group in clusters
+    ]
+
+
+def _projected_segments(words: List[Tuple[Any, ...]], min_x: float, max_x: float) -> List[Tuple[float, float]]:
+    spans = sorted(
+        (float(w[0]), float(w[2]))
+        for w in words
+        if float(w[2]) > min_x and float(w[0]) < max_x
+    )
+    merged: List[List[float]] = []
+    for x0, x1 in spans:
+        x0 = max(x0, min_x)
+        x1 = min(x1, max_x)
+        if not merged or x0 - merged[-1][1] > 9.0:
+            merged.append([x0, x1])
+        else:
+            merged[-1][1] = max(merged[-1][1], x1)
+    return [(a, b) for a, b in merged]
+
+
+def _split_asset_indication(
+    block_words: List[Tuple[Any, ...]],
+    code_x: float,
+    column_right: float,
+) -> Tuple[str, str, Optional[float]]:
+    """Split molecule/programme text from indication using source whitespace.
+
+    No disease dictionary or company-specific coordinate is used. The split is
+    accepted only when the source itself exposes a material horizontal gap.
+    """
+    content_left = code_x + 38.0
+    content = [
+        w for w in block_words
+        if float(w[0]) >= content_left and float(w[0]) < column_right - 3.0
+    ]
+    if not content:
+        return "", "", None
+
+    segments = _projected_segments(content, content_left, column_right - 3.0)
+    gaps: List[Tuple[float, float]] = []
+    for left, right in zip(segments, segments[1:]):
+        gap = right[0] - left[1]
+        split = (left[1] + right[0]) / 2.0
+        # Ignore an early gap inside the molecule-name region. Indication text
+        # in this layout is aligned toward the right side of the programme cell.
+        if gap >= 14.0 and split >= content_left + 55.0:
+            gaps.append((gap, split))
+    if not gaps:
+        return "", "", None
+
+    _, split_x = max(gaps, key=lambda item: item[0])
+    asset_words = [w for w in content if float(w[0]) < split_x]
+    indication_words = [w for w in content if float(w[0]) >= split_x]
+    asset = _join_words(asset_words)
+    indication = _join_words(indication_words)
+    return asset, indication, split_x
+
+
+def parse_phase_column_pdf(
+    company: str,
+    source_url: str,
+    data: bytes,
+) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
+    """Parse multi-column PDFs where each horizontal section declares a phase.
+
+    The parser infers code-column clusters, maps each cluster to the nearest
+    semantic phase header, and splits programme vs indication using visible
+    whitespace. It has no company-specific names, coordinates or Portfolio
+    dependencies.
+    """
+    try:
+        doc = fitz.open(stream=data, filetype="pdf")
+    except Exception as exc:
+        raise HTTPException(status_code=422, detail=f"Invalid PDF: {exc}") from exc
+
+    rows: List[Dict[str, Any]] = []
+    page_diags: List[Dict[str, Any]] = []
+    failures: List[Dict[str, Any]] = []
+    declared_programmes = 0
+
+    for page_idx in range(len(doc)):
+        page = doc[page_idx]
+        words = page.get_text("words")
+        headers = _phase_section_headers(words)
+        if not headers:
+            continue
+
+        header_y = min(float(h["y"]) for h in headers)
+        body_words = [
+            w for w in words
+            if _word_center_y(w) > header_y + 8.0
+            and _word_center_y(w) < page.rect.height - 45.0
+        ]
+
+        seed_words = [w for w in body_words if _strong_code_token(w[4])]
+        clusters = [
+            c for c in _cluster_x([float(w[0]) for w in seed_words])
+            if int(c["count"]) >= 3
+        ]
+        if len(clusters) < 2:
+            continue
+
+        cluster_xs = sorted(float(c["x"]) for c in clusters)
+        # Reject implausibly close duplicate clusters.
+        filtered_xs: List[float] = []
+        for x in cluster_xs:
+            if not filtered_xs or x - filtered_xs[-1] >= 70.0:
+                filtered_xs.append(x)
+        cluster_xs = filtered_xs
+        if len(cluster_xs) < 2:
+            continue
+
+        # Parse any source-declared programme counts for completeness diagnostics.
+        top_text = clean(" ".join(
+            clean(w[4]) for w in words
+            if abs(_word_center_y(w) - header_y) <= 12.0
+        ))
+        for a, b in re.findall(
+            r"\((\d+)\s+NMEs?\s*\+\s*(\d+)\s+AIs?\)",
+            top_text,
+            flags=re.I,
+        ):
+            declared_programmes += int(a) + int(b)
+
+        parsed_here = 0
+        page_failures = 0
+        column_diags: List[Dict[str, Any]] = []
+
+        for ci, code_x in enumerate(cluster_xs):
+            left_bound = (
+                18.0 if ci == 0
+                else (cluster_xs[ci - 1] + code_x) / 2.0
+            )
+            right_bound = (
+                page.rect.width - 18.0 if ci == len(cluster_xs) - 1
+                else (code_x + cluster_xs[ci + 1]) / 2.0
+            )
+
+            phase_header = min(headers, key=lambda h: abs(float(h["x"]) - code_x))
+            phase = clean(phase_header["phase"])
+            if not phase:
+                continue
+
+            # After the x clusters are established, allow short uppercase source
+            # management codes (e.g. a non-numeric code prefix) at the same x.
+            anchor_candidates: List[Tuple[float, str]] = []
+            for w in body_words:
+                x = float(w[0])
+                if abs(x - code_x) > 22.0:
+                    continue
+                token = clean(w[4])
+                if _strong_code_token(token) or (
+                    re.fullmatch(r"[A-Z]{2,6}", token)
+                    and norm(token) not in {"phase", "nme", "nmes", "ai", "ais", "us", "eu"}
+                ):
+                    anchor_candidates.append((_word_center_y(w), token))
+
+            anchors: List[Tuple[float, str]] = []
+            for y, token in sorted(anchor_candidates):
+                if anchors and abs(anchors[-1][0] - y) <= 3.5:
+                    # Prefer the more informative/numeric code on the same line.
+                    if _strong_code_token(token) and not _strong_code_token(anchors[-1][1]):
+                        anchors[-1] = (y, token)
+                    continue
+                anchors.append((y, token))
+
+            column_parsed = 0
+            for ai, (anchor_y, code) in enumerate(anchors):
+                next_y = anchors[ai + 1][0] if ai + 1 < len(anchors) else min(page.rect.height - 45.0, anchor_y + 32.0)
+                if next_y - anchor_y > 44.0:
+                    next_y = anchor_y + 32.0
+
+                block_words = [
+                    w for w in body_words
+                    if left_bound <= float(w[0]) < right_bound
+                    and anchor_y - 3.5 <= _word_center_y(w) < next_y - 2.0
+                ]
+                asset, indication, split_x = _split_asset_indication(
+                    block_words,
+                    code_x,
+                    right_bound,
+                )
+                if not asset or not indication or split_x is None:
+                    page_failures += 1
+                    failures.append({
+                        "page": page_idx + 1,
+                        "code": code,
+                        "y": round(anchor_y, 1),
+                        "phase": phase,
+                        "reason": "PROGRAMME_INDICATION_SPLIT_UNRESOLVED",
+                    })
+                    continue
+
+                # Remove the development code when it leaks into the programme
+                # text because the source prints it on the same baseline.
+                if norm(asset).startswith(norm(code) + " "):
+                    asset = clean(asset[len(code):])
+
+                if not asset or not indication:
+                    page_failures += 1
+                    continue
+
+                rows.append({
+                    "company": company,
+                    "sourceFamily": "Company Pipeline",
+                    "sourceRecordId": f"pdfphase:p{page_idx+1}:x{int(round(code_x))}:y{int(round(anchor_y))}",
+                    "sourceUrl": source_url,
+                    "asset": asset,
+                    "molecule": asset,
+                    "developmentCode": code,
+                    "brand": "",
+                    "indication": indication,
+                    "phase": phase,
+                    "phaseEvidence": "SOURCE_PDF_PHASE_SECTION",
+                    "programStatus": "",
+                    "sponsorOwner": company,
+                    "partners": [],
+                    "study": "",
+                    "trialIds": [],
+                    "therapeuticArea": "",
+                    "marketRegion": "",
+                    "sourceStageText": clean(phase_header["label"]),
+                    "sourcePage": page_idx + 1,
+                    "sourceOrdinal": len(rows) + 1,
+                    "parserMethod": "SEMANTIC_PDF_PHASE_COLUMN",
+                    "sourceAdapter": ADAPTER_PROFILE,
+                })
+                parsed_here += 1
+                column_parsed += 1
+
+            column_diags.append({
+                "codeX": round(code_x, 1),
+                "left": round(left_bound, 1),
+                "right": round(right_bound, 1),
+                "phase": phase,
+                "headerX": round(float(phase_header["x"]), 1),
+                "anchors": len(anchors),
+                "parsedRows": column_parsed,
+            })
+
+        page_diags.append({
+            "page": page_idx + 1,
+            "headerY": round(header_y, 1),
+            "phaseHeaders": [
+                {"label": h["label"], "phase": h["phase"], "x": round(float(h["x"]), 1)}
+                for h in headers
+            ],
+            "columns": column_diags,
+            "parsedRows": parsed_here,
+            "rejectedRows": page_failures,
+        })
+
+    deduped: List[Dict[str, Any]] = []
+    seen = set()
+    for row in rows:
+        key = (
+            norm(row["developmentCode"]),
+            norm(row["asset"]),
+            norm(row["indication"]),
+            norm(row["phase"]),
+        )
+        if key in seen:
+            continue
+        seen.add(key)
+        row["sourceOrdinal"] = len(deduped) + 1
+        deduped.append(row)
+
+    diagnostics = {
+        "pageCount": len(doc),
+        "semanticPhaseColumnPages": len(page_diags),
+        "pages": page_diags,
+        "candidateRows": len(rows),
+        "dedupedRows": len(deduped),
+        "exactDuplicatesRemoved": len(rows) - len(deduped),
+        "declaredProgrammes": declared_programmes,
+        "rowFailures": len(failures),
+        "failureSamples": failures[:20],
+        "boundaryWarnings": 0,
+        "companySpecificParserBranch": False,
+        "portfolioDependentValidation": False,
+        "writes": 0,
+        "selectedMethod": "SEMANTIC_PDF_PHASE_COLUMN",
+    }
+    return deduped, diagnostics
+
+
 async def download_pdf(url: str, timeout_seconds: float) -> Tuple[bytes, str]:
     await _assert_public_http_url(url)
     parsed = urlparse(url)
@@ -1052,6 +1417,13 @@ async def extract_generic_pdf(
             diagnostics = bar_diagnostics
             selected_method = "SEMANTIC_PDF_STAGE_BAR"
 
+    if not rows:
+        phase_rows, phase_diagnostics = parse_phase_column_pdf(company, final_url, data)
+        if len(phase_rows) > len(rows):
+            rows = phase_rows
+            diagnostics = phase_diagnostics
+            selected_method = "SEMANTIC_PDF_PHASE_COLUMN"
+
     incomplete = [r["sourceRecordId"] for r in rows if not (r.get("asset") and r.get("indication") and r.get("phase"))]
     issues: List[str] = []
     if len(rows) < MIN_ROWS:
@@ -1081,6 +1453,7 @@ async def extract_generic_pdf(
         "semanticTableFound": (
             int(diagnostics.get("semanticTablePages", 0)) > 0
             or int(diagnostics.get("semanticStageBarPages", 0)) > 0
+            or int(diagnostics.get("semanticPhaseColumnPages", 0)) > 0
         ),
     }
 

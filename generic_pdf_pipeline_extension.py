@@ -1254,7 +1254,38 @@ def parse_phase_column_pdf(
                     continue
                 anchors.append((y, token))
 
+            # Learn the source column's programme/indication separator from
+            # rows where whitespace makes the split explicit. This lets a small
+            # number of dense rows reuse the document's own alignment rather
+            # than introducing disease- or company-specific rules.
+            split_samples: List[float] = []
+            for ai, (anchor_y, code) in enumerate(anchors):
+                next_y = anchors[ai + 1][0] if ai + 1 < len(anchors) else min(page.rect.height - 45.0, anchor_y + 32.0)
+                if next_y - anchor_y > 44.0:
+                    next_y = anchor_y + 32.0
+                block_words = [
+                    w for w in body_words
+                    if left_bound <= float(w[0]) < right_bound
+                    and anchor_y - 3.5 <= _word_center_y(w) < next_y - 2.0
+                ]
+                probe_asset, probe_indication, probe_split = _split_asset_indication(
+                    block_words, code_x, right_bound
+                )
+                if probe_split is not None and probe_asset and probe_indication:
+                    split_samples.append(float(probe_split))
+
+            column_split_x: Optional[float] = None
+            if len(split_samples) >= 3:
+                ordered_splits = sorted(split_samples)
+                mid = len(ordered_splits) // 2
+                column_split_x = (
+                    ordered_splits[mid]
+                    if len(ordered_splits) % 2
+                    else (ordered_splits[mid - 1] + ordered_splits[mid]) / 2.0
+                )
+
             column_parsed = 0
+            fallback_splits = 0
             for ai, (anchor_y, code) in enumerate(anchors):
                 next_y = anchors[ai + 1][0] if ai + 1 < len(anchors) else min(page.rect.height - 45.0, anchor_y + 32.0)
                 if next_y - anchor_y > 44.0:
@@ -1270,6 +1301,19 @@ def parse_phase_column_pdf(
                     code_x,
                     right_bound,
                 )
+
+                if (not asset or not indication or split_x is None) and column_split_x is not None:
+                    content = [
+                        w for w in block_words
+                        if float(w[0]) >= code_x + 38.0
+                        and float(w[0]) < right_bound - 3.0
+                    ]
+                    asset = _join_words([w for w in content if float(w[0]) < column_split_x])
+                    indication = _join_words([w for w in content if float(w[0]) >= column_split_x])
+                    if asset and indication:
+                        split_x = column_split_x
+                        fallback_splits += 1
+
                 if clean(asset) == "-":
                     asset = code
                 if not asset or not indication or split_x is None:
@@ -1328,6 +1372,8 @@ def parse_phase_column_pdf(
                 "headerX": round(float(phase_header["x"]), 1),
                 "anchors": len(anchors),
                 "parsedRows": column_parsed,
+                "learnedSplitX": round(column_split_x, 1) if column_split_x is not None else None,
+                "fallbackSplits": fallback_splits,
             })
 
         page_diags.append({

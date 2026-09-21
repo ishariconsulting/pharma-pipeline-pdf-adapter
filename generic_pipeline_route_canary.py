@@ -1,39 +1,56 @@
-"""Read-only regression canary for newer generic HTML pipeline interpreter."""
-import asyncio, json
-from generic_pipeline_extension import _extract_generic_pipeline
+"""Read-only browser worker contract diagnostic using the production GET contract."""
+import asyncio, json, os
+import httpx
 
-SOURCES=[
- ("Johnson & Johnson","https://www.investor.jnj.com/pipeline/development-pipeline/default.aspx"),
- ("Sobi","https://www.sobi.com/en/pipeline"),
- ("Novartis","https://www.novartis.com/research-development/novartis-pipeline"),
- ("Viatris","https://www.viatris.com/en/science"),
+TARGETS=[
+ ("J&J","https://www.investor.jnj.com/pipeline/development-pipeline/default.aspx"),
+ ("Vertex","https://www.vrtx.com/our-science/pipeline/"),
+ ("Verve","https://www.vervetx.com/our-programs/our-pipeline"),
+ ("Wave","https://wavelifesciences.com/pipeline/research-and-development/"),
+ ("Boehringer","https://www.boehringer-ingelheim.com/science-innovation/human-health-innovation/pipeline"),
 ]
-
-async def one(company,url):
-    try:
-        r=await _extract_generic_pipeline(company=company,source_url=url,timeout_seconds=35.0)
-        print("GENERIC_HTML_REGRESSION "+json.dumps({
-          "company":company,
-          "readyForDiscovery":r.readyForDiscovery,
-          "rowCount":r.rowCount,
-          "retrievalMode":r.summary.get("retrievalMode"),
-          "selectedMethod":r.summary.get("selectedMethod"),
-          "issues":[x.get("issue") for x in r.issues],
-          "coreCompleteRows":r.diagnostics.get("coreCompleteRows"),
-          "methods":r.diagnostics.get("methodsEvaluated"),
-          "masterWrites":0
-        },ensure_ascii=False),flush=True)
-    except Exception as exc:
-        print("GENERIC_HTML_REGRESSION "+json.dumps({
-          "company":company,
-          "readyForDiscovery":False,
-          "error":f"{type(exc).__name__}: {exc}",
-          "masterWrites":0
-        },ensure_ascii=False),flush=True)
+BASE=os.environ.get("BROWSER_FETCH_BASE_URL","").rstrip("/")
+KEY=os.environ.get("BROWSER_FETCH_KEY","")
 
 async def main():
-    for company,url in SOURCES:
-        await one(company,url)
+    print("BROWSER_CONTRACT_ENV "+json.dumps({"configured":bool(BASE and KEY),"base":BASE}),flush=True)
+    if not BASE:
+        return
+    async with httpx.AsyncClient(timeout=50.0,follow_redirects=False) as c:
+        try:
+            r=await c.get(BASE+"/health",headers={"X-Browser-Key":KEY,"Accept":"application/json"})
+            print("BROWSER_HEALTH_PROBE "+json.dumps({
+              "status":r.status_code,"contentType":r.headers.get("content-type"),
+              "body":r.text[:2000]
+            },ensure_ascii=False),flush=True)
+        except Exception as exc:
+            print("BROWSER_HEALTH_PROBE "+json.dumps({"error":f"{type(exc).__name__}: {exc}"}),flush=True)
+
+        for label,url in TARGETS:
+            try:
+                r=await c.get(
+                    BASE+"/fetch/browser",
+                    params={"url":url,"timeout_seconds":35.0},
+                    headers={"X-Browser-Key":KEY,"Accept":"application/json"},
+                )
+                body=r.text
+                try: payload=r.json()
+                except Exception: payload=None
+                print("BROWSER_FETCH_GET_PROBE "+json.dumps({
+                  "label":label,"status":r.status_code,
+                  "contentType":r.headers.get("content-type"),
+                  "json":isinstance(payload,dict),
+                  "version":payload.get("version") if isinstance(payload,dict) else None,
+                  "finalUrl":payload.get("finalUrl") if isinstance(payload,dict) else None,
+                  "statusCode":payload.get("statusCode") if isinstance(payload,dict) else None,
+                  "visibleLines":len(payload.get("visibleLines") or []) if isinstance(payload,dict) else None,
+                  "tables":len(payload.get("tables") or []) if isinstance(payload,dict) else None,
+                  "bodyHead":body[:1200]
+                },ensure_ascii=False),flush=True)
+            except Exception as exc:
+                print("BROWSER_FETCH_GET_PROBE "+json.dumps({
+                  "label":label,"error":f"{type(exc).__name__}: {exc}"
+                },ensure_ascii=False),flush=True)
 
 if __name__=="__main__":
     asyncio.run(main())

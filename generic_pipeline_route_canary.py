@@ -1,60 +1,63 @@
-"""Focused read-only source-contract discovery: Merck, BioNTech, Vertex."""
+"""Focused machine-contract discovery for Merck, BioNTech, Vertex."""
 import asyncio, html as html_lib, json, re
-import httpx
 from urllib.parse import urljoin
+import httpx
 
-HEADERS={"User-Agent":"Mozilla/5.0 SourceContractCanary/1.0","Accept":"text/html,*/*;q=0.8"}
-URLS={
+HEADERS={"User-Agent":"Mozilla/5.0 MachineContractCanary/1.0","Accept":"text/html,application/javascript,*/*;q=0.8"}
+PAGES={
  "MERCK":"https://www.emdgroup.com/en/research/healthcare-pipeline.html",
  "BIONTECH":"https://www.biontech.com/int/en/home/pipeline-and-products/pipeline.html",
  "VERTEX":"https://www.vrtx.com/our-science/pipeline/",
 }
 
-def compact(v): return re.sub(r"\s+"," ",html_lib.unescape(str(v or ""))).strip()
+def compact(v):
+    return re.sub(r"\s+"," ",html_lib.unescape(str(v or ""))).strip()
+
+def around(text,key,before=900,after=2200,limit=8):
+    low=text.lower(); k=key.lower(); out=[]; pos=0
+    for _ in range(limit):
+      i=low.find(k,pos)
+      if i<0: break
+      out.append(compact(text[max(0,i-before):i+after])[:before+after])
+      pos=i+len(k)
+    return out
 
 async def main():
-  async with httpx.AsyncClient(timeout=30,follow_redirects=True,headers=HEADERS) as c:
-    for label,url in URLS.items():
-      r=await c.get(url); body=r.text; low=body.lower()
-      result={"label":label,"status":r.status_code,"finalUrl":str(r.url),"chars":len(body)}
-      if label=="MERCK":
-        snippets=[]
-        for pat in [r'id=["\']contentdiv["\'][^>]*>[\s\S]{0,3000}',r'class=["\']filePath["\'][^>]*>[\s\S]{0,600}',r'filePath[\s\S]{0,900}']:
-          m=re.search(pat,body,re.I)
-          if m: snippets.append(compact(m.group(0))[:3000])
-        result["snippets"]=snippets
-      elif label=="BIONTECH":
-        keys=["react-pipeline","pipelinev2","pipeline-data","clinical-pipeline","phase-1","phase 1","data-json","data-api","content-fragment","model.json"]
-        hits=[]
-        for k in keys:
-          pos=0
-          for _ in range(8):
-            i=low.find(k,pos)
-            if i<0: break
-            hits.append({"key":k,"text":compact(body[max(0,i-500):i+1800])[:2300]})
-            pos=i+len(k)
-        scripts=[urljoin(str(r.url),html_lib.unescape(x)) for x in re.findall(r'<script[^>]+src=["\']([^"\']+)["\']',body,re.I)]
-        result["hits"]=hits[:35]; result["scripts"]=list(dict.fromkeys(scripts))[-25:]
-      elif label=="VERTEX":
-        # Summarize repeated semantic class/id names and nearby source rows.
-        class_names=[]
-        for raw in re.findall(r'class=["\']([^"\']+)["\']',body,re.I):
-          for cls in raw.split():
-            if any(k in cls.lower() for k in ["pipeline","phase","indication","molecule","therapeutic","program","views-row","coh-"]):
-              class_names.append(cls)
-        counts={}
-        for cls in class_names: counts[cls]=counts.get(cls,0)+1
-        result["classCounts"]=dict(sorted(counts.items(),key=lambda x:-x[1])[:80])
-        hits=[]
-        for k in ["VX-993","VX-407","povetacicept","phase 2","views-row","pipeline-card","pipeline"]:
-          pos=0
-          for _ in range(10):
-            i=low.find(k.lower(),pos)
-            if i<0: break
-            hits.append({"key":k,"text":compact(body[max(0,i-500):i+1700])[:2200]})
-            pos=i+len(k)
-        result["hits"]=hits[:45]
-      print("SOURCE_CONTRACT "+json.dumps(result,ensure_ascii=False),flush=True)
+  async with httpx.AsyncClient(timeout=35,follow_redirects=True,headers=HEADERS) as c:
+    merck=await c.get(PAGES["MERCK"])
+    print("MERCK_PATH_DISCOVERY "+json.dumps({
+      "status":merck.status_code,
+      "contentdiv":around(merck.text,"contentdiv",1200,2600,10),
+      "filepath":around(merck.text,"filePath",1200,2600,10),
+      "datajs":around(merck.text,"data.js",1200,2600,10),
+    },ensure_ascii=False),flush=True)
+
+    bio=await c.get(PAGES["BIONTECH"])
+    scripts=[urljoin(str(bio.url),html_lib.unescape(x)) for x in re.findall(r'<script[^>]+src=["\']([^"\']+)["\']',bio.text,re.I)]
+    js_hits=[]
+    for s in list(dict.fromkeys(scripts)):
+      try:
+        r=await c.get(s)
+        txt=r.text
+        low=txt.lower()
+        if any(k in low for k in ["pipelinecfref","pipelinedirectoryref","pipelinev2","contentfragment","content-fragment","graphql"]):
+          snippets=[]
+          for key in ["pipelineCfRef","pipelineDirectoryRef","pipelinev2","contentFragment","graphql",".model.json","assets.json"]:
+            snippets += [{"key":key,"text":x} for x in around(txt,key,700,1900,8)]
+          js_hits.append({"url":s,"status":r.status_code,"chars":len(txt),"snippets":snippets[:35]})
+      except Exception as exc:
+        pass
+    print("BIONTECH_JS_CONTRACT "+json.dumps({"scripts":js_hits},ensure_ascii=False),flush=True)
+
+    vx=await c.get(PAGES["VERTEX"])
+    phase_hits=around(vx.text,"views-field-field-phase",1800,2600,12)
+    asset_keys=[]
+    for key in ["views-field-title","views-field-field-indication","views-field-field-therapeutic","views-field-field-program","views-field-field-molecule","VX-993","VX-407"]:
+      vals=around(vx.text,key,1400,2200,6)
+      if vals: asset_keys.append({"key":key,"hits":vals})
+    print("VERTEX_ROW_CONTRACT "+json.dumps({
+      "status":vx.status_code,"phaseHits":phase_hits[:12],"semanticHits":asset_keys
+    },ensure_ascii=False),flush=True)
 
 if __name__=="__main__":
   asyncio.run(main())

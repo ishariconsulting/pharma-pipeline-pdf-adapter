@@ -1,43 +1,56 @@
-"""Read-only focused JS endpoint extraction for Menarini and BioNTech."""
+"""Read-only Menarini official GraphQL pipeline canary."""
 import asyncio, json, re
-from urllib.parse import urljoin
 import httpx
 
-HEADERS={"User-Agent":"Mozilla/5.0 PipelineClientCodeProbe/1.0","Accept":"application/javascript,text/javascript,*/*;q=0.8"}
-TARGETS=[
- ("MENARINI","https://www.menarini.com/etc.clientlibs/menarinimaster/clientlibs/clientlib-menarinicom.lc-8ec83e7087f5f427f9648d98b0a60c50-lc.min.js",
-  ["pipelinetable","data-table-cf-path","content-fragment",".model.json","fetch(","ajax","/bin/"]),
- ("BIONTECH","https://www.biontech.com/etc.clientlibs/biontech-xp-nova/clientlibs/clientlib-site-main.lc-b59be832b3008ea78c75ca1f1589206c-lc.min.js",
-  ["react-pipeline","pipelinev2","pipeline","fetch(","axios","graphql","/bin/","api/","json"]),
+BASE="https://www.menarini.com"
+PATHS=[
+ "/content/dam/menarini-com/content-fragments/en_us/pipeline-tables/pipeline-and-products/oncology-(focus-on-compound)",
+ "/content/dam/menarini-com/content-fragments/en_us/pipeline-tables/pipeline-and-products/oncology-(focus-on-indication)",
+ "/content/dam/menarini-com/content-fragments/en_us/pipeline-tables/pipeline-and-products/anti-infectives-table-1",
+ "/content/dam/menarini-com/content-fragments/en_us/pipeline-tables/pipeline-and-products/anti-infectives-table-2",
+ "/content/dam/menarini-com/content-fragments/en_us/pipeline-tables/pipeline-and-products/cardio-metabolic-table-focus-on-compound",
+ "/content/dam/menarini-com/content-fragments/en_us/pipeline-tables/pipeline-and-products/cardio-metabolic-table-focus-on-indication",
 ]
+HEADERS={"User-Agent":"Mozilla/5.0 MenariniGraphQLPipelineCanary/1.0","Accept":"application/json,*/*;q=0.8"}
 
-def compact(s): return re.sub(r"\s+"," ",str(s or "")).strip()
+def clean(x): return re.sub(r"\s+"," ",str(x or "")).strip()
 
 async def main():
-  async with httpx.AsyncClient(timeout=35.0,follow_redirects=True,headers=HEADERS) as c:
-    for label,url,keys in TARGETS:
+  async with httpx.AsyncClient(timeout=30.0,follow_redirects=True,headers=HEADERS) as c:
+    all_rows=[]
+    for path in PATHS:
+      url=BASE+"/graphql/execute.json/menarini-com/pipeline-table;path="+path
       try:
-        r=await c.get(url); txt=r.text; low=txt.lower()
-        snippets=[]
-        for key in keys:
-          pos=0
-          for _ in range(20):
-            i=low.find(key.lower(),pos)
-            if i<0: break
-            snippets.append({"key":key,"offset":i,"text":compact(txt[max(0,i-1000):i+2500])[:3500]})
-            pos=i+len(key)
-        strings=[]
-        for m in re.finditer(r'''["']([^"'\s]{3,800})["']''',txt):
-          v=m.group(1); lv=v.lower()
-          if any(k in lv for k in ["pipeline","content-fragment","model.json","/bin/","graphql","api/","json"]):
-            if v not in strings: strings.append(v)
-          if len(strings)>=200: break
-        print(label+"_CLIENT_CODE "+json.dumps({
-          "status":r.status_code,"chars":len(txt),"contentType":r.headers.get("content-type"),
-          "strings":strings[:200],"snippets":snippets[:80]
-        },ensure_ascii=False),flush=True)
+        r=await c.get(url)
+        payload={"path":path,"status":r.status_code,"contentType":r.headers.get("content-type"),"chars":len(r.text)}
+        data=None
+        try: data=r.json()
+        except Exception: pass
+        item=((data or {}).get("data") or {}).get("pipelineTableByPath") or {}
+        item=item.get("item") if isinstance(item,dict) else None
+        rows=(item or {}).get("pipelineItems") if isinstance(item,dict) else None
+        rows=rows if isinstance(rows,list) else []
+        payload["groupByFirstColumn"]=(item or {}).get("groupByFirstColumn") if isinstance(item,dict) else None
+        payload["rowCount"]=len(rows)
+        payload["keys"]=sorted({k for x in rows if isinstance(x,dict) for k in x.keys()})
+        payload["sample"]=rows[:4]
+        all_rows.extend(rows)
+        print("MENARINI_GRAPHQL_TABLE "+json.dumps(payload,ensure_ascii=False),flush=True)
       except Exception as exc:
-        print(label+"_CLIENT_CODE "+json.dumps({"error":f"{type(exc).__name__}: {exc}"},ensure_ascii=False),flush=True)
+        print("MENARINI_GRAPHQL_TABLE "+json.dumps({"path":path,"error":f"{type(exc).__name__}: {exc}"},ensure_ascii=False),flush=True)
+
+    compound_rows=[]
+    for x in all_rows:
+      if not isinstance(x,dict): continue
+      compound=clean(x.get("compound")); indication=clean(x.get("indication")); stage=clean(x.get("developmentStage"))
+      if compound and indication and stage:
+        compound_rows.append((compound,indication,stage))
+    unique=list(dict.fromkeys(compound_rows))
+    print("MENARINI_GRAPHQL_SUMMARY "+json.dumps({
+      "rawRows":len(all_rows),"coreCompleteRows":len(compound_rows),"uniqueCoreRows":len(unique),
+      "sampleUnique":[{"compound":a,"indication":b,"developmentStage":c} for a,b,c in unique[:15]],
+      "masterWrites":0
+    },ensure_ascii=False),flush=True)
 
 if __name__=="__main__":
   asyncio.run(main())

@@ -1,30 +1,28 @@
-"""Read-only canary for reusable rendered-flow pipeline strategies."""
+"""Read-only static-document canary for unresolved pipeline sources."""
 import asyncio, json
-from generic_pipeline_extension import _extract_generic_pipeline
+from generic_pdf_pipeline_extension import extract_generic_pdf
 
 SOURCES=[
- ("Johnson & Johnson","https://www.investor.jnj.com/pipeline/development-pipeline/default.aspx"),
- ("BioNTech SE","https://www.biontech.com/int/en/home/pipeline-and-products/pipeline.html"),
- ("Wave Life Sciences","https://wavelifesciences.com/pipeline/research-and-development/"),
+ ("Wave Life Sciences","https://ir.wavelifesciences.com/static-files/70d130e3-8c51-4059-9dc4-5b5f117a62fc"),
+ ("BioNTech SE","https://investors.biontech.de/static-files/3d7f3499-9d42-4e9d-8dcb-3c5da9be7450"),
+ ("Vertex Pharmaceuticals","https://investors.vrtx.com/static-files/25a09e85-5615-46d3-8f28-7e5e75440a14"),
 ]
 
 async def one(company,url):
     try:
-        r=await _extract_generic_pipeline(company=company,source_url=url,timeout_seconds=30.0)
-        print("RENDERED_FLOW_CANARY "+json.dumps({
+        r=await extract_generic_pdf(company,url,35.0)
+        print("STATIC_PIPELINE_CANARY "+json.dumps({
           "company":company,
           "readyForDiscovery":r.readyForDiscovery,
           "rowCount":r.rowCount,
-          "retrievalMode":r.summary.get("retrievalMode"),
-          "routingReason":r.summary.get("routingReason"),
-          "selectedMethod":r.summary.get("selectedMethod"),
           "issues":[x.get("issue") for x in r.issues],
+          "selectedMethod":r.summary.get("selectedMethod"),
           "diagnostics":r.diagnostics,
-          "sampleRows":r.rows[:12],
+          "sampleRows":r.rows[:10],
           "masterWrites":0,
         },ensure_ascii=False),flush=True)
     except Exception as exc:
-        print("RENDERED_FLOW_CANARY "+json.dumps({
+        print("STATIC_PIPELINE_CANARY "+json.dumps({
           "company":company,"readyForDiscovery":False,
           "error":f"{type(exc).__name__}: {exc}","masterWrites":0
         },ensure_ascii=False),flush=True)

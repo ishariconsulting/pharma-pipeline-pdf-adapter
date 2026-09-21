@@ -1168,6 +1168,13 @@ def parse_phase_column_pdf(
         if not headers:
             continue
 
+        # Phase-section pipeline tables expose a small number of wide stage
+        # bands. Dense four-stage overview graphics and closely packed chart
+        # legends are different structures and are intentionally rejected.
+        header_xs = sorted(float(h["x"]) for h in headers)
+        if len(headers) != 2 or header_xs[1] - header_xs[0] < 140.0:
+            continue
+
         header_y = min(float(h["y"]) for h in headers)
         body_words = [
             w for w in words
@@ -1210,13 +1217,13 @@ def parse_phase_column_pdf(
         column_diags: List[Dict[str, Any]] = []
 
         for ci, code_x in enumerate(cluster_xs):
-            left_bound = (
-                18.0 if ci == 0
-                else (cluster_xs[ci - 1] + code_x) / 2.0
-            )
+            # Each code anchor starts a horizontal programme cell. The cell
+            # extends almost to the next code anchor; using midpoint bounds
+            # would truncate right-aligned indication text.
+            left_bound = max(18.0, code_x - 12.0)
             right_bound = (
                 page.rect.width - 18.0 if ci == len(cluster_xs) - 1
-                else (code_x + cluster_xs[ci + 1]) / 2.0
+                else cluster_xs[ci + 1] - 10.0
             )
 
             phase_header = min(headers, key=lambda h: abs(float(h["x"]) - code_x))
@@ -1263,6 +1270,8 @@ def parse_phase_column_pdf(
                     code_x,
                     right_bound,
                 )
+                if clean(asset) == "-":
+                    asset = code
                 if not asset or not indication or split_x is None:
                     page_failures += 1
                     failures.append({

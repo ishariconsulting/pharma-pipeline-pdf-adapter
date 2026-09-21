@@ -1,39 +1,33 @@
-"""Read-only AbbVie adapter validation plus bullet-color diagnostic."""
-import asyncio, json
-import fitz
-from abbvie_pdf_pipeline_extension import extract_abbvie_pipeline, _download_with_retry
+"""Read-only Bayer WAF transport probe via external text retrieval fallback."""
+import asyncio, json, re
+import httpx
 
-ABBVIE="https://investors.abbvie.com/static-files/de1828c0-47ed-42cb-8573-24fe42ceb748"
+OFFICIAL="https://www.bayer.com/en/pharma/development-pipeline"
+PROXY="https://r.jina.ai/https://www.bayer.com/en/pharma/development-pipeline"
 
 async def main():
-  try:
-    r=await extract_abbvie_pipeline("AbbVie",ABBVIE,35.0)
-    print("ABBVIE_ADAPTER_CANARY "+json.dumps({
-      "readyForDiscovery":r.readyForDiscovery,"rowCount":r.rowCount,
-      "sourceDate":r.sourceDate,"summary":r.summary,"issues":r.issues,
-      "diagnostics":r.diagnostics,"sample":r.rows[:16],"masterWrites":0
-    },ensure_ascii=False),flush=True)
-  except Exception as exc:
-    print("ABBVIE_ADAPTER_CANARY "+json.dumps({"readyForDiscovery":False,"error":f"{type(exc).__name__}: {exc}","masterWrites":0},ensure_ascii=False),flush=True)
-
-  try:
-    data,_=await _download_with_retry(ABBVIE,35.0)
-    page=fitz.open(stream=data,filetype="pdf")[1]
-    spans=[]
-    for block in page.get_text("dict").get("blocks",[]):
-      for line in block.get("lines",[]):
-        for span in line.get("spans",[]):
-          txt=str(span.get("text") or "")
-          bbox=span.get("bbox",[0,0,0,0])
-          if "■" in txt:
-            spans.append({
-              "text":txt,"bbox":[round(float(x),1) for x in bbox],
-              "color":span.get("color"),"font":span.get("font"),
-              "size":round(float(span.get("size") or 0),2)
-            })
-    print("ABBVIE_BULLET_COLOR_DIAGNOSTIC "+json.dumps({"count":len(spans),"spans":spans[:180]},ensure_ascii=False),flush=True)
-  except Exception as exc:
-    print("ABBVIE_BULLET_COLOR_DIAGNOSTIC "+json.dumps({"error":f"{type(exc).__name__}: {exc}"},ensure_ascii=False),flush=True)
+    headers={"User-Agent":"Mozilla/5.0 BayerPipelineTransportProbe/1.0","Accept":"text/plain,text/markdown,*/*;q=0.8"}
+    try:
+        async with httpx.AsyncClient(timeout=40.0,follow_redirects=True,headers=headers) as client:
+            r=await client.get(PROXY)
+        body=r.text
+        markers={
+          "hasOfficialUrl":OFFICIAL.lower() in body.lower(),
+          "hasDevelopmentPipeline":"development pipeline" in body.lower(),
+          "hasDarolutamide":"darolutamide" in body.lower(),
+          "hasFinerenone":"finerenone" in body.lower(),
+          "hasLastUpdated":"last updated" in body.lower(),
+          "hasTableHeader":bool(re.search(r"phase\s*\|\s*area\s*\|\s*program",body,re.I)),
+        }
+        print("BAYER_PROXY_PROBE "+json.dumps({
+          "status":r.status_code,"finalUrl":str(r.url),
+          "contentType":r.headers.get("content-type"),
+          "chars":len(body),"markers":markers,
+          "head":re.sub(r"\s+"," ",body[:5000])[:5000],
+          "masterWrites":0
+        },ensure_ascii=False),flush=True)
+    except Exception as exc:
+        print("BAYER_PROXY_PROBE "+json.dumps({"error":f"{type(exc).__name__}: {exc}","masterWrites":0},ensure_ascii=False),flush=True)
 
 if __name__=="__main__":
-  asyncio.run(main())
+    asyncio.run(main())

@@ -267,7 +267,13 @@ async def _extract_rendered(
                       .join(' ')
                       .replace(/\\s+/g, ' ')
                       .trim();
-                    if (!ownText) continue;
+                    const className = String(el.className || '');
+                    const id = String(el.id || '');
+                    const styleAttr = String(el.getAttribute('style') || '');
+                    const structural = /(pipeline|stage|phase|progress|bar|track|clinical|discovery|cta|ind|grid|row|column)/i.test(
+                      className + ' ' + id + ' ' + styleAttr
+                    );
+                    if (!ownText && !structural) continue;
                     nodes.push({
                       tag: (el.tagName || '').toLowerCase(),
                       text: ownText.slice(0, 500),
@@ -275,10 +281,19 @@ async def _extract_rendered(
                       y: Math.round(rect.y * 10) / 10,
                       width: Math.round(rect.width * 10) / 10,
                       height: Math.round(rect.height * 10) / 10,
-                      className: String(el.className || '').slice(0, 300),
-                      id: String(el.id || '').slice(0, 160),
+                      className: className.slice(0, 300),
+                      id: id.slice(0, 160),
+                      style: styleAttr.slice(0, 500),
                       ariaLabel: String(el.getAttribute('aria-label') || '').slice(0, 240),
                       role: String(el.getAttribute('role') || '').slice(0, 120),
+                      display: String(style.display || ''),
+                      position: String(style.position || ''),
+                      left: String(style.left || ''),
+                      right: String(style.right || ''),
+                      gridColumnStart: String(style.gridColumnStart || ''),
+                      gridColumnEnd: String(style.gridColumnEnd || ''),
+                      transform: String(style.transform || ''),
+                      backgroundColor: String(style.backgroundColor || ''),
                     });
                   }
                   return nodes;

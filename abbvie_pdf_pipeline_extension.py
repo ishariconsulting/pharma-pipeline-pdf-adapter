@@ -306,7 +306,6 @@ def _pdf_bullet_spans(page: fitz.Page) -> List[Dict[str, Any]]:
 
 def _legend_from_bullet_spans(page: fitz.Page, bullet_spans: List[Dict[str, Any]]) -> Dict[int, str]:
     words = page.get_text("words")
-    lines = line_groups(words, 3.5)
     expected = {
         "immunology": "Immunology",
         "oncology": "Oncology",
@@ -316,30 +315,31 @@ def _legend_from_bullet_spans(page: fitz.Page, bullet_spans: List[Dict[str, Any]
         "targeted investment": "Targeted Investment",
     }
 
-    # The source legend is a vertical six-item list. Pair its large square
-    # glyphs with semantic legend labels by source order rather than relying
-    # on baseline equality (the large glyph baseline sits several points above
-    # the adjacent text baseline in this PDF).
+    # Isolate the right-side legend text before line grouping. Pipeline rows
+    # elsewhere on the same baseline must not be merged with legend labels.
+    legend_words = [w for w in words if float(w[0]) >= 590.0]
+    legend_lines = line_groups(legend_words, 3.5)
+    label_lines = sorted(
+        [line for line in legend_lines if norm(line["text"]) in expected],
+        key=lambda line: float(line["y"]),
+    )
     legend_bullets = sorted(
         [b for b in bullet_spans if b["size"] >= 15.0],
         key=lambda b: b["cy"],
     )
-    label_lines = sorted(
-        [line for line in lines if norm(line["text"]) in expected and float(line["x0"]) > 585.0],
-        key=lambda line: float(line["y"]),
-    )
 
     mapping: Dict[int, str] = {}
-    if len(legend_bullets) == len(label_lines) and len(legend_bullets) >= 4:
+    if len(legend_bullets) == 6 and len(label_lines) == 6:
         for bullet, line in zip(legend_bullets, label_lines):
             mapping[int(bullet["color"])] = expected[norm(line["text"])]
         return mapping
 
-    # Defensive fallback for future source layout changes.
+    # Defensive fallback for future source layout changes. Match only a label
+    # immediately to the right and slightly below the square's visual centre.
     for bullet in legend_bullets:
         candidates = [
             line for line in label_lines
-            if abs(float(line["y"]) - bullet["cy"]) <= 20.0
+            if -1.0 <= float(line["y"]) - bullet["cy"] <= 12.0
         ]
         if not candidates:
             continue

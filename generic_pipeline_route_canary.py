@@ -1,75 +1,53 @@
-"""Read-only Vertex Q2 2026 investor presentation parser-fit diagnostic."""
-import asyncio, json, re
-import fitz
+"""Read-only Vertex official pipeline browser-retrieval diagnostic."""
+import asyncio, json, os
 import httpx
 
-import generic_pdf_pipeline_extension as pdf_table
-import generic_pdf_grid_pipeline_extension as pdf_grid
-
-URL="https://investors.vrtx.com/static-files/25a09e85-5615-46d3-8f28-7e5e75440a14"
-COMPANY="Vertex Pharmaceuticals"
-
-def compact_rows(rows):
-    out=[]
-    for r in rows[:50]:
-        out.append({
-          "asset":r.get("asset") or r.get("developmentCode") or r.get("brand"),
-          "molecule":r.get("molecule"),
-          "developmentCode":r.get("developmentCode"),
-          "indication":r.get("indication"),
-          "phase":r.get("phase"),
-          "therapeuticArea":r.get("therapeuticArea"),
-        })
-    return out
+URL="https://www.vrtx.com/our-science/pipeline/"
+BASE=os.environ.get("BROWSER_FETCH_BASE_URL","").rstrip("/")
+KEY=os.environ.get("BROWSER_FETCH_KEY","")
 
 async def main():
-    out={"url":URL,"documentProvenance":"VERTEX_OFFICIAL_IR_Q2_2026_PRESENTATION","masterWrites":0}
-    headers={"User-Agent":"Mozilla/5.0","Accept":"application/pdf,*/*"}
-    async with httpx.AsyncClient(timeout=35.0,follow_redirects=True,headers=headers) as c:
-        try:
-            r=await c.get(URL)
-        except Exception as exc:
-            out["fetchError"]=f"{type(exc).__name__}: {exc}"
-            print("VERTEX_Q2_2026_PDF_FIT "+json.dumps(out,ensure_ascii=False),flush=True)
-            return
-    out.update({
-      "status":r.status_code,
-      "finalUrl":str(r.url),
-      "contentType":r.headers.get("content-type"),
-      "bytes":len(r.content),
-    })
-    if r.status_code != 200 or not r.content.startswith(b"%PDF"):
-        out["fetchUsable"]=False
-        try: out["bodyHead"]=r.text[:500]
-        except Exception: pass
-        print("VERTEX_Q2_2026_PDF_FIT "+json.dumps(out,ensure_ascii=False),flush=True)
+    out={"sourceUrl":URL,"configured":bool(BASE and KEY),"masterWrites":0}
+    if not BASE or not KEY:
+        print("VERTEX_BROWSER_PIPELINE_DIAGNOSTIC "+json.dumps(out),flush=True)
         return
-
-    data=r.content
-    out["fetchUsable"]=True
-    try:
-        rows1,diag1=pdf_table.parse_semantic_pdf(COMPANY,URL,data)
-        out["genericPdfTable"]={"rows":len(rows1),"diagnostics":diag1,"sample":compact_rows(rows1)}
-    except Exception as exc:
-        out["genericPdfTable"]={"error":f"{type(exc).__name__}: {exc}"}
-    try:
-        rows2,diag2=pdf_grid.parse_semantic_pdf_grid(COMPANY,URL,data)
-        out["semanticPdfGrid"]={"rows":len(rows2),"diagnostics":diag2,"sample":compact_rows(rows2)}
-    except Exception as exc:
-        out["semanticPdfGrid"]={"error":f"{type(exc).__name__}: {exc}"}
-
-    doc=fitz.open(stream=data,filetype="pdf")
-    pages=[]
-    terms=("pipeline","phase 3","phase 2","phase 1","povetacicept","inaxaplin","suzetrigine","zimislecel","vx-")
-    for pno in range(len(doc)):
-        txt=re.sub(r"\s+"," ",doc[pno].get_text("text",sort=True)).strip()
-        low=txt.lower()
-        hits=sum(1 for t in terms if t in low)
-        if hits>=2:
-            pages.append({"page":pno+1,"hits":hits,"text":txt[:14000]})
-    out["pipelineRelevantPages"]=pages[:12]
-    out["pageCount"]=len(doc)
-    print("VERTEX_Q2_2026_PDF_FIT "+json.dumps(out,ensure_ascii=False),flush=True)
+    async with httpx.AsyncClient(timeout=65.0,follow_redirects=False) as c:
+        try:
+            r=await c.get(
+                BASE+"/fetch/browser",
+                params={"url":URL,"timeout_seconds":35.0,"expand_load_more":True,"include_layout":True},
+                headers={"X-Browser-Key":KEY,"Accept":"application/json"},
+            )
+            try:
+                p=r.json()
+            except Exception:
+                p={}
+            lines=p.get("visibleLines") or []
+            headings=p.get("headings") or []
+            tables=p.get("tables") or []
+            layout=p.get("layoutTextNodes") or []
+            out.update({
+                "status":r.status_code,
+                "version":p.get("version"),
+                "finalUrl":p.get("finalUrl"),
+                "httpStatus":p.get("httpStatus"),
+                "title":p.get("title"),
+                "visibleTextLength":p.get("visibleTextLength"),
+                "expansionClicks":p.get("expansionClicks"),
+                "headings":headings[:80],
+                "tables":tables[:12],
+                "visibleLines":[x for x in lines if any(k in x.lower() for k in (
+                    "phase","vx-","povetacicept","inaxaplin","suzetrigine","zimislecel",
+                    "cystic","kidney","pain","diabetes","pipeline","clinical"
+                ))][:250],
+                "layoutNodes":[x for x in layout if any(k in str(x).lower() for k in (
+                    "phase","vx-","povetacicept","inaxaplin","suzetrigine","zimislecel","pipeline"
+                ))][:300],
+                "bodyHead":r.text[:1200] if r.status_code!=200 else None,
+            })
+        except Exception as exc:
+            out["error"]=f"{type(exc).__name__}: {exc}"
+    print("VERTEX_BROWSER_PIPELINE_DIAGNOSTIC "+json.dumps(out,ensure_ascii=False),flush=True)
 
 if __name__=="__main__":
     asyncio.run(main())

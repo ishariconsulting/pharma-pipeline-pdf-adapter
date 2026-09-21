@@ -315,22 +315,37 @@ def _legend_from_bullet_spans(page: fitz.Page, bullet_spans: List[Dict[str, Any]
         "eye care": "Eye Care",
         "targeted investment": "Targeted Investment",
     }
+
+    # The source legend is a vertical six-item list. Pair its large square
+    # glyphs with semantic legend labels by source order rather than relying
+    # on baseline equality (the large glyph baseline sits several points above
+    # the adjacent text baseline in this PDF).
+    legend_bullets = sorted(
+        [b for b in bullet_spans if b["size"] >= 15.0],
+        key=lambda b: b["cy"],
+    )
+    label_lines = sorted(
+        [line for line in lines if norm(line["text"]) in expected and float(line["x0"]) > 585.0],
+        key=lambda line: float(line["y"]),
+    )
+
     mapping: Dict[int, str] = {}
-    for bullet in bullet_spans:
-        if bullet["size"] < 15.0:
-            continue
+    if len(legend_bullets) == len(label_lines) and len(legend_bullets) >= 4:
+        for bullet, line in zip(legend_bullets, label_lines):
+            mapping[int(bullet["color"])] = expected[norm(line["text"])]
+        return mapping
+
+    # Defensive fallback for future source layout changes.
+    for bullet in legend_bullets:
         candidates = [
-            line for line in lines
-            if float(line["x0"]) > bullet["x1"] + 2.0
-            and abs(float(line["y"]) - bullet["cy"]) <= 10.0
-            and norm(line["text"]) in expected
+            line for line in label_lines
+            if abs(float(line["y"]) - bullet["cy"]) <= 20.0
         ]
         if not candidates:
             continue
         chosen = min(candidates, key=lambda line: abs(float(line["y"]) - bullet["cy"]))
-        mapping[bullet["color"]] = expected[norm(chosen["text"])]
+        mapping[int(bullet["color"])] = expected[norm(chosen["text"])]
     return mapping
-
 
 def _ta_for_anchor(
     anchor_word: Tuple[Any, ...],

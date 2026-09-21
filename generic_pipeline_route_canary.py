@@ -1,5 +1,5 @@
 """Read-only browser worker contract diagnostic."""
-import asyncio, json, os
+import asyncio, json, os, hashlib
 import httpx
 
 TARGETS=[
@@ -13,6 +13,11 @@ BASE=os.environ.get("BROWSER_FETCH_BASE_URL","").rstrip("/")
 KEY=os.environ.get("BROWSER_FETCH_KEY","")
 
 async def main():
+    print("CANARY_KEY_FINGERPRINT "+json.dumps({
+        "configured":bool(KEY),
+        "sha256_12":hashlib.sha256(KEY.encode("utf-8")).hexdigest()[:12] if KEY else None,
+        "length":len(KEY)
+    }),flush=True)
     print("BROWSER_CONTRACT_ENV "+json.dumps({"configured":bool(BASE and KEY),"base":BASE}),flush=True)
     if not BASE:
         return

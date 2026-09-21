@@ -326,8 +326,10 @@ def parse_boehringer_annual_report(
                 # Ignore running headers / page furniture.
                 low = text.lower()
                 if (
-                    "boehringer ingelheim" in low
-                    and ("highlights" in low or "information about the group" in low)
+                    ("boehringer ingelheim" in low and "highlights" in low)
+                    or "information about the group" in low
+                    or (low.endswith("highlights") and len(text) < 100)
+                    or text.isdigit()
                 ):
                     continue
                 if marker in low:
@@ -384,21 +386,18 @@ def parse_boehringer_annual_report(
         if last_ta_this_page:
             carry_ta = last_ta_this_page
 
-    # Exact dedupe only. Distinct indications/phases are legitimate programme rows.
-    deduped: List[Dict[str, Any]] = []
-    seen = set()
-    for row in rows:
-        key = (
-            clean(row.get("therapeuticArea")).lower(),
-            clean(row.get("asset")).lower(),
-            clean(row.get("developmentCode")).lower(),
-            clean(row.get("indication")).lower(),
-            clean(row.get("phase")).lower(),
-        )
-        if key in seen:
-            continue
-        seen.add(key)
-        deduped.append(row)
+    # Preserve every source row. The report intentionally contains distinct
+    # unnamed programmes with identical public descriptors (for example two
+    # Immunomodulator Phase I rows and two Anti-fibrotic agent Phase I rows).
+    # Collapsing them would change the source-declared programme count.
+    deduped: List[Dict[str, Any]] = list(rows)
+    id_counts: Dict[str, int] = {}
+    for ordinal, row in enumerate(deduped, start=1):
+        base_id = str(row.get("sourceRecordId") or "")
+        id_counts[base_id] = id_counts.get(base_id, 0) + 1
+        if id_counts[base_id] > 1:
+            row["sourceRecordId"] = f"{base_id}-{id_counts[base_id]:02d}"
+        row["sourceOrdinal"] = ordinal
 
     sentinel_terms = {
         "survodutide": False,
@@ -438,7 +437,7 @@ def parse_boehringer_annual_report(
         "pageColumns": page_diags,
         "rawRows": len(rows),
         "dedupedRows": len(deduped),
-        "exactDuplicatesRemoved": len(rows) - len(deduped),
+        "exactDuplicatesRemoved": 0,
         "phaseCounts": phase_counts,
         "therapeuticAreaCounts": ta_counts,
         "sentinels": sentinel_terms,

@@ -28,10 +28,10 @@ async def main():
 
         for label,url in TARGETS:
             try:
-                r=await c.post(
+                r=await c.get(
                     BASE+"/fetch/browser",
-                    headers={"x-browser-fetch-key":KEY,"content-type":"application/json"},
-                    json={"url":url,"timeoutSeconds":35.0},
+                    headers={"x-browser-key":KEY,"Accept":"application/json"},
+                    params={"url":url,"timeout_seconds":35.0},
                 )
                 print("BROWSER_FETCH_PROBE "+json.dumps({
                   "label":label,"status":r.status_code,

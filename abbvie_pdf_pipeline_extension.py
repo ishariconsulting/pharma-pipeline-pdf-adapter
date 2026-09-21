@@ -308,8 +308,6 @@ def parse_pdf(company: str, source_url: str, data: bytes) -> Tuple[List[Dict[str
     page = selected_page
     words = page.get_text("words")
     page_text = page.get_text("text", sort=True)
-    rects = _small_filled_rectangles(page)
-    legend = _legend_map(page, rects)
 
     header_y = min(float(c["headerY"]) for c in columns)
     footer_y_candidates = []
@@ -317,68 +315,105 @@ def parse_pdf(company: str, source_url: str, data: bytes) -> Tuple[List[Dict[str
         t = norm(line["text"])
         if t.startswith("new clinical programs") or t.startswith("as of july"):
             footer_y_candidates.append(float(line["y"]))
-    body_top = header_y + 22.0
-    body_bottom = min(footer_y_candidates) - 10.0 if footer_y_candidates else float(page.rect.height) - 80.0
+    body_top = header_y + 10.0
+    body_bottom = min(footer_y_candidates) - 5.0 if footer_y_candidates else float(page.rect.height) - 55.0
 
+    # In this source PDF the coloured therapeutic-area square and the first
+    # asset token are emitted as one word (e.g. "■ABBV-243"). That is a more
+    # reliable row boundary than vector drawings, because the phase columns
+    # have independent vertical spacing and wrapped indications.
     rows: List[Dict[str, Any]] = []
     failures = []
     phase_counts: Dict[str, int] = {}
+    column_diags = []
 
-    for col in columns:
-        bullets = [
-            r for r in rects
-            if col["left"] <= r["x"] < col["right"]
-            and body_top <= r["y"] < body_bottom
-        ]
-        bullets.sort(key=lambda r: r["y"])
-        for i, bullet in enumerate(bullets):
-            y0 = bullet["y"] - 7.0
-            y1 = (bullets[i + 1]["y"] - 4.0) if i + 1 < len(bullets) else body_bottom
+    for col_idx, col in enumerate(columns, 1):
+        anchors = []
+        for w in words:
+            token = clean(w[4])
+            x0 = float(w[0])
+            y = word_y(w)
+            if not (col["left"] <= x0 < col["right"]):
+                continue
+            if not (body_top <= y < body_bottom):
+                continue
+            if not token.startswith("■") or token == "■":
+                continue
+            anchors.append((y, w))
+
+        # Word extraction can theoretically duplicate a glyph at the same
+        # baseline. Keep one source anchor per visual row.
+        dedup_anchors = []
+        for y, w in sorted(anchors, key=lambda item: item[0]):
+            if dedup_anchors and abs(dedup_anchors[-1][0] - y) <= 2.0:
+                continue
+            dedup_anchors.append((y, w))
+        anchors = dedup_anchors
+
+        parsed_here = 0
+        for i, (anchor_y, anchor_word) in enumerate(anchors):
+            next_y = anchors[i + 1][0] if i + 1 < len(anchors) else body_bottom
+            # Include all text belonging to this row until the next explicit
+            # bullet in the same phase column. This preserves wrapped disease
+            # names without borrowing text from adjacent columns.
             item_words = [
                 w for w in words
-                if col["left"] <= word_y(w) * 0 + float(w[0]) < col["right"]
-                and y0 <= word_y(w) < y1
-                and float(w[0]) > bullet["x"] + 4.0
+                if col["left"] <= float(w[0]) < col["right"]
+                and anchor_y - 3.5 <= word_y(w) < next_y - 2.0
             ]
             if not item_words:
                 continue
-            lines = line_groups(item_words, 3.2)
-            entry = clean(" ".join(line["text"] for line in lines))
+
+            grouped = line_groups(item_words, 3.2)
+            entry = clean(" ".join(line["text"] for line in grouped))
             asset, indication, code = _parse_entry(entry)
+
             if not asset or not indication:
-                failures.append({"phase": col["phase"], "entry": entry, "reason": "ASSET_INDICATION_SPLIT"})
+                failures.append({
+                    "phaseColumn": col["phase"],
+                    "entry": entry,
+                    "reason": "ASSET_INDICATION_SPLIT",
+                })
                 continue
+
             phase = (
                 "Phase 3" if col["phase"] == "Registrational / Phase 3"
                 else "Filed / Registration" if col["phase"] == "Submitted"
                 else col["phase"]
             )
-            ta = _ta_for_fill(bullet["fill"], legend)
+
             rows.append({
                 "company": company,
                 "sourceFamily": "Company Pipeline",
-                "sourceRecordId": f"abbviepdf:p{page_index+1}:c{columns.index(col)+1}:r{i+1}",
+                "sourceRecordId": f"abbviepdf:p{page_index+1}:c{col_idx}:r{i+1}",
                 "sourceUrl": source_url,
                 "asset": asset,
-                "molecule": "" if code and norm(asset) == norm(code) else asset,
+                "molecule": "",
                 "developmentCode": code,
-                "brand": "" if re.match(r"^(ABBV|AGN|APG|KST|SIM|UB[- ]?VV|RC)\b", asset, re.I) else asset,
+                "brand": "",
                 "indication": indication,
                 "phase": phase,
                 "phaseEvidence": "SOURCE_PDF_PHASE_COLUMN",
                 "programStatus": "Submitted" if col["phase"] == "Submitted" else "Active",
-                "sourceStageText": col["phase"],
                 "sponsorOwner": company,
                 "partners": [],
                 "study": "",
                 "trialIds": [],
-                "therapeuticArea": ta,
+                "therapeuticArea": "",
+                "sourceStageText": col["phase"],
                 "sourceOrdinal": len(rows) + 1,
-                "parserMethod": "ABBVIE_PDF_PHASE_COLUMN_BULLET",
+                "parserMethod": "ABBVIE_PDF_BULLET_ROW",
                 "sourceAdapter": ADAPTER_PROFILE,
                 "sourceEntry": entry,
             })
+            parsed_here += 1
             phase_counts[phase] = phase_counts.get(phase, 0) + 1
+
+        column_diags.append({
+            "phaseColumn": col["phase"],
+            "anchorRows": len(anchors),
+            "parsedRows": parsed_here,
+        })
 
     # Exact source-grain de-duplication only.
     deduped = []
@@ -396,8 +431,7 @@ def parse_pdf(company: str, source_url: str, data: bytes) -> Tuple[List[Dict[str
     diag = {
         "pageCount": len(doc),
         "pipelinePage": page_index + 1,
-        "phaseColumns": [{"phase": c["phase"], "left": round(c["left"], 1), "right": round(c["right"], 1)} for c in columns],
-        "legendLabels": sorted(set(legend.values())),
+        "phaseColumns": column_diags,
         "candidateRows": len(rows),
         "dedupedRows": len(deduped),
         "exactDuplicates": duplicates,
@@ -456,7 +490,7 @@ async def extract_abbvie_pipeline(company: str, source_url: str, timeout_seconds
             "structuralValidationPass": ready,
             "actual": {"Total": len(rows)},
             "productionStatus": "READY FOR AIRTABLE DELTA COMPARISON" if ready else "FAIL CLOSED - PARSER/STRUCTURE REVIEW REQUIRED",
-            "selectedMethod": "ABBVIE_PDF_PHASE_COLUMN_BULLET",
+            "selectedMethod": "ABBVIE_PDF_BULLET_ROW",
             "portfolioDependentValidation": False,
             "writeMode": "READ_ONLY",
         },

@@ -222,8 +222,8 @@ def _emit_row(
     indication = ""
     if detail:
         left, right = detail.rsplit("|", 1)
-        modality = clean(left)
-        indication = clean(right)
+        modality = clean(left).replace("*", "").replace("🔍", "").strip()
+        indication = clean(right).replace("*", "").replace("🔍", "").strip()
 
     phase = _phase(phase_text)
     if not phase:
@@ -293,7 +293,27 @@ def parse_boehringer_annual_report(
         last_ta_this_page = ""
         for col in (0, 1):
             lines = _line_groups(page, col)
-            current_ta = carry_ta if col == 0 else ""
+
+            # Tables can continue from the left column into the right column
+            # before the next therapeutic-area header (page 16 does this for
+            # Oncology). Carry across only when the right column visibly begins
+            # with short phase-terminated table material; this prevents the
+            # narrative right column on the continuation page from inheriting
+            # the last table section.
+            continuation_from_left = False
+            if col == 1 and last_ta_this_page:
+                for probe in lines[:12]:
+                    probe_text = clean(probe["text"])
+                    if SECTION_RE.match(probe_text) and not PHASE_RE.search(probe_text):
+                        break
+                    if len(probe_text) <= 140 and PHASE_RE.search(probe_text):
+                        continuation_from_left = True
+                        break
+
+            current_ta = (
+                carry_ta if col == 0
+                else (last_ta_this_page if continuation_from_left else "")
+            )
             buffer: List[str] = []
             emitted = 0
             section_count = 0

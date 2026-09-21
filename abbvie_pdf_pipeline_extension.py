@@ -6,6 +6,7 @@ No Airtable or master-data writes.
 """
 from __future__ import annotations
 
+import asyncio
 import math
 import re
 from typing import Any, Dict, List, Optional, Tuple
@@ -347,7 +348,11 @@ def parse_pdf(company: str, source_url: str, data: bytes) -> Tuple[List[Dict[str
             if not asset or not indication:
                 failures.append({"phase": col["phase"], "entry": entry, "reason": "ASSET_INDICATION_SPLIT"})
                 continue
-            phase = "Phase 3" if col["phase"] == "Registrational / Phase 3" else col["phase"]
+            phase = (
+                "Phase 3" if col["phase"] == "Registrational / Phase 3"
+                else "Filed / Registration" if col["phase"] == "Submitted"
+                else col["phase"]
+            )
             ta = _ta_for_fill(bullet["fill"], legend)
             rows.append({
                 "company": company,
@@ -362,6 +367,7 @@ def parse_pdf(company: str, source_url: str, data: bytes) -> Tuple[List[Dict[str
                 "phase": phase,
                 "phaseEvidence": "SOURCE_PDF_PHASE_COLUMN",
                 "programStatus": "Submitted" if col["phase"] == "Submitted" else "Active",
+                "sourceStageText": col["phase"],
                 "sponsorOwner": company,
                 "partners": [],
                 "study": "",
@@ -405,8 +411,22 @@ def parse_pdf(company: str, source_url: str, data: bytes) -> Tuple[List[Dict[str
     return deduped, diag, _source_date(page_text)
 
 
+async def _download_with_retry(source_url: str, timeout_seconds: float) -> tuple[bytes, str]:
+    last_error = None
+    for attempt in range(3):
+        try:
+            return await download_pdf(source_url, timeout_seconds)
+        except HTTPException as exc:
+            last_error = exc
+            retryable = exc.status_code in {502, 504}
+            if not retryable or attempt == 2:
+                raise
+            await asyncio.sleep(1.5 * (attempt + 1))
+    raise last_error or HTTPException(status_code=502, detail="AbbVie PDF retrieval failed")
+
+
 async def extract_abbvie_pipeline(company: str, source_url: str, timeout_seconds: float = 35.0) -> AbbViePipelineResponse:
-    data, final_url = await download_pdf(source_url, timeout_seconds)
+    data, final_url = await _download_with_retry(source_url, timeout_seconds)
     rows, diagnostics, source_date = parse_pdf(company, final_url, data)
 
     issues = []

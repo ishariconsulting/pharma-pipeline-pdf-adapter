@@ -1,33 +1,47 @@
-"""Read-only targeted canary for improved remaining source routes."""
-import asyncio, json
-from generic_pipeline_extension import _extract_generic_pipeline
+"""Read-only browser worker contract diagnostic."""
+import asyncio, json, os
+import httpx
 
-SOURCES=[
- ("Merck KGaA","https://www.emdgroup.com/en/research/healthcare-pipeline.html"),
- ("Johnson & Johnson","https://www.investor.jnj.com/pipeline/development-pipeline/default.aspx"),
- ("BioNTech SE","https://www.biontech.com/int/en/home/pipeline-and-products/pipeline.html"),
+TARGETS=[
+ ("J&J","https://www.investor.jnj.com/pipeline/development-pipeline/default.aspx"),
+ ("Vertex","https://www.vrtx.com/our-science/pipeline/"),
+ ("Verve","https://www.vervetx.com/our-programs/our-pipeline"),
+ ("Wave","https://wavelifesciences.com/pipeline/research-and-development/"),
+ ("Boehringer","https://www.boehringer-ingelheim.com/science-innovation/human-health-innovation/pipeline"),
 ]
-
-async def one(company,url):
-    try:
-        r=await _extract_generic_pipeline(company=company,source_url=url,timeout_seconds=28.0)
-        print("TARGETED_REMAINING_CANARY "+json.dumps({
-          "company":company,"url":url,"readyForDiscovery":r.readyForDiscovery,
-          "rowCount":r.rowCount,"retrievalMode":r.summary.get("retrievalMode"),
-          "routingReason":r.summary.get("routingReason"),
-          "selectedMethod":r.summary.get("selectedMethod"),
-          "issues":[x.get("issue") for x in r.issues],
-          "diagnostics":r.diagnostics,"sampleRows":r.rows[:8],"masterWrites":0
-        },ensure_ascii=False),flush=True)
-    except Exception as exc:
-        print("TARGETED_REMAINING_CANARY "+json.dumps({
-          "company":company,"url":url,"readyForDiscovery":False,
-          "error":f"{type(exc).__name__}: {exc}","masterWrites":0
-        },ensure_ascii=False),flush=True)
+BASE=os.environ.get("BROWSER_FETCH_BASE_URL","").rstrip("/")
+KEY=os.environ.get("BROWSER_FETCH_KEY","")
 
 async def main():
-    for company,url in SOURCES:
-        await one(company,url)
+    print("BROWSER_CONTRACT_ENV "+json.dumps({"configured":bool(BASE and KEY),"base":BASE}),flush=True)
+    if not BASE:
+        return
+    async with httpx.AsyncClient(timeout=45.0,follow_redirects=True) as c:
+        try:
+            r=await c.get(BASE+"/health",headers={"x-browser-fetch-key":KEY})
+            print("BROWSER_HEALTH_PROBE "+json.dumps({
+              "status":r.status_code,"contentType":r.headers.get("content-type"),
+              "body":r.text[:2000]
+            },ensure_ascii=False),flush=True)
+        except Exception as exc:
+            print("BROWSER_HEALTH_PROBE "+json.dumps({"error":f"{type(exc).__name__}: {exc}"}),flush=True)
+
+        for label,url in TARGETS:
+            try:
+                r=await c.post(
+                    BASE+"/fetch/browser",
+                    headers={"x-browser-fetch-key":KEY,"content-type":"application/json"},
+                    json={"url":url,"timeoutSeconds":35.0},
+                )
+                print("BROWSER_FETCH_PROBE "+json.dumps({
+                  "label":label,"status":r.status_code,
+                  "contentType":r.headers.get("content-type"),
+                  "body":r.text[:3500]
+                },ensure_ascii=False),flush=True)
+            except Exception as exc:
+                print("BROWSER_FETCH_PROBE "+json.dumps({
+                  "label":label,"error":f"{type(exc).__name__}: {exc}"
+                },ensure_ascii=False),flush=True)
 
 if __name__=="__main__":
     asyncio.run(main())

@@ -1,38 +1,46 @@
-"""Read-only structural canary for unresolved official pipeline sources."""
-import asyncio, json
-from generic_pipeline_extension import _extract_generic_pipeline
+"""Read-only dependency diagnostics for unresolved pipeline pages."""
+import asyncio, json, re
+from urllib.parse import urljoin
+from generic_pipeline_extension import _fetch_raw_public_html
 
 SOURCES=[
  ("Gilead Sciences","https://www.gilead.com/science/pipeline"),
  ("Amgen","https://www.amgen.com/science/clinical-trials"),
  ("Ionis Pharmaceuticals","https://ionis.com/science-and-innovation/pipeline"),
- ("AbbVie","https://www.abbvie.com/science/pipeline.html"),
 ]
+
+ATTR_RE=re.compile(r'''(?:href|src|data-[a-z0-9_-]+)\s*=\s*["']([^"'<>]+)["']''',re.I)
+QUOTED_URL_RE=re.compile(r'''["']((?:https?:)?//[^"'\s<>]+|/[^"'<>]{3,220})["']''',re.I)
+KEYWORDS=("pipeline","api","json","graphql","content","clinical","trial","program","phase","ajax","search","sitecore","aem","endpoint")
+
+def compact(s): return re.sub(r"\s+"," ",s or "").strip()
 
 async def one(company,url):
     try:
-        r=await _extract_generic_pipeline(company=company,source_url=url,timeout_seconds=28.0)
-        payload={
-          "company":company,
-          "readyForDiscovery":r.readyForDiscovery,
-          "rowCount":r.rowCount,
-          "retrievalMode":r.summary.get("retrievalMode"),
-          "routingReason":r.summary.get("routingReason"),
-          "selectedMethod":r.summary.get("selectedMethod"),
-          "issues":[x.get("issue") for x in r.issues],
-          "diagnostics":{
-             "semanticTableRows":r.diagnostics.get("semanticTableRows"),
-             "labelledFlowRows":r.diagnostics.get("labelledFlowRows"),
-             "tableCount":r.diagnostics.get("tableCount"),
-             "visibleLineCount":r.diagnostics.get("visibleLineCount"),
-             "portfolioDependentValidation":r.diagnostics.get("portfolioDependentValidation"),
-          },
-          "sampleRows":r.rows[:6],
-          "masterWrites":0,
-        }
+        html,final=await _fetch_raw_public_html(url,28.0)
+        found=[]
+        seen=set()
+        for raw in ATTR_RE.findall(html)+QUOTED_URL_RE.findall(html):
+            raw=raw.replace("&amp;","&")
+            full=urljoin(final,raw)
+            low=full.lower()
+            if any(k in low for k in KEYWORDS) and full not in seen:
+                seen.add(full); found.append(full)
+        snippets=[]
+        lower=html.lower()
+        for key in ["phase 1","phase 2","phase 3","pipeline","program count","clinical stage","owned pipeline","partnered pipeline"]:
+            pos=0
+            for _ in range(3):
+                i=lower.find(key,pos)
+                if i<0: break
+                snippets.append({"key":key,"text":compact(html[max(0,i-220):i+500])[:900]})
+                pos=i+len(key)
+        print("PIPELINE_DEPENDENCY_DIAGNOSTIC "+json.dumps({
+          "company":company,"finalUrl":final,"htmlChars":len(html),
+          "candidateUrls":found[:120],"snippets":snippets[:30]
+        },ensure_ascii=False),flush=True)
     except Exception as exc:
-        payload={"company":company,"readyForDiscovery":False,"error":f"{type(exc).__name__}: {exc}","masterWrites":0}
-    print("UNRESOLVED_HTML_CANARY "+json.dumps(payload,ensure_ascii=False),flush=True)
+        print("PIPELINE_DEPENDENCY_DIAGNOSTIC "+json.dumps({"company":company,"error":f"{type(exc).__name__}: {exc}"},ensure_ascii=False),flush=True)
 
 async def main():
     for company,url in SOURCES:

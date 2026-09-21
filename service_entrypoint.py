@@ -15,3 +15,5 @@ import bms_pipeline_extension_v4  # noqa: E402,F401
 import generic_pipeline_extension  # noqa: E402,F401
 import generic_xlsx_pipeline_extension  # noqa: E402,F401
 import generic_pdf_pipeline_extension  # noqa: E402,F401
+import sitecore_sxa_pipeline_extension  # noqa: E402,F401
+import ionis_json_pipeline_extension  # noqa: E402,F401

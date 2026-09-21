@@ -273,7 +273,9 @@ async def _extract_rendered(
                     const structural = /(pipeline|stage|phase|progress|bar|track|clinical|discovery|cta|ind|grid|row|column)/i.test(
                       className + ' ' + id + ' ' + styleAttr
                     );
-                    if (!ownText && !structural) continue;
+                    const rowAncestor = el.closest ? el.closest('.rows') : null;
+                    const inPipelineRow = !!rowAncestor;
+                    if (!ownText && !structural && !inPipelineRow) continue;
                     nodes.push({
                       tag: (el.tagName || '').toLowerCase(),
                       text: ownText.slice(0, 500),
@@ -294,6 +296,8 @@ async def _extract_rendered(
                       gridColumnEnd: String(style.gridColumnEnd || ''),
                       transform: String(style.transform || ''),
                       backgroundColor: String(style.backgroundColor || ''),
+                      inPipelineRow: inPipelineRow,
+                      parentClassName: String((el.parentElement && el.parentElement.className) || '').slice(0, 300),
                     });
                   }
                   return nodes;

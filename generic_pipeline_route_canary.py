@@ -1,42 +1,46 @@
-"""Read-only structural canary for remaining pipeline sources."""
-import asyncio, json
-from generic_pipeline_extension import _extract_generic_pipeline
+"""Read-only Menarini AEM content-fragment endpoint probe."""
+import asyncio, json, re, html as html_lib
+from urllib.parse import urljoin, quote
+import httpx
 
-SOURCES=[
- ("Johnson & Johnson","https://www.investor.jnj.com/pipeline/development-pipeline/default.aspx"),
- ("Menarini Group","https://www.menarini.com/en-us/innovation-research/our-pipeline-and-products.html"),
- ("BioNTech SE","https://www.biontech.com/int/en/home/pipeline-and-products/pipeline.html"),
- ("Biogen","https://www.biogen.com/science-and-innovation/pipeline.html"),
- ("Wave Life Sciences","https://wavelifesciences.com/pipeline/research-and-development/"),
- ("Vertex Pharmaceuticals","https://www.vrtx.com/our-science/pipeline/"),
- ("Verve Therapeutics","https://www.vervetx.com/our-programs/our-pipeline"),
- ("Boehringer Ingelheim","https://www.boehringer-ingelheim.com/science-innovation/human-health-innovation/pipeline"),
-]
+PAGE="https://www.menarini.com/en-us/innovation-research/our-pipeline-and-products.html"
+HEADERS={"User-Agent":"Mozilla/5.0 MenariniPipelineProbe/1.0","Accept":"application/json,text/html,*/*;q=0.8"}
 
-async def one(company,url):
-    try:
-        r=await _extract_generic_pipeline(company=company,source_url=url,timeout_seconds=28.0)
-        print("REMAINING_PIPELINE_CANARY "+json.dumps({
-          "company":company,
-          "readyForDiscovery":r.readyForDiscovery,
-          "rowCount":r.rowCount,
-          "retrievalMode":r.summary.get("retrievalMode"),
-          "routingReason":r.summary.get("routingReason"),
-          "selectedMethod":r.summary.get("selectedMethod"),
-          "issues":[x.get("issue") for x in r.issues],
-          "diagnostics":r.diagnostics,
-          "sampleRows":r.rows[:6],
-          "masterWrites":0,
-        },ensure_ascii=False),flush=True)
-    except Exception as exc:
-        print("REMAINING_PIPELINE_CANARY "+json.dumps({
-          "company":company,"readyForDiscovery":False,
-          "error":f"{type(exc).__name__}: {exc}","masterWrites":0
-        },ensure_ascii=False),flush=True)
+def compact(s): return re.sub(r"\s+"," ",str(s or "")).strip()
 
 async def main():
-    for company,url in SOURCES:
-        await one(company,url)
+    async with httpx.AsyncClient(timeout=30.0,follow_redirects=True,headers=HEADERS) as c:
+        p=await c.get(PAGE); p.raise_for_status()
+        html=p.text
+        paths=re.findall(r'data-table-cf-path=["\']([^"\']+)["\']',html,re.I)
+        paths=list(dict.fromkeys(html_lib.unescape(x) for x in paths))
+        print("MENARINI_PATHS "+json.dumps({"count":len(paths),"paths":paths},ensure_ascii=False),flush=True)
+
+        results=[]
+        for path in paths[:20]:
+            encoded=path.replace("(","%28").replace(")","%29")
+            for suffix in [".model.json",".json",".infinity.json",".1.json"]:
+                url="https://www.menarini.com"+encoded+suffix
+                try:
+                    r=await c.get(url)
+                    item={"path":path,"suffix":suffix,"url":url,"status":r.status_code,"contentType":r.headers.get("content-type"),"chars":len(r.text)}
+                    if r.status_code==200 and "json" in (r.headers.get("content-type") or "").lower():
+                        try:
+                            data=r.json()
+                            item["jsonType"]=type(data).__name__
+                            if isinstance(data,dict):
+                                item["keys"]=list(data.keys())[:40]
+                                item["sample"]=data
+                            elif isinstance(data,list):
+                                item["sample"]=data[:3]
+                        except Exception as exc:
+                            item["jsonError"]=str(exc)
+                    else:
+                        item["head"]=compact(r.text[:800])
+                    results.append(item)
+                except Exception as exc:
+                    results.append({"path":path,"suffix":suffix,"error":f"{type(exc).__name__}: {exc}"})
+        print("MENARINI_ENDPOINT_RESULTS "+json.dumps(results,ensure_ascii=False),flush=True)
 
 if __name__=="__main__":
     asyncio.run(main())

@@ -462,3 +462,146 @@ async def canary_bayer() -> Dict[str, Any]:
         BAYER_CANARY_URL,
         ["pipeline", "phase"],
     )
+
+
+async def _browser_dom_context(
+    url: str,
+    terms: List[str],
+    timeout_seconds: float = DEFAULT_TIMEOUT_SECONDS,
+) -> Dict[str, Any]:
+    """Read-only bounded DOM context for source-structure diagnostics."""
+    await _assert_public_http_url(url)
+    timeout_ms = int(timeout_seconds * 1000)
+
+    clean_terms = []
+    for raw in terms[:12]:
+        term = re.sub(r"\s+", " ", str(raw or "")).strip()
+        if term and len(term) <= 160:
+            clean_terms.append(term)
+    if not clean_terms:
+        raise HTTPException(status_code=400, detail="At least one inspect term is required")
+
+    async with async_playwright() as pw:
+        browser: Browser = await pw.chromium.launch(
+            headless=True,
+            args=["--no-sandbox", "--disable-dev-shm-usage", "--disable-gpu"],
+        )
+        context: Optional[BrowserContext] = None
+        try:
+            context = await browser.new_context(
+                user_agent=(
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                    "AppleWebKit/537.36 (KHTML, like Gecko) "
+                    "Chrome/124.0.0.0 Safari/537.36"
+                ),
+                locale="en-GB",
+                viewport={"width": 1365, "height": 900},
+                java_script_enabled=True,
+            )
+            page = await context.new_page()
+            await _install_request_guard(page)
+            try:
+                response = await page.goto(url, wait_until="domcontentloaded", timeout=timeout_ms)
+            except Exception as exc:
+                raise HTTPException(status_code=504, detail=f"Browser navigation failed: {type(exc).__name__}") from exc
+            if response is None:
+                raise HTTPException(status_code=502, detail="Browser navigation returned no document response")
+            if int(response.status) >= 400:
+                raise HTTPException(status_code=502, detail=f"Browser source returned HTTP {int(response.status)}")
+            try:
+                await page.wait_for_load_state("networkidle", timeout=min(10_000, timeout_ms))
+            except Exception:
+                pass
+            await page.wait_for_timeout(1_000)
+
+            result = await page.evaluate(
+                """(terms) => {
+                  const norm = (s) => (s || '').replace(/\\s+/g,' ').trim();
+                  const attrs = (el) => {
+                    const out = {};
+                    for (const a of Array.from(el.attributes || [])) {
+                      if (
+                        a.name === 'class' || a.name === 'id' || a.name === 'style' ||
+                        a.name.startsWith('data-') || a.name.startsWith('aria-') ||
+                        a.name === 'role'
+                      ) out[a.name] = (a.value || '').slice(0,500);
+                    }
+                    return out;
+                  };
+                  const node = (el) => {
+                    const cs = getComputedStyle(el);
+                    const r = el.getBoundingClientRect();
+                    return {
+                      tag: el.tagName.toLowerCase(),
+                      text: norm(el.innerText || el.textContent || '').slice(0,500),
+                      attrs: attrs(el),
+                      computed: {
+                        display: cs.display,
+                        position: cs.position,
+                        width: cs.width,
+                        left: cs.left,
+                        right: cs.right,
+                        gridColumn: cs.gridColumn,
+                        gridRow: cs.gridRow,
+                        transform: cs.transform
+                      },
+                      rect: {
+                        x: Math.round(r.x * 10) / 10,
+                        y: Math.round(r.y * 10) / 10,
+                        width: Math.round(r.width * 10) / 10,
+                        height: Math.round(r.height * 10) / 10
+                      }
+                    };
+                  };
+                  const all = Array.from(document.querySelectorAll('body *'));
+                  const results = [];
+                  for (const term of terms) {
+                    const low = term.toLowerCase();
+                    const exact = all.filter(el => norm(el.innerText || el.textContent || '').toLowerCase() === low);
+                    const pool = exact.length ? exact : all.filter(el => {
+                      const t = norm(el.innerText || el.textContent || '').toLowerCase();
+                      return t && t.includes(low) && t.length <= Math.max(300, low.length * 8);
+                    });
+                    const matches = [];
+                    for (const el of pool.slice(0,4)) {
+                      const ancestors = [];
+                      let p = el.parentElement;
+                      for (let depth=0; p && depth<7; depth++, p=p.parentElement) ancestors.push(node(p));
+                      const parent = el.parentElement;
+                      const siblings = parent ? Array.from(parent.children).slice(0,30).map(node) : [];
+                      matches.push({element: node(el), ancestors, siblings});
+                    }
+                    results.push({term, matches});
+                  }
+                  return results;
+                }""",
+                clean_terms,
+            )
+            return {
+                "ok": True,
+                "version": BROWSER_FETCH_VERSION,
+                "sourceUrl": url,
+                "finalUrl": page.url,
+                "terms": clean_terms,
+                "contexts": result,
+                "readOnly": True,
+            }
+        finally:
+            if context is not None:
+                await context.close()
+            await browser.close()
+
+
+@app.get("/diagnostic/dom-context")
+async def diagnostic_dom_context(
+    url: str = Query(..., min_length=8),
+    terms: str = Query(..., min_length=1, max_length=1000),
+    timeout_seconds: float = Query(DEFAULT_TIMEOUT_SECONDS, ge=5.0, le=35.0),
+    x_browser_key: Optional[str] = Header(default=None),
+) -> Dict[str, Any]:
+    _auth(x_browser_key)
+    return await _browser_dom_context(
+        url,
+        [x for x in terms.split("|") if x.strip()],
+        timeout_seconds=timeout_seconds,
+    )

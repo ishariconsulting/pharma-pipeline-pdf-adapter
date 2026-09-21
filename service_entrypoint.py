@@ -32,3 +32,4 @@ import boehringer_annual_report_pipeline_extension  # noqa: E402,F401
 import boehringer_reconciliation_canary  # noqa: E402,F401
 import vertex_pipeline_snapshot_extension  # noqa: E402,F401
 import vertex_pipeline_snapshot_reconciliation_canary  # noqa: E402,F401
+import merck_kgaa_reconciliation_canary  # noqa: E402,F401

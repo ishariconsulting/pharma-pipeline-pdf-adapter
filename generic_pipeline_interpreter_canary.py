@@ -223,11 +223,23 @@ def phase_canonical(value: Any) -> str:
     if "registration" in n or "regulatory" in n or "filed" in n:
         return "Filed / Registration"
 
-    # Prefer the highest explicit clinical phase if a cell includes a range.
-    phase_hits = [
-        int(x)
-        for x in re.findall(r"\bphase\s*([1-4])\b", n, flags=re.I)
-    ]
+    if "pre clinical" in n or "preclinical" in n or n in {"phase 0", "0"}:
+        return "Preclinical"
+
+    # Prefer the highest explicit clinical phase when the source publishes a
+    # range such as Phase 1/2 or Phase 2/3.
+    phase_hits: List[int] = []
+    roman = {"i": 1, "ii": 2, "iii": 3, "iv": 4}
+    for match in re.finditer(
+        r"\bphase\s*(i{1,3}|iv|[1-4])(?:\s*/\s*(i{1,3}|iv|[1-4]))?",
+        text,
+        flags=re.I,
+    ):
+        for token in match.groups():
+            if not token:
+                continue
+            t = token.lower()
+            phase_hits.append(int(t) if t.isdigit() else roman[t])
     if phase_hits:
         return f"Phase {max(phase_hits)}"
 
@@ -235,9 +247,25 @@ def phase_canonical(value: Any) -> str:
     if re.fullmatch(r"[1-4]", n):
         return f"Phase {n}"
 
-    if "pre clinical" in n or "preclinical" in n or n in {"phase 0", "0"}:
-        return "Preclinical"
+    return ""
 
+
+def exact_phase_label(value: Any) -> str:
+    """Return a phase only when the complete visible line is a stage label."""
+    text = clean(value)
+    n = norm(text)
+    if not n:
+        return ""
+    if n in {"registration", "registrational", "filed", "regulatory review"}:
+        return "Filed / Registration"
+    if n in {"preclinical", "pre clinical"}:
+        return "Preclinical"
+    if re.fullmatch(
+        r"phase\s*(?:i{1,3}|iv|[1-4])(?:\s*/\s*(?:i{1,3}|iv|[1-4]))?",
+        text,
+        flags=re.I,
+    ):
+        return phase_canonical(text)
     return ""
 
 
@@ -800,6 +828,174 @@ def extract_rows_from_labelled_flow(
     return out
 
 
+FLOW_STOP_TERMS = {
+    "candidate", "about", "rights", "target", "indication", "indications",
+    "clinical phase", "study", "share", "clinical trial information",
+    "load more", "filter", "search", "program", "programme", "phase",
+    "development pipeline", "pipeline",
+}
+
+
+def compact_flow_value(value: Any, *, max_words: int = 18, max_chars: int = 180) -> bool:
+    s = clean(value)
+    n = norm(s)
+    if not s or not n or n in FLOW_STOP_TERMS:
+        return False
+    if exact_phase_label(s):
+        return False
+    if len(s) > max_chars or len(s.split()) > max_words:
+        return False
+    if re.fullmatch(r"[+\-–—]+", s):
+        return False
+    return True
+
+
+def extract_rows_from_phase_triplets(
+    company: str,
+    source_url: str,
+    lines: Sequence[str],
+) -> List[DiscoveryRow]:
+    """Parse repeated visible asset / indication / phase triples.
+
+    This is useful for accessible/rendered pipeline grids where browser text
+    already exposes each row sequentially. The parser does not rely on company
+    names, CSS selectors, Portfolio identities, or disease dictionaries.
+    """
+    clean_lines = [clean(x) for x in lines if clean(x)]
+    out: List[DiscoveryRow] = []
+
+    for i, phase_line in enumerate(clean_lines):
+        phase = exact_phase_label(phase_line)
+        if not phase or i < 2:
+            continue
+
+        indication = clean_lines[i - 1]
+        asset = clean_lines[i - 2]
+
+        if not compact_flow_value(asset, max_words=16, max_chars=150):
+            continue
+        if not compact_flow_value(indication, max_words=24, max_chars=220):
+            continue
+
+        # Avoid treating neighbouring labels/navigation as programme rows.
+        if norm(asset) in FLOW_STOP_TERMS or norm(indication) in FLOW_STOP_TERMS:
+            continue
+
+        out.append(
+            DiscoveryRow(
+                company=company,
+                sourceFamily="Company Pipeline",
+                sourceRecordId=f"triplet:{len(out)+1}",
+                sourceUrl=source_url,
+                asset=asset,
+                molecule="",
+                indication=indication,
+                phase=phase,
+                phaseEvidence="SOURCE_RENDERED_TEXT",
+                sponsorOwner=company,
+                partners=[],
+                study="",
+                trialIds=[],
+                sourceOrdinal=len(out) + 1,
+                parserMethod="PHASE_TRIPLET_FLOW",
+            )
+        )
+
+    return out
+
+
+def extract_rows_from_candidate_cards(
+    company: str,
+    source_url: str,
+    lines: Sequence[str],
+) -> List[DiscoveryRow]:
+    """Parse labelled candidate cards from browser-visible text.
+
+    A card starts with the literal semantic label Candidate. Within that card,
+    each exact phase label is paired only with the compact visible line
+    immediately above it as the indication. This supports multiple indications
+    per candidate while failing closed on prose or unlabeled structures.
+    """
+    clean_lines = [clean(x) for x in lines if clean(x)]
+    candidate_positions = [
+        i for i, value in enumerate(clean_lines)
+        if norm(value) == "candidate"
+    ]
+    if not candidate_positions:
+        return []
+
+    out: List[DiscoveryRow] = []
+    for pos_index, pos in enumerate(candidate_positions):
+        if pos + 1 >= len(clean_lines):
+            continue
+        asset = clean_lines[pos + 1]
+        if not compact_flow_value(asset, max_words=14, max_chars=150):
+            continue
+
+        end = (
+            candidate_positions[pos_index + 1]
+            if pos_index + 1 < len(candidate_positions)
+            else min(len(clean_lines), pos + 80)
+        )
+        block = clean_lines[pos + 2 : end]
+
+        # Require the source's own Indications label before accepting phase
+        # rows from this card.
+        indication_label_positions = [
+            j for j, value in enumerate(block)
+            if norm(value) in {"indication", "indications"}
+        ]
+        if not indication_label_positions:
+            continue
+        first_indication_label = indication_label_positions[0]
+
+        for j in range(first_indication_label + 1, len(block)):
+            phase = exact_phase_label(block[j])
+            if not phase or j < 1:
+                continue
+            indication = block[j - 1]
+            if not compact_flow_value(indication, max_words=24, max_chars=220):
+                continue
+
+            out.append(
+                DiscoveryRow(
+                    company=company,
+                    sourceFamily="Company Pipeline",
+                    sourceRecordId=f"candidate:{len(out)+1}",
+                    sourceUrl=source_url,
+                    asset=asset,
+                    molecule="",
+                    indication=indication,
+                    phase=phase,
+                    phaseEvidence="SOURCE_RENDERED_TEXT",
+                    sponsorOwner=company,
+                    partners=[],
+                    study="",
+                    trialIds=[],
+                    sourceOrdinal=len(out) + 1,
+                    parserMethod="CANDIDATE_CARD_FLOW",
+                )
+            )
+
+    return out
+
+
+def source_declared_total_rows(lines: Sequence[str]) -> Optional[int]:
+    joined = clean(" ".join(clean(x) for x in lines if clean(x)))
+    patterns = [
+        r"\b\d+\s+of\s+(\d+)\s+total\s+indications\b",
+        r"\bof\s+(\d+)\s+total\s+indications\b",
+        r"\b(\d+)\s+total\s+indications\b",
+    ]
+    for pattern in patterns:
+        m = re.search(pattern, joined, flags=re.I)
+        if m:
+            value = int(m.group(1))
+            if 1 <= value <= 2000:
+                return value
+    return None
+
+
 def dedupe_rows(rows: Sequence[DiscoveryRow]) -> List[DiscoveryRow]:
     out: List[DiscoveryRow] = []
     seen = set()
@@ -853,11 +1049,25 @@ def interpret_pipeline_structure(
         clean_lines,
     )
 
+    triplet_rows = extract_rows_from_phase_triplets(
+        company,
+        source_url,
+        clean_lines,
+    )
+
+    candidate_card_rows = extract_rows_from_candidate_cards(
+        company,
+        source_url,
+        clean_lines,
+    )
+
     # Reusable strategy selection: choose the structurally stronger extraction.
     # No company name or Portfolio state is used to choose a parser.
     candidates = [
         ("SEMANTIC_TABLE", table_rows),
         ("LABELLED_FLOW", labelled_rows),
+        ("PHASE_TRIPLET_FLOW", triplet_rows),
+        ("CANDIDATE_CARD_FLOW", candidate_card_rows),
     ]
     method, selected = max(
         candidates,
@@ -874,6 +1084,9 @@ def interpret_pipeline_structure(
         "tableCount": len(tables),
         "semanticTableRows": len(table_rows),
         "labelledFlowRows": len(labelled_rows),
+        "phaseTripletRows": len(triplet_rows),
+        "candidateCardRows": len(candidate_card_rows),
+        "declaredRowCount": source_declared_total_rows(clean_lines),
         "selectedMethod": method,
         "selectedRows": len(selected),
         "coreCompleteRows": sum(
@@ -930,6 +1143,12 @@ def validate_source(
     if incomplete:
         issues.append(
             f"{len(incomplete)} rows missing core asset/indication/phase"
+        )
+
+    declared_count = diagnostics.get("declaredRowCount")
+    if isinstance(declared_count, int) and declared_count > 0 and len(rows) != declared_count:
+        issues.append(
+            f"source declares {declared_count} rows but parser recovered {len(rows)}"
         )
 
     bad_phase = [

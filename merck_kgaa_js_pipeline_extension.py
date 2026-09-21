@@ -54,6 +54,36 @@ def text_only(v:Any)->str:
     return clean(s)
 
 
+def normalize_asset_identity(raw:Any)->Dict[str,str]:
+    """Split the public compound label from trailing mechanism text.
+
+    Examples:
+      "enpatoran (TLR7/8 antagonist)" -> asset/molecule "enpatoran"
+      "M3554 (anti-GD2 Antibody drug conjugate)" -> asset/code "M3554"
+      "cladribine capsules (Immune reconstitution )" -> asset "cladribine capsules",
+        molecule "cladribine"
+
+    This uses source text only; it does not consult Portfolio/master data.
+    """
+    label=text_only(raw)
+    core=clean(re.sub(r"\s*\([^()]*\)\s*$","",label))
+    if not core:
+        core=label
+    code=""
+    molecule=core
+    if re.fullmatch(r"[A-Z]{1,5}[- ]?\d{3,8}",core,re.I):
+        code=core.upper().replace(" ","")
+        molecule=""
+    elif re.fullmatch(r"cladribine\s+capsules?",core,re.I):
+        molecule="cladribine"
+    return {
+      "asset":core,
+      "molecule":molecule,
+      "developmentCode":code,
+      "sourceAssetLabel":label,
+    }
+
+
 def phase_value(raw:Any,phase_text:Any="")->str:
     n=clean(raw).lower()
     label=clean(phase_text).lower()
@@ -121,7 +151,8 @@ async def extract_merck_pipeline(
             source_rows+=1
             if not isinstance(item,dict):
                 rejected.append({"ordinal":source_rows,"reason":"NON_OBJECT"}); continue
-            asset=text_only(item.get("title1"))
+            identity=normalize_asset_identity(item.get("title1"))
+            asset=identity["asset"]
             indication=text_only(item.get("title2"))
             ph=phase_value(item.get("phase"),item.get("phasetext"))
             ta=text_only(item.get("type")) or group_name
@@ -142,8 +173,8 @@ async def extract_merck_pipeline(
               "sourceRecordId":f"merckjs:{source_rows}",
               "sourceUrl":final_url,
               "asset":asset,
-              "molecule":asset,
-              "developmentCode":"",
+              "molecule":identity["molecule"],
+              "developmentCode":identity["developmentCode"],
               "brand":"",
               "indication":indication,
               "phase":ph,
@@ -155,6 +186,7 @@ async def extract_merck_pipeline(
               "trialIds":[],
               "therapeuticArea":ta,
               "sourceOwnership":clean(item.get("asset")),
+              "sourceAssetLabel":identity["sourceAssetLabel"],
               "compoundClass":clean(item.get("entity")) or clean(item.get("compound")),
               "sourcePhaseText":clean(item.get("phasetext")),
               "sourceLinks":trial_links,

@@ -37,7 +37,7 @@ from generic_pipeline_interpreter_canary import (
 
 
 ADAPTER_PROFILE = "PIPELINE_GENERIC_HTML_V1"
-ROUTE_VERSION = "GENERIC_PIPELINE_EXTRACTION_V1.2.1_BOUNDED_ROUTING_READ_ONLY"
+ROUTE_VERSION = "GENERIC_PIPELINE_EXTRACTION_V1.2.2_BROWSER_TRANSIENT_RETRY_READ_ONLY"
 
 
 class GenericPipelineExtractionResponse(BaseModel):
@@ -185,50 +185,83 @@ async def _fetch_browser_structure(
     endpoint = f"{base}/fetch/browser"
     timeout = httpx.Timeout(timeout_seconds + 12.0, connect=12.0)
 
-    try:
-        async with httpx.AsyncClient(
-            timeout=timeout,
-            follow_redirects=False,
-        ) as client:
-            response = await client.get(
-                endpoint,
-                params={
-                    "url": url,
-                    "timeout_seconds": timeout_seconds,
-                    "expand_load_more": "true",
-                },
-                headers={
-                    "X-Browser-Key": key,
-                    "Accept": "application/json",
-                },
+    response: Optional[httpx.Response] = None
+    payload: Optional[Dict[str, Any]] = None
+    last_error = "Browser fallback failed"
+
+    # Render browser workers can cold-start behind a non-JSON 502/503 page.
+    # Retry only bounded transient transport/service failures. Source-level
+    # failures remain fail-closed and are never retried into success.
+    for attempt in range(1, 3):
+        try:
+            async with httpx.AsyncClient(
+                timeout=timeout,
+                follow_redirects=False,
+            ) as client:
+                response = await client.get(
+                    endpoint,
+                    params={
+                        "url": url,
+                        "timeout_seconds": timeout_seconds,
+                        "expand_load_more": "true",
+                    },
+                    headers={
+                        "X-Browser-Key": key,
+                        "Accept": "application/json",
+                    },
+                )
+        except httpx.TimeoutException:
+            last_error = "Browser fallback timed out"
+            if attempt < 2:
+                await asyncio.sleep(1.0)
+                continue
+            raise HTTPException(status_code=504, detail=last_error)
+        except httpx.HTTPError as exc:
+            last_error = f"Browser fallback transport failed: {exc}"
+            if attempt < 2:
+                await asyncio.sleep(1.0)
+                continue
+            raise HTTPException(status_code=502, detail=last_error) from exc
+
+        try:
+            parsed_payload = response.json()
+            payload = parsed_payload if isinstance(parsed_payload, dict) else None
+        except Exception:
+            payload = None
+
+        if payload is None:
+            last_error = (
+                f"Browser fallback returned invalid JSON; "
+                f"HTTP {response.status_code}; "
+                f"body={response.text[:180]!r}"
             )
-    except httpx.TimeoutException as exc:
-        raise HTTPException(
-            status_code=504,
-            detail="Browser fallback timed out",
-        ) from exc
-    except httpx.HTTPError as exc:
-        raise HTTPException(
-            status_code=502,
-            detail=f"Browser fallback transport failed: {exc}",
-        ) from exc
+            if attempt < 2 and response.status_code in {408, 429, 500, 502, 503, 504}:
+                await asyncio.sleep(1.0)
+                continue
+            raise HTTPException(status_code=502, detail=last_error)
 
-    try:
-        payload = response.json()
-    except Exception as exc:
-        raise HTTPException(
-            status_code=502,
-            detail="Browser fallback returned invalid JSON",
-        ) from exc
+        if response.status_code >= 400:
+            detail = str(payload.get("detail", "no detail"))
+            last_error = (
+                f"Browser fallback failed: HTTP {response.status_code}; {detail}"
+            )
+            # Retry only worker/service transient errors. If the worker reached
+            # the target and reports source HTTP 403/other source denial, fail
+            # closed immediately rather than masking the source condition.
+            source_denial = "source returned http" in detail.lower()
+            if (
+                attempt < 2
+                and not source_denial
+                and response.status_code in {408, 429, 500, 502, 503, 504}
+            ):
+                await asyncio.sleep(1.0)
+                continue
+            raise HTTPException(status_code=502, detail=last_error)
 
-    if response.status_code >= 400:
-        raise HTTPException(
-            status_code=502,
-            detail=(
-                f"Browser fallback failed: HTTP {response.status_code}; "
-                f"{payload.get('detail', 'no detail')}"
-            ),
-        )
+        break
+
+    if response is None or payload is None:
+        raise HTTPException(status_code=502, detail=last_error)
 
     visible_lines = payload.get("visibleLines")
     tables = payload.get("tables")

@@ -1,8 +1,8 @@
 """Read-only promotion and generic-pipeline startup canaries."""
 import asyncio, json
 from amgen_json_pipeline_extension import extract_amgen_pipeline
-from generic_pipeline_extension import _extract_generic_pipeline
-from generic_pipeline_interpreter_canary import norm
+from generic_pipeline_extension import _extract_generic_pipeline, _fetch_raw_public_html
+from generic_pipeline_interpreter_canary import norm, PageShapeParser
 
 TARGETS={
 "amgen:2:2:1",
@@ -129,6 +129,27 @@ async def main():
         "readyForDiscovery":arrowhead.readyForDiscovery,
         "masterWrites":0,
     },ensure_ascii=False),flush=True)
+    raw_html, _ = await _fetch_raw_public_html(
+        "https://arrowheadpharma.com/en-us/pipeline",
+        timeout_seconds=35.0,
+    )
+    shape = PageShapeParser()
+    shape.feed(raw_html)
+    contexts = {}
+    for target in ("alzheimer s disease", "alpha 1 liver disease"):
+        hits = [
+            i for i, line in enumerate(shape.visible_lines)
+            if norm(line) == target
+        ]
+        contexts[target] = [
+            shape.visible_lines[max(0, i - 15): min(len(shape.visible_lines), i + 16)]
+            for i in hits[:3]
+        ]
+    print(
+        "ARROWHEAD_SOURCE_CONTEXT "
+        + json.dumps(contexts, ensure_ascii=False),
+        flush=True,
+    )
 
 if __name__=="__main__":
     asyncio.run(main())

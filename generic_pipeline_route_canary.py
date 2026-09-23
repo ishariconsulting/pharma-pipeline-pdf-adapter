@@ -1,6 +1,8 @@
-"""Read-only Amgen seven-row promotion QA canary."""
+"""Read-only promotion and generic-pipeline startup canaries."""
 import asyncio, json
 from amgen_json_pipeline_extension import extract_amgen_pipeline
+from generic_pipeline_extension import _extract_generic_pipeline
+from generic_pipeline_interpreter_canary import norm
 
 TARGETS={
 "amgen:2:2:1",
@@ -10,6 +12,25 @@ TARGETS={
 "amgen:2:3:1",
 "amgen:11:2:1",
 "amgen:12:1:2",
+}
+
+GENERIC_CONTEXT_ASSETS={
+    "liver",
+    "muscle",
+    "lung",
+    "cns",
+    "adipose",
+    "brain",
+    "kidney",
+    "heart",
+    "skin",
+    "blood",
+    "bone",
+    "bone marrow",
+    "retina",
+    "eye",
+    "skeletal muscle",
+    "central nervous system",
 }
 
 async def main():
@@ -35,6 +56,35 @@ async def main():
         "selectedCount":len(selected),
         "selected":selected,
         "issues":r.issues,
+        "masterWrites":0,
+    },ensure_ascii=False),flush=True)
+
+    arrowhead=await _extract_generic_pipeline(
+        company="Arrowhead Pharmaceuticals",
+        source_url="https://arrowheadpharma.com/en-us/pipeline",
+        timeout_seconds=35.0,
+    )
+    bad_assets=sorted({
+        row.get("asset","")
+        for row in arrowhead.rows
+        if norm(row.get("asset","")) in GENERIC_CONTEXT_ASSETS
+    })
+    if not arrowhead.readyForDiscovery:
+        raise RuntimeError(
+            "Arrowhead generic canary failed structural validation: "
+            + json.dumps(arrowhead.validation,ensure_ascii=False)
+        )
+    if bad_assets:
+        raise RuntimeError(
+            "Arrowhead generic canary emitted context labels as assets: "
+            + json.dumps(bad_assets,ensure_ascii=False)
+        )
+    print("ARROWHEAD_GENERIC_QA "+json.dumps({
+        "rowCount":arrowhead.rowCount,
+        "selectedMethod":arrowhead.summary.get("selectedMethod"),
+        "assets":[row.get("asset") for row in arrowhead.rows[:12]],
+        "badContextAssets":bad_assets,
+        "readyForDiscovery":arrowhead.readyForDiscovery,
         "masterWrites":0,
     },ensure_ascii=False),flush=True)
 

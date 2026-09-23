@@ -78,6 +78,13 @@ async def main():
                     "eligibility criteria",
                     "participants",
                     "locations",
+                    "recruiting id",
+                    "active id",
+                    "complete id",
+                    "clinical severity",
+                    "severity score",
+                    "score between",
+                    "nct",
                 )
             )
             or any(

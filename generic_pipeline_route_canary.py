@@ -89,6 +89,7 @@ async def main():
                     "in collaboration with",
                 )
             )
+            or str(row.get("asset","")).strip().replace(".", "", 1).isdigit()
         )
     })
     if not arrowhead.readyForDiscovery:

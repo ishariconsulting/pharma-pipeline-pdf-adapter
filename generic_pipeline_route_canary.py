@@ -67,7 +67,29 @@ async def main():
     bad_assets=sorted({
         row.get("asset","")
         for row in arrowhead.rows
-        if norm(row.get("asset","")) in GENERIC_CONTEXT_ASSETS
+        if (
+            norm(row.get("asset","")) in GENERIC_CONTEXT_ASSETS
+            or any(
+                term in norm(row.get("asset",""))
+                for term in (
+                    "years old",
+                    "all sexes",
+                    "healthy volunteers",
+                    "eligibility criteria",
+                    "participants",
+                    "locations",
+                )
+            )
+            or any(
+                term in norm(row.get("asset",""))
+                for term in (
+                    "licensed to",
+                    "licensed from",
+                    "partnered with",
+                    "in collaboration with",
+                )
+            )
+        )
     })
     if not arrowhead.readyForDiscovery:
         raise RuntimeError(

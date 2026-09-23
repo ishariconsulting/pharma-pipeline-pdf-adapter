@@ -941,7 +941,9 @@ def normalize_phase_triplet_identity(value: Any) -> Tuple[str, str]:
 NON_ASSET_IDENTITY_RE = re.compile(
     r"\b(?:years?\s+old|all\s+sexes|healthy\s+volunteers?|eligibility\s+criteria|"
     r"participants?|locations?|start\s+date|end\s+date|study\s+first\s+posted|"
-    r"estimated\s+completion|actual\s+completion|clinical\s+trials?)\b",
+    r"estimated\s+completion|actual\s+completion|clinical\s+trials?|"
+    r"recruiting\s+id|active\s+id|complete\s+id|clinical\s+severity|"
+    r"severity\s+score|clinical\s+score|score\s+between|scale\s*,|nct\d{8})\b",
     flags=re.I,
 )
 

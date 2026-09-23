@@ -943,6 +943,8 @@ def phase_triplet_identity_score(value: Any) -> int:
         return -100
     if NON_ASSET_IDENTITY_RE.search(asset):
         return -100
+    if re.fullmatch(r"\d+(?:\.\d+)?", asset):
+        return -100
     if not compact_flow_value(asset, max_words=14, max_chars=150):
         return -100
 

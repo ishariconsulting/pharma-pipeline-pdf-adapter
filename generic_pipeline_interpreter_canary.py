@@ -889,6 +889,24 @@ PHASE_TRIPLET_STATUS_TERMS = {
     "pre clinical",
 }
 
+PHASE_TRIPLET_METADATA_LABELS = {
+    "location",
+    "locations",
+    "participant",
+    "participants",
+    "start date",
+    "end date",
+    "study start date",
+    "study first posted",
+    "primary completion date",
+    "estimated completion date",
+    "estimated study completion date",
+    "eligibility criteria",
+    "trial details",
+    "timeline",
+}
+
+
 
 def normalize_phase_triplet_identity(value: Any) -> Tuple[str, str]:
     """Normalize a compact programme heading without using company-specific rules."""
@@ -993,7 +1011,7 @@ def recover_phase_triplet_identity(
     This remains company-agnostic: the fallback is triggered only by a small
     semantic set of anatomical/compartment labels, never by company name.
     """
-    lower_bound = max(0, context_index - 12)
+    lower_bound = max(0, context_index - 40)
     ranked: List[Tuple[int, int, str, str]] = []
 
     for j in range(context_index - 1, lower_bound - 1, -1):
@@ -1007,6 +1025,11 @@ def recover_phase_triplet_identity(
         if n in PHASE_TRIPLET_STATUS_TERMS:
             continue
         if exact_phase_label(candidate):
+            continue
+        if (
+            j > 0
+            and norm(lines[j - 1]) in PHASE_TRIPLET_METADATA_LABELS
+        ):
             continue
 
         # A compact line immediately following a tissue/compartment label is

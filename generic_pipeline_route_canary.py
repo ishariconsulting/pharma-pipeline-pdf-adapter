@@ -111,6 +111,13 @@ async def main():
         "rowCount":arrowhead.rowCount,
         "selectedMethod":arrowhead.summary.get("selectedMethod"),
         "assets":[row.get("asset") for row in arrowhead.rows],
+        "rows":[{
+            "sourceRecordId":row.get("sourceRecordId"),
+            "asset":row.get("asset"),
+            "developmentCode":row.get("developmentCode"),
+            "indication":row.get("indication"),
+            "phase":row.get("phase"),
+        } for row in arrowhead.rows],
         "badContextAssets":bad_assets,
         "readyForDiscovery":arrowhead.readyForDiscovery,
         "masterWrites":0,

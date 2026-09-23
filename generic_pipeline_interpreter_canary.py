@@ -945,6 +945,18 @@ def phase_triplet_identity_score(value: Any) -> int:
         return -100
     if re.fullmatch(r"\d+(?:\.\d+)?", asset):
         return -100
+    if re.fullmatch(
+        r"(?:january|february|march|april|may|june|july|august|september|october|november|december)\s+\d{4}",
+        asset,
+        flags=re.I,
+    ):
+        return -100
+    if re.fullmatch(
+        r"(?:january|february|march|april|may|june|july|august|september|october|november|december)\s+\d{1,2},?\s+\d{4}",
+        asset,
+        flags=re.I,
+    ):
+        return -100
     if not compact_flow_value(asset, max_words=14, max_chars=150):
         return -100
 

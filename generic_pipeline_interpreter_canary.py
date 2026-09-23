@@ -896,9 +896,10 @@ def normalize_phase_triplet_identity(value: Any) -> Tuple[str, str]:
     if not text:
         return "", ""
 
-    # Partnership text is commercial context, not part of the asset identity.
+    # Partnership/licensing text is commercial context, not part of the
+    # asset identity.
     text = re.sub(
-        r"\s+partnered\s+with\b.*$",
+        r"\s+(?:partnered\s+with|licensed\s+to|licensed\s+from|in\s+collaboration\s+with)\b.*$",
         "",
         text,
         flags=re.I,
@@ -919,6 +920,55 @@ def normalize_phase_triplet_identity(value: Any) -> Tuple[str, str]:
     return text, ""
 
 
+NON_ASSET_IDENTITY_RE = re.compile(
+    r"\b(?:years?\s+old|all\s+sexes|healthy\s+volunteers?|eligibility\s+criteria|"
+    r"participants?|locations?|start\s+date|end\s+date|study\s+first\s+posted|"
+    r"estimated\s+completion|actual\s+completion|clinical\s+trials?)\b",
+    flags=re.I,
+)
+
+
+def phase_triplet_identity_score(value: Any) -> int:
+    """Score a compact source line as a plausible programme identity."""
+    asset, development_code = normalize_phase_triplet_identity(value)
+    n = norm(asset)
+
+    if not asset or not n:
+        return -100
+    if n in PHASE_TRIPLET_CONTEXT_TERMS:
+        return -100
+    if n in PHASE_TRIPLET_STATUS_TERMS:
+        return -100
+    if exact_phase_label(asset):
+        return -100
+    if NON_ASSET_IDENTITY_RE.search(asset):
+        return -100
+    if not compact_flow_value(asset, max_words=14, max_chars=150):
+        return -100
+
+    words = asset.split()
+    score = 0
+
+    if development_code:
+        score += 8
+
+    if re.search(r"\b[A-Z0-9]{2,}-[A-Z0-9-]{2,}\b", asset):
+        score += 7
+    elif re.search(r"\b[A-Z]{2,}\d{2,}[A-Z0-9-]*\b", asset):
+        score += 7
+    elif len(words) <= 2:
+        score += 5
+    elif len(words) <= 4:
+        score += 3
+    else:
+        score += 1
+
+    if "," in asset:
+        score -= 2
+
+    return score
+
+
 def recover_phase_triplet_identity(
     lines: Sequence[str],
     context_index: int,
@@ -930,6 +980,7 @@ def recover_phase_triplet_identity(
     semantic set of anatomical/compartment labels, never by company name.
     """
     lower_bound = max(0, context_index - 12)
+    ranked: List[Tuple[int, int, str, str]] = []
 
     for j in range(context_index - 1, lower_bound - 1, -1):
         candidate = clean(lines[j])
@@ -943,19 +994,27 @@ def recover_phase_triplet_identity(
             continue
         if exact_phase_label(candidate):
             continue
-        if not compact_flow_value(candidate, max_words=14, max_chars=150):
-            continue
 
         # A compact line immediately following a tissue/compartment label is
         # much more likely to be an indication than a programme identity.
         if j > 0 and norm(lines[j - 1]) in PHASE_TRIPLET_CONTEXT_TERMS:
             continue
 
+        score = phase_triplet_identity_score(candidate)
+        if score <= 0:
+            continue
+
         asset, development_code = normalize_phase_triplet_identity(candidate)
         if asset:
-            return asset, development_code
+            distance = context_index - j
+            ranked.append((score, -distance, asset, development_code))
 
-    return "", ""
+    if not ranked:
+        return "", ""
+
+    ranked.sort(reverse=True)
+    _, _, asset, development_code = ranked[0]
+    return asset, development_code
 
 
 def extract_rows_from_phase_triplets(
@@ -991,7 +1050,7 @@ def extract_rows_from_phase_triplets(
                 raw_asset
             )
 
-        if not compact_flow_value(asset, max_words=16, max_chars=150):
+        if phase_triplet_identity_score(asset) <= 0:
             continue
         if not compact_flow_value(indication, max_words=24, max_chars=220):
             continue

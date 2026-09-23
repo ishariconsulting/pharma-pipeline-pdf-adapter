@@ -43,7 +43,7 @@ from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 import httpx
 
 
-VERSION = "GENERIC_PIPELINE_INTERPRETER_CANARY_V1.0_READ_ONLY"
+VERSION = "GENERIC_PIPELINE_INTERPRETER_CANARY_V1.1_CONTEXT_AWARE_TRIPLETS_READ_ONLY"
 
 SOURCES = [
     {
@@ -220,6 +220,9 @@ def phase_canonical(value: Any) -> str:
     if not n:
         return ""
 
+    if n in {"in market", "marketed", "approved"}:
+        return "Approved"
+
     if "registration" in n or "regulatory" in n or "filed" in n:
         return "Filed / Registration"
 
@@ -256,6 +259,8 @@ def exact_phase_label(value: Any) -> str:
     n = norm(text)
     if not n:
         return ""
+    if n in {"in market", "marketed", "approved"}:
+        return "Approved"
     if n in {"registration", "registrational", "filed", "regulatory review"}:
         return "Filed / Registration"
     if n in {"preclinical", "pre clinical"}:
@@ -854,6 +859,105 @@ def compact_flow_value(value: Any, *, max_words: int = 18, max_chars: int = 180)
     return True
 
 
+PHASE_TRIPLET_CONTEXT_TERMS = {
+    "liver",
+    "muscle",
+    "lung",
+    "cns",
+    "adipose",
+    "brain",
+    "kidney",
+    "heart",
+    "skin",
+    "blood",
+    "bone",
+    "bone marrow",
+    "retina",
+    "eye",
+    "skeletal muscle",
+    "central nervous system",
+}
+
+PHASE_TRIPLET_STATUS_TERMS = {
+    "in market",
+    "marketed",
+    "approved",
+    "filed",
+    "registration",
+    "registrational",
+    "preclinical",
+    "pre clinical",
+}
+
+
+def normalize_phase_triplet_identity(value: Any) -> Tuple[str, str]:
+    """Normalize a compact programme heading without using company-specific rules."""
+    text = clean(value)
+    if not text:
+        return "", ""
+
+    # Partnership text is commercial context, not part of the asset identity.
+    text = re.sub(
+        r"\s+partnered\s+with\b.*$",
+        "",
+        text,
+        flags=re.I,
+    ).strip()
+
+    # Generic source headings often publish a canonical asset followed by a
+    # development code in parentheses, e.g. Name (ABC-123). Preserve both.
+    match = re.fullmatch(
+        r"(.+?)\s*\(([^()]{2,60})\)\s*",
+        text,
+    )
+    if match:
+        asset = clean(match.group(1))
+        code = clean(match.group(2))
+        if asset and code and (re.search(r"\d", code) or "-" in code):
+            return asset, code
+
+    return text, ""
+
+
+def recover_phase_triplet_identity(
+    lines: Sequence[str],
+    context_index: int,
+) -> Tuple[str, str]:
+    """Recover the nearest preceding programme heading when a row uses a
+    tissue/compartment label immediately before indication and phase.
+
+    This remains company-agnostic: the fallback is triggered only by a small
+    semantic set of anatomical/compartment labels, never by company name.
+    """
+    lower_bound = max(0, context_index - 12)
+
+    for j in range(context_index - 1, lower_bound - 1, -1):
+        candidate = clean(lines[j])
+        n = norm(candidate)
+
+        if not candidate or not n:
+            continue
+        if n in PHASE_TRIPLET_CONTEXT_TERMS:
+            continue
+        if n in PHASE_TRIPLET_STATUS_TERMS:
+            continue
+        if exact_phase_label(candidate):
+            continue
+        if not compact_flow_value(candidate, max_words=14, max_chars=150):
+            continue
+
+        # A compact line immediately following a tissue/compartment label is
+        # much more likely to be an indication than a programme identity.
+        if j > 0 and norm(lines[j - 1]) in PHASE_TRIPLET_CONTEXT_TERMS:
+            continue
+
+        asset, development_code = normalize_phase_triplet_identity(candidate)
+        if asset:
+            return asset, development_code
+
+    return "", ""
+
+
 def extract_rows_from_phase_triplets(
     company: str,
     source_url: str,
@@ -874,7 +978,18 @@ def extract_rows_from_phase_triplets(
             continue
 
         indication = clean_lines[i - 1]
-        asset = clean_lines[i - 2]
+        raw_asset = clean_lines[i - 2]
+        development_code = ""
+
+        if norm(raw_asset) in PHASE_TRIPLET_CONTEXT_TERMS:
+            asset, development_code = recover_phase_triplet_identity(
+                clean_lines,
+                i - 2,
+            )
+        else:
+            asset, development_code = normalize_phase_triplet_identity(
+                raw_asset
+            )
 
         if not compact_flow_value(asset, max_words=16, max_chars=150):
             continue
@@ -893,6 +1008,7 @@ def extract_rows_from_phase_triplets(
                 sourceUrl=source_url,
                 asset=asset,
                 molecule="",
+                developmentCode=development_code,
                 indication=indication,
                 phase=phase,
                 phaseEvidence="SOURCE_RENDERED_TEXT",
@@ -1166,6 +1282,7 @@ def validate_source(
             "Phase 3",
             "Phase 4",
             "Filed / Registration",
+            "Approved",
         }
     ]
     if bad_phase:

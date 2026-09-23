@@ -1028,17 +1028,17 @@ def recover_phase_triplet_identity(
             continue
         if exact_phase_label(candidate):
             continue
+        if n in PHASE_TRIPLET_METADATA_LABELS:
+            continue
         if (
             j > 0
             and norm(lines[j - 1]) in PHASE_TRIPLET_METADATA_LABELS
         ):
             continue
 
-        # A compact line immediately following a tissue/compartment label is
-        # much more likely to be an indication than a programme identity.
-        if j > 0 and norm(lines[j - 1]) in PHASE_TRIPLET_CONTEXT_TERMS:
-            continue
-
+        # Do not reject a candidate merely because it follows an anatomical
+        # or section heading. Many pipeline pages publish the programme name
+        # immediately after a section label (for example CNS -> ARO-MAPT).
         score = phase_triplet_identity_score(candidate)
         if score <= 0:
             continue

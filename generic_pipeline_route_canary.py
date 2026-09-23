@@ -90,6 +90,11 @@ async def main():
                 )
             )
             or str(row.get("asset","")).strip().replace(".", "", 1).isdigit()
+            or __import__("re").fullmatch(
+                r"(?:january|february|march|april|may|june|july|august|september|october|november|december)(?:\s+\d{1,2},?)?\s+\d{4}",
+                str(row.get("asset","")).strip(),
+                flags=__import__("re").I,
+            ) is not None
         )
     })
     if not arrowhead.readyForDiscovery:
@@ -105,7 +110,7 @@ async def main():
     print("ARROWHEAD_GENERIC_QA "+json.dumps({
         "rowCount":arrowhead.rowCount,
         "selectedMethod":arrowhead.summary.get("selectedMethod"),
-        "assets":[row.get("asset") for row in arrowhead.rows[:12]],
+        "assets":[row.get("asset") for row in arrowhead.rows],
         "badContextAssets":bad_assets,
         "readyForDiscovery":arrowhead.readyForDiscovery,
         "masterWrites":0,

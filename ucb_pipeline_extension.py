@@ -96,31 +96,70 @@ def _indication_start(lines: List[Dict[str, Any]]) -> Optional[float]:
     return min((x["x0"] for x in candidates), default=None)
 
 
-def _asset_lines(lines: List[Dict[str, Any]], indication_x: float, header_y: float, page_h: float) -> List[Dict[str, Any]]:
-    out = []
+def _phase_grid_right(headers: Dict[int, float]) -> float:
+    """Right edge of the source Phase 3 grid inferred from header spacing."""
+    spacing = (headers[3] - headers[1]) / 2.0
+    return headers[3] + spacing / 2.0
+
+
+def _asset_lines(
+    lines: List[Dict[str, Any]],
+    headers: Dict[int, float],
+    header_y: float,
+    page_h: float,
+) -> List[Dict[str, Any]]:
+    """Return left-column programme labels only.
+
+    The long indication heading is centred over the right panel, so its x0 is
+    not a safe left/right boundary. Programme names consistently start left of
+    the Phase 1 header centre; use that source geometry instead.
+    """
+    left_cutoff = headers[1] - 8.0
+    candidates = []
+
     for line in lines:
         if not (header_y + 12 < line["yc"] < page_h - 45):
             continue
-        if line["x0"] >= indication_x - 25:
+        if line["x0"] >= left_cutoff:
             continue
+
         text = line["text"]
         if re.search(r"^PHASE\s*[123]$", text, re.I):
             continue
-        if re.search(r"UCB.?s Pipeline|Immunology|Neurology|Proprietary|Inspired by|Driven by|Facts & Figures", text, re.I):
+        if re.search(
+            r"UCB.?s Pipeline|Immunology|Neurology|Proprietary|Inspired by|Driven by|Facts & Figures",
+            text,
+            re.I,
+        ):
             continue
         if line["bold"] and len(text) >= 4:
-            out.append(line)
+            candidates.append(line)
 
-    # Asset labels may wrap; keep only the first bold line in each tight y cluster.
-    dedup: List[Dict[str, Any]] = []
-    for line in sorted(out, key=lambda x: x["yc"]):
-        if dedup and abs(line["yc"] - dedup[-1]["yc"]) < 8:
-            # Prefer the line with the earlier left edge and longer useful label.
-            if len(line["text"]) > len(dedup[-1]["text"]) and line["x0"] <= dedup[-1]["x0"] + 10:
-                dedup[-1] = line
+    # Merge wrapped labels such as glovadalen + mechanism on the following line.
+    groups: List[List[Dict[str, Any]]] = []
+    for line in sorted(candidates, key=lambda x: x["yc"]):
+        if groups and line["yc"] - groups[-1][-1]["yc"] <= 13.0:
+            groups[-1].append(line)
+        else:
+            groups.append([line])
+
+    out: List[Dict[str, Any]] = []
+    for group in groups:
+        ordered = sorted(group, key=lambda x: (x["yc"], x["x0"]))
+        text = clean(" ".join(x["text"] for x in ordered))
+        if not text:
             continue
-        dedup.append(line)
-    return dedup
+        out.append({
+            "text": text,
+            "x0": min(x["x0"] for x in ordered),
+            "y0": min(x["y0"] for x in ordered),
+            "x1": max(x["x1"] for x in ordered),
+            "y1": max(x["y1"] for x in ordered),
+            "yc": sum(x["yc"] for x in ordered) / len(ordered),
+            "bold": True,
+            "size": max(x["size"] for x in ordered),
+        })
+    return out
 
 
 def _bar_right_edge(page: fitz.Page, y: float, indication_x: float) -> Optional[float]:
@@ -289,12 +328,17 @@ async def extract_ucb_pipeline(
     page = doc[0]
     lines = _line_items(page)
     headers = _phase_headers(lines)
-    indication_x = _indication_start(lines)
+    heading_indication_x = _indication_start(lines)
+    indication_x = (
+        _phase_grid_right(headers) + 12.0
+        if set(headers) == {1, 2, 3}
+        else None
+    )
     issues: List[Dict[str, Any]] = []
 
     if set(headers) != {1, 2, 3}:
         issues.append({"issue": f"phase headers unresolved: {headers}"})
-    if indication_x is None:
+    if heading_indication_x is None:
         issues.append({"issue": "Indication / Planned Timelines header not found"})
 
     rows: List[Dict[str, Any]] = []
@@ -305,7 +349,7 @@ async def extract_ucb_pipeline(
             line["yc"] for line in lines
             if re.fullmatch(r"PHASE\s*[123]", line["text"], re.I)
         )
-        assets = _asset_lines(lines, indication_x, header_y, page.rect.height)
+        assets = _asset_lines(lines, headers, header_y, page.rect.height)
 
         centers = [a["yc"] for a in assets]
         for idx, asset_line in enumerate(assets):
@@ -373,6 +417,7 @@ async def extract_ucb_pipeline(
             {
                 "phaseHeaders": headers,
                 "indicationStartX": indication_x,
+                "headingIndicationX": heading_indication_x,
                 "lineSample": [
                     {
                         "text": x["text"],
@@ -408,6 +453,7 @@ async def extract_ucb_pipeline(
         "exactDuplicates": 0,
         "phaseHeaderCenters": headers,
         "indicationStartX": indication_x,
+        "headingIndicationX": heading_indication_x,
         "unresolvedSample": unresolved_assets[:12],
         "portfolioDependentValidation": False,
         "retrievalMode": "STATIC_DOCUMENT",
@@ -480,18 +526,24 @@ async def ucb_pipeline_probe() -> Dict[str, Any]:
     page = doc[0]
     lines = _line_items(page)
     headers = _phase_headers(lines)
-    indication_x = _indication_start(lines)
+    heading_indication_x = _indication_start(lines)
+    indication_x = (
+        _phase_grid_right(headers) + 12.0
+        if set(headers) == {1, 2, 3}
+        else None
+    )
     header_y = min(
         (line["yc"] for line in lines if re.fullmatch(r"PHASE\\s*[123]", line["text"], re.I)),
         default=0,
     )
-    assets = _asset_lines(lines, indication_x or page.rect.width, header_y, page.rect.height)
+    assets = _asset_lines(lines, headers, header_y, page.rect.height) if set(headers) == {1, 2, 3} else []
     return {
         "ok": True,
         "version": ADAPTER_PROFILE,
         "page": {"width": page.rect.width, "height": page.rect.height},
         "phaseHeaders": headers,
         "indicationStartX": indication_x,
+        "headingIndicationX": heading_indication_x,
         "assetCandidates": assets,
         "lines": lines,
         "drawings": [

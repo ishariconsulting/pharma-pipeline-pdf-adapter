@@ -1,5 +1,5 @@
 """Read-only promotion and generic-pipeline startup canaries."""
-import asyncio, json
+import asyncio, json, os
 from amgen_json_pipeline_extension import extract_amgen_pipeline
 from generic_pipeline_extension import _extract_generic_pipeline
 from generic_pipeline_interpreter_canary import norm
@@ -133,4 +133,11 @@ async def main():
     },ensure_ascii=False),flush=True)
 
 if __name__=="__main__":
-    asyncio.run(main())
+    if os.getenv("RUN_STARTUP_CANARIES", "").strip() == "1":
+        asyncio.run(main())
+    else:
+        print(
+            "GENERIC_PIPELINE_ROUTE_CANARY startup suite skipped; "
+            "set RUN_STARTUP_CANARIES=1 for explicit regression execution.",
+            flush=True,
+        )

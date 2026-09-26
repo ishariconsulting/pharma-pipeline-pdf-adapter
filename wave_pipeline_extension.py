@@ -12,6 +12,7 @@ No Airtable or master-data writes.
 """
 from __future__ import annotations
 
+import asyncio
 import os
 import re
 from typing import Any, Dict, List, Optional
@@ -25,7 +26,7 @@ from html_fetch_extension import _assert_public_http_url
 
 
 ADAPTER_PROFILE = "PIPELINE_WAVE_BROWSER_LAYOUT_V1"
-ROUTE_VERSION = "WAVE_BROWSER_LAYOUT_PIPELINE_V1.0_READ_ONLY"
+ROUTE_VERSION = "WAVE_BROWSER_LAYOUT_PIPELINE_V1.1_BROWSER_WARM_RETRY_READ_ONLY"
 DEFAULT_SOURCE_URL = "https://wavelifesciences.com/pipeline/research-and-development/"
 MIN_NAMED_ROWS = 4
 MAX_NAMED_ROWS = 20
@@ -67,38 +68,83 @@ async def _fetch_layout(source_url: str, timeout_seconds: float) -> Dict[str, An
         raise HTTPException(status_code=502, detail="Wave browser retrieval is required but not configured")
 
     endpoint = f"{base}/fetch/browser"
-    try:
-        async with httpx.AsyncClient(
-            timeout=httpx.Timeout(timeout_seconds + 15.0, connect=12.0),
-            follow_redirects=False,
-        ) as client:
-            response = await client.get(
-                endpoint,
-                params={
-                    "url": source_url,
-                    "timeout_seconds": timeout_seconds,
-                    "include_layout": "true",
-                },
-                headers={
-                    "X-Browser-Key": key,
-                    "Accept": "application/json",
-                },
+
+    # Browser retrieval may itself run on a sleeping Render instance. Warm it
+    # first, then allow one bounded retry for transient proxy/cold-start
+    # failures. Source-level failures still fail closed.
+    timeout = httpx.Timeout(timeout_seconds + 15.0, connect=12.0)
+    last_error = None
+    response = None
+    payload = None
+
+    async with httpx.AsyncClient(timeout=timeout, follow_redirects=False) as client:
+        try:
+            await client.get(
+                f"{base}/health",
+                headers={"X-Browser-Key": key, "Accept": "application/json"},
             )
-    except httpx.TimeoutException as exc:
-        raise HTTPException(status_code=504, detail="Wave browser retrieval timed out") from exc
-    except httpx.HTTPError as exc:
-        raise HTTPException(status_code=502, detail=f"Wave browser retrieval failed: {exc}") from exc
+        except Exception:
+            pass
 
-    try:
-        payload = response.json()
-    except Exception as exc:
-        raise HTTPException(status_code=502, detail="Wave browser retrieval returned invalid JSON") from exc
+        for attempt in range(1, 3):
+            try:
+                response = await client.get(
+                    endpoint,
+                    params={
+                        "url": source_url,
+                        "timeout_seconds": timeout_seconds,
+                        "include_layout": "true",
+                    },
+                    headers={
+                        "X-Browser-Key": key,
+                        "Accept": "application/json",
+                    },
+                )
+            except httpx.TimeoutException:
+                last_error = "Wave browser retrieval timed out"
+                if attempt < 2:
+                    await asyncio.sleep(1.0)
+                    continue
+                raise HTTPException(status_code=504, detail=last_error)
+            except httpx.HTTPError as exc:
+                last_error = f"Wave browser retrieval failed: {exc}"
+                if attempt < 2:
+                    await asyncio.sleep(1.0)
+                    continue
+                raise HTTPException(status_code=502, detail=last_error) from exc
 
-    if response.status_code >= 400:
-        raise HTTPException(
-            status_code=502,
-            detail=f"Wave browser retrieval failed: HTTP {response.status_code}; {clean(payload.get('detail'))}",
-        )
+            try:
+                parsed_payload = response.json()
+                payload = parsed_payload if isinstance(parsed_payload, dict) else None
+            except Exception:
+                payload = None
+
+            source_denial = False
+            if payload:
+                source_denial = "source returned http" in clean(payload.get("detail")).lower()
+
+            if (
+                payload is not None
+                and response.status_code < 400
+            ):
+                break
+
+            last_error = (
+                f"Wave browser retrieval returned invalid JSON HTTP {response.status_code}"
+                if payload is None
+                else f"Wave browser retrieval failed: HTTP {response.status_code}; {clean(payload.get('detail'))}"
+            )
+            if (
+                attempt < 2
+                and not source_denial
+                and response.status_code in {408, 429, 500, 502, 503, 504}
+            ):
+                await asyncio.sleep(1.0)
+                continue
+            raise HTTPException(status_code=502, detail=last_error)
+
+    if response is None or payload is None:
+        raise HTTPException(status_code=502, detail=last_error or "Wave browser retrieval failed")
 
     if not isinstance(payload.get("layoutTextNodes"), list):
         raise HTTPException(status_code=502, detail="Wave browser layout payload is missing layoutTextNodes")

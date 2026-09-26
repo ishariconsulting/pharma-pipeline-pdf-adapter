@@ -9,6 +9,7 @@ pipeline extraction. No master-data or production automation write paths are add
 from html_fetch_extension import app  # noqa: F401
 import routed_html_extension  # noqa: E402,F401
 import astrazeneca_staging_export  # noqa: E402,F401
+import astrazeneca_common_contract_extension  # noqa: E402,F401
 import lilly_static_extension  # noqa: E402,F401
 import bms_pipeline_extension_v3  # noqa: E402,F401
 import bms_pipeline_extension_v4  # noqa: E402,F401

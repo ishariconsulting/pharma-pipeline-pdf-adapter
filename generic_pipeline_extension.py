@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+import re
 from typing import Any, Dict, List, Optional
 from urllib.parse import urljoin
 
@@ -37,7 +38,7 @@ from generic_pipeline_interpreter_canary import (
 
 
 ADAPTER_PROFILE = "PIPELINE_GENERIC_HTML_V1"
-ROUTE_VERSION = "GENERIC_PIPELINE_EXTRACTION_V1.2.2_BROWSER_TRANSIENT_RETRY_READ_ONLY"
+ROUTE_VERSION = "GENERIC_PIPELINE_EXTRACTION_V1.2.3_SPARSE_TEXT_BROWSER_ROUTING_READ_ONLY"
 
 
 class GenericPipelineExtractionResponse(BaseModel):
@@ -147,6 +148,24 @@ async def _fetch_raw_public_html(
     await _assert_public_http_url(final_url)
 
     return response.text, final_url
+
+
+def _visible_text_length(raw_html: str) -> int:
+    """Approximate useful server-rendered text before parser interpretation.
+
+    Modern JS sites can return HTTP 200 with a large HTML/script shell but almost
+    no user-visible content. Treat that as sparse server HTML so the existing
+    bounded Playwright route gets one chance to recover the rendered pipeline.
+    """
+    text = raw_html or ""
+    text = re.sub(
+        r"(?is)<(?:script|style|noscript|svg)\\b[^>]*>.*?</(?:script|style|noscript|svg)>",
+        " ",
+        text,
+    )
+    text = re.sub(r"(?s)<[^>]+>", " ", text)
+    text = re.sub(r"\\s+", " ", text).strip()
+    return len(text)
 
 
 def _browser_config() -> tuple[str, str]:
@@ -319,7 +338,14 @@ async def _extract_generic_pipeline(
         # response (typical JS shell) or the bounded transport failures handled
         # in the HTTPException path below.
         direct_visible_lines = int(diagnostics.get("visibleLineCount") or 0)
-        if not validation.get("pass") and direct_visible_lines < 20:
+        direct_visible_text_length = _visible_text_length(raw_html)
+        if (
+            not validation.get("pass")
+            and (
+                direct_visible_lines < 20
+                or direct_visible_text_length < 800
+            )
+        ):
             base, key = _browser_config()
             if base and key:
                 routing_reason = "SPARSE_SERVER_HTML"
@@ -385,6 +411,11 @@ async def _extract_generic_pipeline(
                 else 0
             ),
             "directFailure": direct_failure,
+            "directVisibleTextLength": (
+                direct_visible_text_length
+                if "direct_visible_text_length" in locals()
+                else None
+            ),
             "portfolioDependentValidation": False,
         }
     )

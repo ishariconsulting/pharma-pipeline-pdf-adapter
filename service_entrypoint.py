@@ -15,6 +15,7 @@ import bms_pipeline_extension_v3  # noqa: E402,F401
 import bms_pipeline_extension_v4  # noqa: E402,F401
 import generic_pipeline_extension  # noqa: E402,F401
 import teva_pipeline_extension  # noqa: E402,F401
+import ucb_pipeline_extension  # noqa: E402,F401
 import generic_xlsx_pipeline_extension  # noqa: E402,F401
 import generic_pdf_grid_pipeline_extension  # noqa: E402,F401
 import generic_pdf_pipeline_extension  # noqa: E402,F401

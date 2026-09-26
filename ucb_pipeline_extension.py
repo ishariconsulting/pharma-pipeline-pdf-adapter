@@ -439,3 +439,40 @@ async def ucb_pipeline_health() -> Dict[str, Any]:
         "sourceUrl": SOURCE_URL,
         "readOnly": True,
     }
+
+
+@app.get("/extract/ucb/pipeline/probe")
+async def ucb_pipeline_probe() -> Dict[str, Any]:
+    """Fixed-source geometry diagnostic for parser validation; read-only."""
+    data = await download_pdf(35.0)
+    doc = fitz.open(stream=data, filetype="pdf")
+    page = doc[0]
+    lines = _line_items(page)
+    headers = _phase_headers(lines)
+    indication_x = _indication_start(lines)
+    header_y = min(
+        (line["yc"] for line in lines if re.fullmatch(r"PHASE\\s*[123]", line["text"], re.I)),
+        default=0,
+    )
+    assets = _asset_lines(lines, indication_x or page.rect.width, header_y, page.rect.height)
+    return {
+        "ok": True,
+        "version": ADAPTER_PROFILE,
+        "page": {"width": page.rect.width, "height": page.rect.height},
+        "phaseHeaders": headers,
+        "indicationStartX": indication_x,
+        "assetCandidates": assets,
+        "lines": lines,
+        "drawings": [
+            {
+                "rect": [d["rect"].x0, d["rect"].y0, d["rect"].x1, d["rect"].y1]
+                if d.get("rect") is not None else None,
+                "fill": d.get("fill"),
+                "width": d["rect"].width if d.get("rect") is not None else None,
+                "height": d["rect"].height if d.get("rect") is not None else None,
+            }
+            for d in page.get_drawings()
+            if d.get("rect") is not None
+        ][:250],
+        "readOnly": True,
+    }

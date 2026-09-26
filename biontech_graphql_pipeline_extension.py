@@ -22,11 +22,12 @@ from generic_pipeline_interpreter_canary import phase_canonical
 
 
 ADAPTER_PROFILE="PIPELINE_BIONTECH_AEM_GRAPHQL_V1"
-ROUTE_VERSION="BIONTECH_AEM_GRAPHQL_PIPELINE_V1.0_READ_ONLY"
+ROUTE_VERSION="BIONTECH_AEM_GRAPHQL_PIPELINE_V1.1_SOURCE_OR_MACHINE_URL_READ_ONLY"
 MIN_ROWS=8
 MAX_BYTES=8_000_000
 
 DEFAULT_SOURCE_URL="https://www.biontech.com/int/en/home/pipeline-and-products/pipeline.html"
+ALT_SOURCE_URL="https://www.biontech.com/us/en/home/pipeline-and-products/pipeline.html"
 
 PIPELINE_QUERY=r"""
 query GetPipelineContent($pipelinePath: String!, $directoryPath: ID!) {
@@ -241,23 +242,51 @@ async def extract_biontech_pipeline(
             follow_redirects=True,
             headers=headers,
         ) as client:
-            page=await client.get(source_url)
-            if page.status_code!=200:
-                raise HTTPException(status_code=502,detail=f"BioNTech pipeline page returned HTTP {page.status_code}")
-            total_bytes+=len(page.content)
-            if total_bytes>MAX_BYTES:
-                raise HTTPException(status_code=413,detail="BioNTech pipeline source exceeds size limit")
+            # Source Watch may hold either the public pipeline page or the
+            # first-party GraphQL machine endpoint. This source-specific adapter
+            # accepts both. The public page remains the authority for current
+            # content-fragment paths; the stored machine URL can be reused as
+            # the POST endpoint after those paths are resolved.
+            source_is_graphql = "/_cq_graphql/" in source_url or source_url.lower().endswith("endpoint.json")
+            page_candidates=[]
+            for candidate in (
+                DEFAULT_SOURCE_URL if source_is_graphql else source_url,
+                DEFAULT_SOURCE_URL,
+                ALT_SOURCE_URL,
+            ):
+                if candidate and candidate not in page_candidates:
+                    page_candidates.append(candidate)
+
+            page=None
+            config={}
+            attempts=[]
+            for candidate in page_candidates:
+                await _assert_public_http_url(candidate)
+                candidate_page=await client.get(candidate)
+                attempts.append({"url":candidate,"status":candidate_page.status_code})
+                if candidate_page.status_code!=200:
+                    continue
+                total_bytes+=len(candidate_page.content)
+                if total_bytes>MAX_BYTES:
+                    raise HTTPException(status_code=413,detail="BioNTech pipeline source exceeds size limit")
+                candidate_config=_extract_config(candidate_page.text)
+                if candidate_config.get("_pipelineCfRef") and candidate_config.get("_pipelineDirectoryRef"):
+                    page=candidate_page
+                    config=candidate_config
+                    break
+
+            if page is None:
+                detail=", ".join(f"{x['url']}={x['status']}" for x in attempts)
+                raise HTTPException(status_code=502,detail=f"BioNTech pipeline page/config unavailable ({detail})")
+
             final_url=str(page.url)
             await _assert_public_http_url(final_url)
 
-            config=_extract_config(page.text)
             pipeline_path=clean(config.get("_pipelineCfRef"))
             directory_path=clean(config.get("_pipelineDirectoryRef"))
-            if not pipeline_path or not directory_path:
-                raise HTTPException(status_code=422,detail="BioNTech pipeline component refs not found")
 
             parsed=urlparse(final_url)
-            endpoint=f"{parsed.scheme}://{parsed.netloc}/content/_cq_graphql/pipeline-v2/endpoint.json"
+            endpoint=source_url if source_is_graphql else f"{parsed.scheme}://{parsed.netloc}/content/_cq_graphql/pipeline-v2/endpoint.json"
             await _assert_public_http_url(endpoint)
 
             response=await client.post(

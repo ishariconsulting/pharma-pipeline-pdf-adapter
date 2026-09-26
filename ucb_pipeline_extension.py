@@ -11,6 +11,7 @@ Read-only. No Airtable or master-data writes.
 from __future__ import annotations
 
 import hashlib
+import json
 import re
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -366,6 +367,36 @@ async def extract_ucb_pipeline(
         issues.append({"issue": f"too few structured rows: {len(rows)} < 4"})
     if unresolved_assets:
         issues.append({"issue": f"{len(unresolved_assets)} programme rows unresolved"})
+
+    print(
+        "UCB_PIPELINE_DIAG " + json.dumps(
+            {
+                "phaseHeaders": headers,
+                "indicationStartX": indication_x,
+                "lineSample": [
+                    {
+                        "text": x["text"],
+                        "x0": round(x["x0"], 1),
+                        "x1": round(x["x1"], 1),
+                        "yc": round(x["yc"], 1),
+                        "bold": x["bold"],
+                    }
+                    for x in lines
+                ],
+                "unresolvedAssets": unresolved_assets,
+                "rows": [
+                    {
+                        "asset": r["asset"],
+                        "indication": r["indication"],
+                        "phase": r["phase"],
+                    }
+                    for r in rows
+                ],
+            },
+            ensure_ascii=False,
+        ),
+        flush=True,
+    )
 
     structural_pass = not issues
     diagnostics = {

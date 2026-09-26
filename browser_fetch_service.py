@@ -22,7 +22,7 @@ from pydantic import BaseModel
 from playwright.async_api import Browser, BrowserContext, Page, async_playwright
 
 
-BROWSER_FETCH_VERSION = "BROWSER_RETRIEVAL_V1.1_STRUCTURED_DOM"
+BROWSER_FETCH_VERSION = "BROWSER_RETRIEVAL_V1.2_STRUCTURED_DOM_EXPAND"
 MAX_VISIBLE_TEXT = 200_000
 MAX_HTML_BYTES = 2_500_000
 MAX_ANCHORS = 400
@@ -62,6 +62,8 @@ class BrowserFetchResponse(BaseModel):
     anchors: List[Dict[str, str]]
     transport: str = "PLAYWRIGHT_CHROMIUM"
     retrievalMode: str = "BROWSER_REQUIRED"
+    expansionClicks: int = 0
+    layoutTextNodes: List[Dict[str, Any]] = []
 
 
 def _auth(x_browser_key: Optional[str]) -> None:
@@ -158,7 +160,13 @@ async def _install_request_guard(page: Page) -> None:
     await page.route("**/*", guard)
 
 
-async def _extract_rendered(page: Page, source_url: str, response_status: int) -> BrowserFetchResponse:
+async def _extract_rendered(
+    page: Page,
+    source_url: str,
+    response_status: int,
+    expansion_clicks: int = 0,
+    include_layout: bool = False,
+) -> BrowserFetchResponse:
     raw_html = await page.content()
     encoded = raw_html.encode("utf-8", errors="ignore")
     if len(encoded) > MAX_HTML_BYTES:
@@ -240,6 +248,65 @@ async def _extract_rendered(page: Page, source_url: str, response_status: int) -
         MAX_ANCHORS * 2,
     )
 
+    layout_text_nodes: List[Dict[str, Any]] = []
+    if include_layout:
+        try:
+            layout_text_nodes = await page.evaluate(
+                """(limit) => {
+                  const nodes = [];
+                  const all = Array.from(document.querySelectorAll('body *'));
+                  for (const el of all) {
+                    if (nodes.length >= limit) break;
+                    const style = window.getComputedStyle(el);
+                    if (!style || style.display === 'none' || style.visibility === 'hidden') continue;
+                    const rect = el.getBoundingClientRect();
+                    if (!rect || rect.width <= 0 || rect.height <= 0) continue;
+                    const ownText = Array.from(el.childNodes)
+                      .filter(n => n.nodeType === Node.TEXT_NODE)
+                      .map(n => n.textContent || '')
+                      .join(' ')
+                      .replace(/\\s+/g, ' ')
+                      .trim();
+                    const className = String(el.className || '');
+                    const id = String(el.id || '');
+                    const styleAttr = String(el.getAttribute('style') || '');
+                    const structural = /(pipeline|stage|phase|progress|bar|track|clinical|discovery|cta|ind|grid|row|column)/i.test(
+                      className + ' ' + id + ' ' + styleAttr
+                    );
+                    const rowAncestor = el.closest ? el.closest('.rows') : null;
+                    const inPipelineRow = !!rowAncestor;
+                    if (!ownText && !structural && !inPipelineRow) continue;
+                    nodes.push({
+                      tag: (el.tagName || '').toLowerCase(),
+                      text: ownText.slice(0, 500),
+                      x: Math.round(rect.x * 10) / 10,
+                      y: Math.round(rect.y * 10) / 10,
+                      width: Math.round(rect.width * 10) / 10,
+                      height: Math.round(rect.height * 10) / 10,
+                      className: className.slice(0, 300),
+                      id: id.slice(0, 160),
+                      style: styleAttr.slice(0, 500),
+                      ariaLabel: String(el.getAttribute('aria-label') || '').slice(0, 240),
+                      role: String(el.getAttribute('role') || '').slice(0, 120),
+                      display: String(style.display || ''),
+                      position: String(style.position || ''),
+                      left: String(style.left || ''),
+                      right: String(style.right || ''),
+                      gridColumnStart: String(style.gridColumnStart || ''),
+                      gridColumnEnd: String(style.gridColumnEnd || ''),
+                      transform: String(style.transform || ''),
+                      backgroundColor: String(style.backgroundColor || ''),
+                      inPipelineRow: inPipelineRow,
+                      parentClassName: String((el.parentElement && el.parentElement.className) || '').slice(0, 300),
+                    });
+                  }
+                  return nodes;
+                }""",
+                1800,
+            )
+        except Exception:
+            layout_text_nodes = []
+
     anchors: List[Dict[str, str]] = []
     seen = set()
     for item in raw_anchors:
@@ -273,10 +340,61 @@ async def _extract_rendered(page: Page, source_url: str, response_status: int) -
         tables=tables,
         headings=headings,
         anchors=anchors,
+        expansionClicks=expansion_clicks,
+        layoutTextNodes=layout_text_nodes,
     )
 
 
-async def _browser_fetch(url: str, timeout_seconds: float = DEFAULT_TIMEOUT_SECONDS) -> BrowserFetchResponse:
+async def _expand_load_more_buttons(page: Page, max_clicks: int = 30) -> int:
+    """Expand read-only cards hidden behind literal Load more buttons."""
+    clicks = 0
+    unchanged = 0
+
+    for _ in range(max_clicks):
+        locator = page.get_by_role(
+            "button",
+            name=re.compile(r"^\s*load\s+more\s*$", re.I),
+        )
+        count = await locator.count()
+        target = None
+        for idx in range(min(count, 12)):
+            candidate = locator.nth(idx)
+            try:
+                if await candidate.is_visible():
+                    target = candidate
+                    break
+            except Exception:
+                continue
+
+        if target is None:
+            break
+
+        try:
+            before = await page.locator("body").inner_text(timeout=3_000)
+            await target.scroll_into_view_if_needed(timeout=2_000)
+            await target.click(timeout=3_000)
+            clicks += 1
+            await page.wait_for_timeout(650)
+            after = await page.locator("body").inner_text(timeout=3_000)
+        except Exception:
+            break
+
+        if len(after or "") <= len(before or ""):
+            unchanged += 1
+            if unchanged >= 2:
+                break
+        else:
+            unchanged = 0
+
+    return clicks
+
+
+async def _browser_fetch(
+    url: str,
+    timeout_seconds: float = DEFAULT_TIMEOUT_SECONDS,
+    expand_load_more: bool = False,
+    include_layout: bool = False,
+) -> BrowserFetchResponse:
     await _assert_public_http_url(url)
     timeout_ms = int(timeout_seconds * 1000)
 
@@ -318,7 +436,16 @@ async def _browser_fetch(url: str, timeout_seconds: float = DEFAULT_TIMEOUT_SECO
                 pass
 
             await page.wait_for_timeout(1_000)
-            return await _extract_rendered(page, url, status)
+            expansion_clicks = 0
+            if expand_load_more:
+                expansion_clicks = await _expand_load_more_buttons(page)
+            return await _extract_rendered(
+                page,
+                url,
+                status,
+                expansion_clicks=expansion_clicks,
+                include_layout=include_layout,
+            )
         finally:
             if context is not None:
                 await context.close()
@@ -339,10 +466,17 @@ async def health() -> Dict[str, Any]:
 async def fetch_browser(
     url: str = Query(..., min_length=8),
     timeout_seconds: float = Query(DEFAULT_TIMEOUT_SECONDS, ge=5.0, le=35.0),
+    expand_load_more: bool = Query(default=False),
+    include_layout: bool = Query(default=False),
     x_browser_key: Optional[str] = Header(default=None),
 ) -> BrowserFetchResponse:
     _auth(x_browser_key)
-    return await _browser_fetch(url, timeout_seconds=timeout_seconds)
+    return await _browser_fetch(
+        url,
+        timeout_seconds=timeout_seconds,
+        expand_load_more=expand_load_more,
+        include_layout=include_layout,
+    )
 
 
 async def _run_canary(url: str, expected_terms: List[str]) -> Dict[str, Any]:
@@ -394,3 +528,278 @@ async def canary_bayer() -> Dict[str, Any]:
         BAYER_CANARY_URL,
         ["pipeline", "phase"],
     )
+
+
+async def _browser_dom_context(
+    url: str,
+    terms: List[str],
+    timeout_seconds: float = DEFAULT_TIMEOUT_SECONDS,
+) -> Dict[str, Any]:
+    """Read-only bounded DOM context for source-structure diagnostics."""
+    await _assert_public_http_url(url)
+    timeout_ms = int(timeout_seconds * 1000)
+
+    clean_terms = []
+    for raw in terms[:12]:
+        term = re.sub(r"\s+", " ", str(raw or "")).strip()
+        if term and len(term) <= 160:
+            clean_terms.append(term)
+    if not clean_terms:
+        raise HTTPException(status_code=400, detail="At least one inspect term is required")
+
+    async with async_playwright() as pw:
+        browser: Browser = await pw.chromium.launch(
+            headless=True,
+            args=["--no-sandbox", "--disable-dev-shm-usage", "--disable-gpu"],
+        )
+        context: Optional[BrowserContext] = None
+        try:
+            context = await browser.new_context(
+                user_agent=(
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                    "AppleWebKit/537.36 (KHTML, like Gecko) "
+                    "Chrome/124.0.0.0 Safari/537.36"
+                ),
+                locale="en-GB",
+                viewport={"width": 1365, "height": 900},
+                java_script_enabled=True,
+            )
+            page = await context.new_page()
+            await _install_request_guard(page)
+            try:
+                response = await page.goto(url, wait_until="domcontentloaded", timeout=timeout_ms)
+            except Exception as exc:
+                raise HTTPException(status_code=504, detail=f"Browser navigation failed: {type(exc).__name__}") from exc
+            if response is None:
+                raise HTTPException(status_code=502, detail="Browser navigation returned no document response")
+            if int(response.status) >= 400:
+                raise HTTPException(status_code=502, detail=f"Browser source returned HTTP {int(response.status)}")
+            try:
+                await page.wait_for_load_state("networkidle", timeout=min(10_000, timeout_ms))
+            except Exception:
+                pass
+            await page.wait_for_timeout(1_000)
+
+            result = await page.evaluate(
+                """(terms) => {
+                  const norm = (s) => (s || '').replace(/\\s+/g,' ').trim();
+                  const attrs = (el) => {
+                    const out = {};
+                    for (const a of Array.from(el.attributes || [])) {
+                      if (
+                        a.name === 'class' || a.name === 'id' || a.name === 'style' ||
+                        a.name.startsWith('data-') || a.name.startsWith('aria-') ||
+                        a.name === 'role'
+                      ) out[a.name] = (a.value || '').slice(0,500);
+                    }
+                    return out;
+                  };
+                  const node = (el) => {
+                    const cs = getComputedStyle(el);
+                    const r = el.getBoundingClientRect();
+                    return {
+                      tag: el.tagName.toLowerCase(),
+                      text: norm(el.innerText || el.textContent || '').slice(0,500),
+                      attrs: attrs(el),
+                      computed: {
+                        display: cs.display,
+                        position: cs.position,
+                        width: cs.width,
+                        left: cs.left,
+                        right: cs.right,
+                        gridColumn: cs.gridColumn,
+                        gridRow: cs.gridRow,
+                        transform: cs.transform
+                      },
+                      rect: {
+                        x: Math.round(r.x * 10) / 10,
+                        y: Math.round(r.y * 10) / 10,
+                        width: Math.round(r.width * 10) / 10,
+                        height: Math.round(r.height * 10) / 10
+                      }
+                    };
+                  };
+                  const all = Array.from(document.querySelectorAll('body *'));
+                  const results = [];
+                  for (const term of terms) {
+                    const low = term.toLowerCase();
+                    const exact = all.filter(el => norm(el.innerText || el.textContent || '').toLowerCase() === low);
+                    const pool = exact.length ? exact : all.filter(el => {
+                      const t = norm(el.innerText || el.textContent || '').toLowerCase();
+                      return t && t.includes(low) && t.length <= Math.max(300, low.length * 8);
+                    });
+                    const matches = [];
+                    for (const el of pool.slice(0,4)) {
+                      const ancestors = [];
+                      let p = el.parentElement;
+                      for (let depth=0; p && depth<7; depth++, p=p.parentElement) ancestors.push(node(p));
+                      const parent = el.parentElement;
+                      const siblings = parent ? Array.from(parent.children).slice(0,30).map(node) : [];
+                      matches.push({element: node(el), ancestors, siblings});
+                    }
+                    results.push({term, matches});
+                  }
+                  return results;
+                }""",
+                clean_terms,
+            )
+            return {
+                "ok": True,
+                "version": BROWSER_FETCH_VERSION,
+                "sourceUrl": url,
+                "finalUrl": page.url,
+                "terms": clean_terms,
+                "contexts": result,
+                "readOnly": True,
+            }
+        finally:
+            if context is not None:
+                await context.close()
+            await browser.close()
+
+
+@app.get("/diagnostic/dom-context")
+async def diagnostic_dom_context(
+    url: str = Query(..., min_length=8),
+    terms: str = Query(..., min_length=1, max_length=1000),
+    timeout_seconds: float = Query(DEFAULT_TIMEOUT_SECONDS, ge=5.0, le=35.0),
+    x_browser_key: Optional[str] = Header(default=None),
+) -> Dict[str, Any]:
+    _auth(x_browser_key)
+    return await _browser_dom_context(
+        url,
+        [x for x in terms.split("|") if x.strip()],
+        timeout_seconds=timeout_seconds,
+    )
+
+
+async def _browser_network_sources(
+    url: str,
+    timeout_seconds: float = DEFAULT_TIMEOUT_SECONDS,
+) -> Dict[str, Any]:
+    """Capture bounded public network response metadata to discover page data sources."""
+    await _assert_public_http_url(url)
+    timeout_ms = int(timeout_seconds * 1000)
+    captured: List[Dict[str, Any]] = []
+
+    async with async_playwright() as pw:
+        browser: Browser = await pw.chromium.launch(
+            headless=True,
+            args=["--no-sandbox", "--disable-dev-shm-usage", "--disable-gpu"],
+        )
+        context: Optional[BrowserContext] = None
+        try:
+            context = await browser.new_context(
+                user_agent=(
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                    "AppleWebKit/537.36 (KHTML, like Gecko) "
+                    "Chrome/124.0.0.0 Safari/537.36"
+                ),
+                locale="en-GB",
+                viewport={"width": 1365, "height": 900},
+                java_script_enabled=True,
+            )
+            page = await context.new_page()
+            await _install_request_guard(page)
+
+            async def on_response(response) -> None:
+                if len(captured) >= 160:
+                    return
+                try:
+                    req = response.request
+                    rtype = str(req.resource_type or "")
+                    ctype = str((response.headers or {}).get("content-type") or "")
+                    rurl = str(response.url or "")
+                    low = (rurl + " " + ctype).lower()
+                    interesting = (
+                        rtype in {"xhr", "fetch"}
+                        or "json" in ctype.lower()
+                        or any(token in low for token in (
+                            "api", "graphql", "pipeline", "content", "ajax",
+                            "json", "search", "query", "data"
+                        ))
+                    )
+                    if not interesting:
+                        return
+                    item = {
+                        "url": rurl[:1200],
+                        "status": int(response.status),
+                        "resourceType": rtype,
+                        "contentType": ctype[:200],
+                    }
+                    if (
+                        int(response.status) < 400
+                        and len(captured) < 80
+                        and any(x in ctype.lower() for x in ("json", "text/plain", "text/html"))
+                    ):
+                        try:
+                            body = await response.text()
+                            item["bodyHead"] = re.sub(r"\s+", " ", body or "").strip()[:1200]
+                        except Exception:
+                            pass
+                    captured.append(item)
+                except Exception:
+                    return
+
+            page.on("response", on_response)
+            try:
+                response = await page.goto(url, wait_until="domcontentloaded", timeout=timeout_ms)
+            except Exception as exc:
+                raise HTTPException(
+                    status_code=504,
+                    detail=f"Browser navigation failed: {type(exc).__name__}",
+                ) from exc
+            if response is None:
+                raise HTTPException(status_code=502, detail="Browser navigation returned no document response")
+            if int(response.status) >= 400:
+                raise HTTPException(
+                    status_code=502,
+                    detail=f"Browser source returned HTTP {int(response.status)}",
+                )
+            try:
+                await page.wait_for_load_state("networkidle", timeout=min(12_000, timeout_ms))
+            except Exception:
+                pass
+            await page.wait_for_timeout(2_000)
+
+            try:
+                visible = await page.locator("body").inner_text(timeout=3_000)
+            except Exception:
+                visible = ""
+
+            # Dedupe exact URL/status/type tuples while preserving order.
+            deduped: List[Dict[str, Any]] = []
+            seen = set()
+            for item in captured:
+                key = (item.get("url"), item.get("status"), item.get("resourceType"))
+                if key in seen:
+                    continue
+                seen.add(key)
+                deduped.append(item)
+
+            return {
+                "ok": True,
+                "version": BROWSER_FETCH_VERSION,
+                "sourceUrl": url,
+                "finalUrl": page.url,
+                "documentStatus": int(response.status),
+                "title": (await page.title()).strip() or None,
+                "visibleTextLength": len((visible or "").strip()),
+                "responses": deduped[:120],
+                "responseCount": len(deduped),
+                "readOnly": True,
+            }
+        finally:
+            if context is not None:
+                await context.close()
+            await browser.close()
+
+
+@app.get("/diagnostic/network-sources")
+async def diagnostic_network_sources(
+    url: str = Query(..., min_length=8),
+    timeout_seconds: float = Query(DEFAULT_TIMEOUT_SECONDS, ge=5.0, le=35.0),
+    x_browser_key: Optional[str] = Header(default=None),
+) -> Dict[str, Any]:
+    _auth(x_browser_key)
+    return await _browser_network_sources(url, timeout_seconds=timeout_seconds)

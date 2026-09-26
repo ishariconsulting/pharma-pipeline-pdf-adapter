@@ -38,7 +38,7 @@ from generic_pipeline_interpreter_canary import (
 
 
 ADAPTER_PROFILE = "PIPELINE_GENERIC_HTML_V1"
-ROUTE_VERSION = "GENERIC_PIPELINE_EXTRACTION_V1.2.3_SPARSE_TEXT_BROWSER_ROUTING_READ_ONLY"
+ROUTE_VERSION = "GENERIC_PIPELINE_EXTRACTION_V1.2.4_BROWSER_ON_STRUCTURE_FAIL_READ_ONLY"
 
 
 class GenericPipelineExtractionResponse(BaseModel):
@@ -339,16 +339,17 @@ async def _extract_generic_pipeline(
         # in the HTTPException path below.
         direct_visible_lines = int(diagnostics.get("visibleLineCount") or 0)
         direct_visible_text_length = _visible_text_length(raw_html)
-        if (
-            not validation.get("pass")
-            and (
-                direct_visible_lines < 20
-                or direct_visible_text_length < 800
-            )
-        ):
+        if not validation.get("pass"):
             base, key = _browser_config()
             if base and key:
-                routing_reason = "SPARSE_SERVER_HTML"
+                routing_reason = (
+                    "SPARSE_SERVER_HTML"
+                    if (
+                        direct_visible_lines < 20
+                        or direct_visible_text_length < 800
+                    )
+                    else "DIRECT_STRUCTURE_BROWSER_RETRY"
+                )
                 browser = await _fetch_browser_structure(
                     source_url,
                     timeout_seconds,
@@ -369,8 +370,8 @@ async def _extract_generic_pipeline(
                     rows,
                     diagnostics,
                 )
-        elif not validation.get("pass"):
-            routing_reason = "DIRECT_STRUCTURE_UNSUPPORTED"
+            else:
+                routing_reason = "DIRECT_STRUCTURE_UNSUPPORTED_BROWSER_NOT_CONFIGURED"
 
     except HTTPException as exc:
         if not _browser_fallback_allowed(exc):

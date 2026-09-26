@@ -37,8 +37,10 @@ if (!sourceWatchRecordId) {
 }
 
 const SCRIPT_VERSION = "V3.77";
-// V3.77 preserves previously validated bindings during revalidation and only
-// persists auto-selected adapter/source changes after the candidate passes QA.
+// V3.77 preserves established/staged or previously PASSed bindings during
+// revalidation, and only persists auto-selected adapter/source changes after
+// the candidate passes QA. First-time / Not Established sources still receive
+// automatic source-format discovery and best-adapter selection.
 // It also retains the V3.74 stale-adapterIds crash fix from V3.76.
 // V3.77 fixes the V3.74 post-extraction crash caused by stale adapterIds
 // references after adapter auto-selection was moved to the Adapter Registry.
@@ -138,6 +140,7 @@ const SF = {
     bindingLastValidation: sourceWatch.getField("fldE0i0tBeGNrjZTf"),
     bindingNotes: sourceWatch.getField("fldcTmrWsJISL84xM"),
     bindingRequested: sourceWatch.getField("fldppv7xqxuS3C4i4"),
+    baselineStatus: sourceWatch.getField("fld9vSq9bAu28ETII"),
 };
 
 // ---------- ADAPTER FIELDS ----------
@@ -846,9 +849,17 @@ if (pipelineBinding) {
 
     const priorBindingValidation =
         source.getCellValueAsString(SF.bindingLastValidation).trim();
+    const baselineStatus =
+        selectName(source, SF.baselineStatus);
     const trustedExistingBinding =
         validatedPipelineAdapter(adapter) &&
-        Boolean(priorBindingValidation);
+        (
+            baselineStatus === "Established" ||
+            baselineStatus === "Needs Review" ||
+            /Binding QA:\s*PASS|production-eligible/i.test(
+                source.getCellValueAsString(SF.bindingNotes)
+            )
+        );
 
     if (exactSourceSpecific) {
         adapter = exactSourceSpecific;

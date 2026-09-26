@@ -606,8 +606,8 @@ if (!source) {
 const sourceName = source.getCellValueAsString(SF.name).trim();
 const sourceType = selectName(source, SF.type);
 const monitoringStatus = selectName(source, SF.status);
-const fetchMethod = selectName(source, SF.fetchMethod);
-const sourceRetrievalMode = selectName(source, SF.retrievalMode);
+let fetchMethod = selectName(source, SF.fetchMethod);
+let sourceRetrievalMode = selectName(source, SF.retrievalMode);
 const bindingStatus = selectName(source, SF.bindingStatus);
 const requested = !!source.getCellValue(SF.bindingRequested);
 
@@ -840,11 +840,11 @@ const adapterContractVersion = adapter ? adapter.getCellValueAsString(AF.contrac
 const adapterHandlerRaw = adapter ? adapter.getCellValueAsString(AF.handler).trim() : null;
 const adapterHandlerPath = String(adapterHandlerRaw || "").replace(/^pharma-pipeline-pdf-adapter:/i, "");
 const adapterRetrievalModes = adapterModes(adapter);
-const fetchMethod =
+fetchMethod =
     pipelineBinding && adapter
         ? expectedSourceWatchFetchMethod(adapterInputFormat)
         : selectName(source, SF.fetchMethod);
-const sourceRetrievalMode =
+sourceRetrievalMode =
     pipelineBinding && adapter
         ? expectedRetrievalMode(adapter)
         : selectName(source, SF.retrievalMode);

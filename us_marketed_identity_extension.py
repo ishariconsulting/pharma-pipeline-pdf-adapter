@@ -665,12 +665,54 @@ async def get_us_identity_job(
         "companyName": job.get("companyName"),
     }
     if job.get("status") == "complete":
-        response["result"] = job.get("result")
+        result = job.get("result") or {}
+        response["resultSummary"] = result.get("summary") or {}
+        response["resultRowCount"] = len(result.get("rows") or [])
+        response["resultVersion"] = result.get("version")
     if job.get("status") == "error":
         response["error"] = job.get("error")
     return response
 
 
+@app.get("/marketed/us-identity/jobs/{job_id}/result")
+async def get_us_identity_job_result(
+    job_id: str,
+    offset: int = 0,
+    limit: int = 50,
+    x_adapter_key: Optional[str] = Header(default=None),
+) -> Dict[str, Any]:
+    """Return a bounded page of a completed job result.
+
+    Large 290-product catalogues are paged so Airtable never receives the full
+    enrichment payload in one HTTP response.
+    """
+    _auth(x_adapter_key)
+    _prune_jobs()
+
+    job = _jobs.get(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="U.S. identity enrichment job not found")
+    if job.get("status") != "complete":
+        raise HTTPException(status_code=409, detail="U.S. identity enrichment job is not complete")
+    if offset < 0 or limit < 1 or limit > 50:
+        raise HTTPException(status_code=400, detail="offset must be >=0 and limit must be 1..50")
+
+    result = job.get("result") or {}
+    rows = list(result.get("rows") or [])
+    page = rows[offset:offset + limit]
+
+    return {
+        "version": VERSION,
+        "jobId": job_id,
+        "status": "complete",
+        "resultVersion": result.get("version"),
+        "summary": result.get("summary") or {},
+        "offset": offset,
+        "limit": limit,
+        "totalRows": len(rows),
+        "rows": page,
+        "nextOffset": (offset + limit) if (offset + limit) < len(rows) else None,
+    }
 
 
 @app.get("/marketed/us-identity/jobs/{job_id}/wait")
@@ -706,7 +748,10 @@ async def wait_us_identity_job(
         "companyName": job.get("companyName"),
     }
     if job.get("status") == "complete":
-        response["result"] = job.get("result")
+        result = job.get("result") or {}
+        response["resultSummary"] = result.get("summary") or {}
+        response["resultRowCount"] = len(result.get("rows") or [])
+        response["resultVersion"] = result.get("version")
     if job.get("status") == "error":
         response["error"] = job.get("error")
     return response

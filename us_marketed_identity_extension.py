@@ -17,6 +17,7 @@ import io
 import os
 import re
 import time
+import uuid
 from collections import defaultdict
 from typing import Any, Dict, Iterable, List, Optional
 
@@ -28,7 +29,7 @@ from main import _auth, app
 
 
 VERSION = "US_MARKETED_IDENTITY_V1.2_FAST_BATCH"
-MAX_PRODUCTS = 100
+MAX_PRODUCTS = 400
 OPENFDA_BASE = "https://api.fda.gov"
 DAILYMED_SPLS = "https://dailymed.nlm.nih.gov/dailymed/services/v2/spls.json"
 PURPLE_DOWNLOADS = "https://www.accessdata.fda.gov/scripts/purplebooksearch/index.cfm?event=downloads"
@@ -37,6 +38,9 @@ CACHE_TTL = 86400.0
 _http_cache: Dict[str, tuple[float, Any]] = {}
 _purple_cache: Dict[str, Any] = {"ts": 0.0, "rows": [], "sourceUrl": None, "error": None}
 _sem = asyncio.Semaphore(8)
+_jobs: Dict[str, Dict[str, Any]] = {}
+_job_tasks: set[asyncio.Task] = set()
+JOB_TTL_SECONDS = 7200.0
 
 
 class ProductInput(BaseModel):
@@ -428,6 +432,196 @@ def _purple_match(rows: List[Dict[str, str]], candidates: List[str]) -> Dict[str
         "licenseTypes": license_types,
         "recordCount": len(matches),
     }
+
+
+async def _build_enrichment_result(payload: EnrichmentRequest) -> Dict[str, Any]:
+    products = payload.products
+    candidates = {p.recordId: _brand_candidates(p.name) for p in products}
+    purple, drugs, labels = await asyncio.gather(
+        _purple_rows(),
+        _batch_drugsfda(products, candidates),
+        _batch_label(products, candidates),
+    )
+
+    unresolved = [
+        p for p in products
+        if not drugs.get(p.recordId, _empty_drugs()).get("matched")
+        and not labels.get(p.recordId, _empty_label()).get("matched")
+    ]
+
+    daily_results: Dict[str, Dict[str, Any]] = {}
+    daily_deferred = len(unresolved) > 12
+    if not daily_deferred:
+        group_results = await asyncio.gather(*[
+            _dailymed(p, candidates[p.recordId]) for p in unresolved
+        ])
+        for p, result in zip(unresolved, group_results):
+            daily_results[p.recordId] = result
+
+    rows = []
+    for product in products:
+        d = drugs.get(product.recordId, _empty_drugs())
+        l = labels.get(product.recordId, _empty_label())
+        dm = daily_results.get(product.recordId, {"matched": False, "setIds": [], "titles": [], "recordCount": 0})
+        pb = _purple_match(list(purple.get("rows") or []), candidates[product.recordId])
+
+        sources = []
+        if d.get("matched"):
+            sources.append("DRUGSATFDA")
+        if l.get("matched"):
+            sources.append("OPENFDA_LABEL")
+        if dm.get("matched"):
+            sources.append("DAILYMED_SPL")
+        if pb.get("matched"):
+            sources.append("PURPLE_BOOK")
+
+        exact_support = bool(d.get("matched") or l.get("matched") or pb.get("matched"))
+        match_status = "Matched" if exact_support else ("Partial" if dm.get("matched") else "Not Found")
+        confidence = "High" if (d.get("matched") or pb.get("matched")) else ("Medium" if l.get("matched") or dm.get("matched") else "Low")
+
+        ingredients = sorted(set(
+            list(d.get("activeIngredients") or [])
+            + list(l.get("genericNames") or [])
+            + list(l.get("substanceNames") or [])
+            + list(pb.get("properNames") or [])
+        ))
+        applications = sorted(set(
+            list(d.get("applicationNumbers") or [])
+            + list(l.get("applicationNumbers") or [])
+            + list(pb.get("blaNumbers") or [])
+        ))
+        spls = sorted(set(list(l.get("splSetIds") or []) + list(dm.get("setIds") or [])))
+        types = sorted(set(list(d.get("productTypes") or []) + list(l.get("productTypes") or [])))
+
+        rows.append({
+            "recordId": product.recordId,
+            "sourceName": product.name,
+            "candidates": candidates[product.recordId],
+            "matchStatus": match_status,
+            "confidence": confidence,
+            "applicationNumbers": applications,
+            "activeIngredients": ingredients,
+            "sponsorNames": sorted(set(list(d.get("sponsorNames") or []) + list(l.get("manufacturerNames") or []))),
+            "marketingStatuses": list(d.get("marketingStatuses") or []),
+            "productTypes": types,
+            "dosageForms": list(d.get("dosageForms") or []),
+            "splSetIds": spls,
+            "purpleBookStatus": pb.get("status") or "Not Identified",
+            "sources": sources,
+            "diagnostics": {
+                "drugsAtFda": d,
+                "label": l,
+                "dailyMed": dm,
+                "purpleBook": pb,
+            },
+        })
+
+    counts = {"Matched": 0, "Partial": 0, "Ambiguous": 0, "Not Found": 0}
+    for row in rows:
+        counts[row["matchStatus"]] = counts.get(row["matchStatus"], 0) + 1
+
+    return {
+        "version": VERSION,
+        "companyName": payload.companyName,
+        "rows": rows,
+        "summary": {
+            "inputCount": len(products),
+            "matchCounts": counts,
+            "purpleBookSourceUrl": purple.get("sourceUrl"),
+            "purpleBookAvailable": bool(purple.get("rows")),
+            "purpleBookError": purple.get("error"),
+            "openFdaApiKeyConfigured": bool(os.getenv("OPENFDA_API_KEY", "").strip()),
+            "dailyMedDeferred": daily_deferred,
+            "unresolvedBeforeDailyMed": len(unresolved),
+            "portfolioWrites": 0,
+        },
+    }
+
+
+def _prune_jobs() -> None:
+    cutoff = time.time() - JOB_TTL_SECONDS
+    stale = [
+        job_id
+        for job_id, job in _jobs.items()
+        if float(job.get("updatedAt") or job.get("createdAt") or 0) < cutoff
+    ]
+    for job_id in stale:
+        _jobs.pop(job_id, None)
+
+
+async def _run_enrichment_job(job_id: str, payload: EnrichmentRequest) -> None:
+    try:
+        _jobs[job_id].update({"status": "running", "updatedAt": time.time()})
+        result = await _build_enrichment_result(payload)
+        _jobs[job_id].update({
+            "status": "complete",
+            "updatedAt": time.time(),
+            "result": result,
+        })
+    except Exception as exc:
+        _jobs[job_id].update({
+            "status": "error",
+            "updatedAt": time.time(),
+            "error": f"{type(exc).__name__}: {str(exc)[:1200]}",
+        })
+
+
+@app.post("/marketed/us-identity/jobs")
+async def create_us_identity_job(
+    payload: EnrichmentRequest,
+    x_adapter_key: Optional[str] = Header(default=None),
+) -> Dict[str, Any]:
+    _auth(x_adapter_key)
+    _prune_jobs()
+
+    job_id = "usmi_" + uuid.uuid4().hex
+    now = time.time()
+    _jobs[job_id] = {
+        "jobId": job_id,
+        "status": "queued",
+        "createdAt": now,
+        "updatedAt": now,
+        "inputCount": len(payload.products),
+        "companyName": payload.companyName,
+    }
+
+    task = asyncio.create_task(_run_enrichment_job(job_id, payload))
+    _job_tasks.add(task)
+    task.add_done_callback(_job_tasks.discard)
+
+    return {
+        "version": VERSION,
+        "jobId": job_id,
+        "status": "queued",
+        "inputCount": len(payload.products),
+        "writeMode": "READ_ONLY",
+    }
+
+
+@app.get("/marketed/us-identity/jobs/{job_id}")
+async def get_us_identity_job(
+    job_id: str,
+    x_adapter_key: Optional[str] = Header(default=None),
+) -> Dict[str, Any]:
+    _auth(x_adapter_key)
+    _prune_jobs()
+
+    job = _jobs.get(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="U.S. identity enrichment job not found")
+
+    response = {
+        "version": VERSION,
+        "jobId": job_id,
+        "status": job.get("status"),
+        "inputCount": job.get("inputCount"),
+        "companyName": job.get("companyName"),
+    }
+    if job.get("status") == "complete":
+        response["result"] = job.get("result")
+    if job.get("status") == "error":
+        response["error"] = job.get("error")
+    return response
 
 
 @app.get("/marketed/us-identity/health")

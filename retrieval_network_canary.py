@@ -12,6 +12,7 @@ from playwright.async_api import async_playwright
 SOURCES = {
     "LILLY": "https://www.lilly.com/science/research-development/pipeline",
     "BAYER": "https://www.bayer.com/en/pharma/development-pipeline",
+    "PFIZER": "https://www.pfizer.com/products/product-list",
 }
 
 
@@ -36,6 +37,9 @@ async def direct_probe(name: str, url: str) -> dict:
             "hasPipeline": "pipeline" in text.lower(),
             "hasPhase": "phase" in text.lower(),
             "hasOrforglipron": "orforglipron" in text.lower(),
+            "hasProductList": "product list" in text.lower(),
+            "hasPaxlovid": "paxlovid" in text.lower(),
+            "hasXeljanz": "xeljanz" in text.lower(),
         }
     except Exception as exc:
         return {"name": name, "error": f"{type(exc).__name__}: {str(exc)[:500]}"}

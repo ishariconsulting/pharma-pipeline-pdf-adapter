@@ -31,7 +31,7 @@ from pydantic import BaseModel, Field
 from main import _auth, app
 
 
-VERSION = "US_MARKETED_IDENTITY_V1.7_IDEMPOTENT_JOBS"
+VERSION = "US_MARKETED_IDENTITY_V1.8_PURPLE_INDEXED"
 MAX_PRODUCTS = 400
 OPENFDA_BASE = "https://api.fda.gov"
 DAILYMED_SPLS = "https://dailymed.nlm.nih.gov/dailymed/services/v2/spls.json"
@@ -511,13 +511,30 @@ async def _build_enrichment_result(payload: EnrichmentRequest) -> Dict[str, Any]
         _batch_drugsfda(products, candidates),
     )
 
-    purple_by_id = {
-        p.recordId: _purple_match(
-            list(purple.get("rows") or []),
+    purple_rows = list(purple.get("rows") or [])
+    purple_index: Dict[str, List[Dict[str, str]]] = defaultdict(list)
+    for row in purple_rows:
+        proprietary = _purple_row_value(row, "Proprietary Name")
+        key = _norm(proprietary)
+        if key:
+            purple_index[key].append(row)
+
+    purple_by_id: Dict[str, Dict[str, Any]] = {}
+    for p in products:
+        matched_rows: List[Dict[str, str]] = []
+        seen_row_ids = set()
+        for candidate in candidates[p.recordId]:
+            for row in purple_index.get(_norm(candidate), []):
+                marker = id(row)
+                if marker in seen_row_ids:
+                    continue
+                seen_row_ids.add(marker)
+                matched_rows.append(row)
+
+        purple_by_id[p.recordId] = _purple_match(
+            matched_rows,
             candidates[p.recordId],
         )
-        for p in products
-    }
 
     label_deferred = len(products) > 40
     if label_deferred:

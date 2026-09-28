@@ -31,7 +31,7 @@ from pydantic import BaseModel, Field
 from main import _auth, app
 
 
-VERSION = "US_MARKETED_IDENTITY_V1.9_LABEL_RESIDUAL"
+VERSION = "US_MARKETED_IDENTITY_V1.10_PURPLE_DAILYMED_RESIDUAL"
 MAX_PRODUCTS = 400
 OPENFDA_BASE = "https://api.fda.gov"
 DAILYMED_SPLS = "https://dailymed.nlm.nih.gov/dailymed/services/v2/spls.json"
@@ -364,28 +364,68 @@ async def _batch_label(products: List[ProductInput], candidates: Dict[str, List[
 
 
 async def _dailymed(product: ProductInput, candidates: List[str]) -> Dict[str, Any]:
-    candidate = candidates[0] if candidates else product.name
-    try:
-        payload = await _json_get(
-            DAILYMED_SPLS,
-            params={"drug_name": candidate, "name_type": "brand", "pagesize": 10, "page": 1},
-            timeout_seconds=15.0,
-        )
-    except Exception:
-        return {"matched": False, "setIds": [], "titles": [], "recordCount": 0, "error": "DAILYMED_FETCH_FAILED"}
+    """Bounded DailyMed residual matcher.
 
-    rows = list(payload.get("data") or [])
-    useful = []
-    for row in rows:
-        title_brand = str(row.get("title") or "").split("(", 1)[0].strip()
-        if _candidate_matches(title_brand, candidates):
-            useful.append(row)
+    Try each useful brand candidate rather than only the combined catalogue label.
+    DailyMed /spls is still treated as supporting label identity rather than a
+    substitute for Drugs@FDA/Purple Book regulatory identity.
+    """
+    attempts: List[Dict[str, str]] = []
+    useful_by_setid: Dict[str, Dict[str, Any]] = {}
+
+    search_candidates = list(candidates[:3]) or [product.name]
+
+    for candidate in search_candidates:
+        try:
+            payload = await _json_get(
+                DAILYMED_SPLS,
+                params={
+                    "drug_name": candidate,
+                    "name_type": "brand",
+                    "pagesize": 25,
+                    "page": 1,
+                },
+                timeout_seconds=15.0,
+            )
+            attempts.append({"candidate": candidate, "nameType": "brand", "status": "OK"})
+        except Exception as exc:
+            attempts.append({
+                "candidate": candidate,
+                "nameType": "brand",
+                "status": type(exc).__name__,
+            })
+            continue
+
+        for row in list(payload.get("data") or []):
+            title = str(row.get("title") or "").strip()
+            # DailyMed titles normally begin BRAND (GENERIC) FORM [LABELER].
+            # Prefix matching against the full title is safer than assuming one
+            # exact punctuation layout.
+            if not _candidate_matches(title, [candidate]):
+                continue
+            setid = str(row.get("setid") or "").strip()
+            marker = setid or title
+            if marker:
+                useful_by_setid[marker] = row
+
+        if useful_by_setid:
+            break
+
+    useful = list(useful_by_setid.values())
 
     return {
         "matched": bool(useful),
-        "setIds": sorted({str(r.get("setid") or "").strip() for r in useful if r.get("setid")}),
-        "titles": [str(r.get("title") or "").strip() for r in useful[:10]],
+        "setIds": sorted({
+            str(r.get("setid") or "").strip()
+            for r in useful
+            if r.get("setid")
+        }),
+        "titles": [
+            str(r.get("title") or "").strip()
+            for r in useful[:10]
+        ],
         "recordCount": len(useful),
+        "attempts": attempts,
     }
 
 
@@ -443,17 +483,29 @@ async def _purple_rows() -> Dict[str, Any]:
     return _purple_cache
 
 
-def _purple_match(rows: List[Dict[str, str]], candidates: List[str]) -> Dict[str, Any]:
+def _purple_match(
+    rows: List[Dict[str, str]],
+    candidates: List[str],
+    reference_names: Optional[set[str]] = None,
+) -> Dict[str, Any]:
     matches = []
     for row in rows:
         proprietary = _purple_row_value(row, "Proprietary Name")
         if proprietary and _candidate_matches(proprietary, candidates):
             matches.append(row)
 
+    # IMPORTANT: "Licensure" in the monthly CSV can contain values such as
+    # "Licensed".  The legal pathway is in "License Type" (e.g. 351(a),
+    # 351(k) Biosimilar, 351(k) Interchangeable), so it must be read first.
     license_types = sorted({
-        _purple_row_value(r, "Licensure", "License Type", "Submission Type")
+        _purple_row_value(r, "License Type", "Submission Type")
         for r in matches
-        if _purple_row_value(r, "Licensure", "License Type", "Submission Type")
+        if _purple_row_value(r, "License Type", "Submission Type")
+    })
+    licensures = sorted({
+        _purple_row_value(r, "Licensure")
+        for r in matches
+        if _purple_row_value(r, "Licensure")
     })
     proper_names = sorted({
         _purple_row_value(r, "Proper Name")
@@ -467,19 +519,65 @@ def _purple_match(rows: List[Dict[str, str]], candidates: List[str]) -> Dict[str
         _purple_row_value(r, "BLA Number", "BLA")
         for r in matches if _purple_row_value(r, "BLA Number", "BLA")
     })
-
-    blob = " | ".join(
-        _purple_row_value(r, "Licensure", "License Type", "Submission Type", "Reference Product")
+    reference_flags = sorted({
+        _purple_row_value(r, "Reference Product")
         for r in matches
-    ).lower()
+        if _purple_row_value(r, "Reference Product")
+    })
+    ref_proper_names = sorted({
+        _purple_row_value(
+            r,
+            "Reference Product Proper Name",
+            "Ref. Product Proper Name",
+            "Reference Proper Name",
+        )
+        for r in matches
+        if _purple_row_value(
+            r,
+            "Reference Product Proper Name",
+            "Ref. Product Proper Name",
+            "Reference Proper Name",
+        )
+    })
+    ref_proprietary_names = sorted({
+        _purple_row_value(
+            r,
+            "Reference Product Proprietary Name",
+            "Ref. Product Proprietary Name",
+            "Reference Product Properietary Name",
+        )
+        for r in matches
+        if _purple_row_value(
+            r,
+            "Reference Product Proprietary Name",
+            "Ref. Product Proprietary Name",
+            "Reference Product Properietary Name",
+        )
+    })
+
+    pathway_blob = " | ".join(license_types).lower()
+    ref_flag_blob = " | ".join(reference_flags).lower()
+    reference_names = reference_names or set()
+
+    is_reference_by_relation = any(
+        _norm(name) in reference_names
+        for name in (proprietary_names + proper_names)
+        if _norm(name)
+    )
 
     status = "Not Identified"
     if matches:
-        if "interchangeable" in blob and ("351(k)" in blob or "biosimilar" in blob):
+        if "351(k) interchangeable" in pathway_blob or (
+            "interchangeable" in pathway_blob and "351(k)" in pathway_blob
+        ):
             status = "Interchangeable Biosimilar"
-        elif "351(k)" in blob or "biosimilar" in blob:
+        elif "351(k)" in pathway_blob or "biosimilar" in pathway_blob:
             status = "Biosimilar"
-        elif any("reference" in _purple_row_value(r, "Reference Product").lower() for r in matches):
+        elif (
+            "yes" in ref_flag_blob
+            or "reference" in ref_flag_blob
+            or is_reference_by_relation
+        ):
             status = "Reference Biologic"
         else:
             status = "Biologic"
@@ -491,6 +589,10 @@ def _purple_match(rows: List[Dict[str, str]], candidates: List[str]) -> Dict[str
         "properNames": proper_names,
         "proprietaryNames": proprietary_names,
         "licenseTypes": license_types,
+        "licensures": licensures,
+        "referenceFlags": reference_flags,
+        "referenceProductProperNames": ref_proper_names,
+        "referenceProductProprietaryNames": ref_proprietary_names,
         "recordCount": len(matches),
     }
 
@@ -513,11 +615,32 @@ async def _build_enrichment_result(payload: EnrichmentRequest) -> Dict[str, Any]
 
     purple_rows = list(purple.get("rows") or [])
     purple_index: Dict[str, List[Dict[str, str]]] = defaultdict(list)
+    purple_reference_names: set[str] = set()
+
     for row in purple_rows:
         proprietary = _purple_row_value(row, "Proprietary Name")
         key = _norm(proprietary)
         if key:
             purple_index[key].append(row)
+
+        # Cross-dataset relation: any name explicitly listed as the reference
+        # product for a 351(k) row is a reference biologic identity.
+        for ref_name in (
+            _purple_row_value(
+                row,
+                "Reference Product Proprietary Name",
+                "Ref. Product Proprietary Name",
+                "Reference Product Properietary Name",
+            ),
+            _purple_row_value(
+                row,
+                "Reference Product Proper Name",
+                "Ref. Product Proper Name",
+                "Reference Proper Name",
+            ),
+        ):
+            if _norm(ref_name):
+                purple_reference_names.add(_norm(ref_name))
 
     purple_by_id: Dict[str, Dict[str, Any]] = {}
     for p in products:
@@ -534,6 +657,7 @@ async def _build_enrichment_result(payload: EnrichmentRequest) -> Dict[str, Any]
         purple_by_id[p.recordId] = _purple_match(
             matched_rows,
             candidates[p.recordId],
+            purple_reference_names,
         )
 
     # Run the heavier label search only for the residual that Drugs@FDA and
@@ -557,8 +681,12 @@ async def _build_enrichment_result(payload: EnrichmentRequest) -> Dict[str, Any]
     ]
 
     daily_results: Dict[str, Dict[str, Any]] = {}
-    daily_deferred = len(unresolved) > 12
-    if not daily_deferred:
+    daily_deferred = False
+
+    # The async job architecture can safely run the residual DailyMed tail.
+    # The loop-aware semaphore in _json_get bounds concurrency, so catalogue
+    # scale does not translate into unbounded outbound requests.
+    if unresolved:
         group_results = await asyncio.gather(*[
             _dailymed(p, candidates[p.recordId]) for p in unresolved
         ])
@@ -582,6 +710,10 @@ async def _build_enrichment_result(payload: EnrichmentRequest) -> Dict[str, Any]
                 "properNames": [],
                 "proprietaryNames": [],
                 "licenseTypes": [],
+                "licensures": [],
+                "referenceFlags": [],
+                "referenceProductProperNames": [],
+                "referenceProductProprietaryNames": [],
                 "recordCount": 0,
             },
         )

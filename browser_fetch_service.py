@@ -37,6 +37,7 @@ DEFAULT_TIMEOUT_SECONDS = 35.0
 
 LILLY_CANARY_URL = "https://www.lilly.com/science/research-development/pipeline"
 BAYER_CANARY_URL = "https://www.bayer.com/en/pharma/development-pipeline"
+PFIZER_CANARY_URL = "https://www.pfizer.com/products/product-list"
 
 app = FastAPI(
     title="Pharma Browser Retrieval Worker",
@@ -527,6 +528,14 @@ async def canary_bayer() -> Dict[str, Any]:
     return await _run_canary(
         BAYER_CANARY_URL,
         ["pipeline", "phase"],
+    )
+
+
+@app.get("/canary/pfizer")
+async def canary_pfizer() -> Dict[str, Any]:
+    return await _run_canary(
+        PFIZER_CANARY_URL,
+        ["product list", "paxlovid", "xeljanx"],
     )
 
 

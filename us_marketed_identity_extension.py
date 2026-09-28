@@ -28,7 +28,7 @@ from pydantic import BaseModel, Field
 from main import _auth, app
 
 
-VERSION = "US_MARKETED_IDENTITY_V1.4_INDEXED_MATCH"
+VERSION = "US_MARKETED_IDENTITY_V1.5_STAGED_FIRST_PASS"
 MAX_PRODUCTS = 400
 OPENFDA_BASE = "https://api.fda.gov"
 DAILYMED_SPLS = "https://dailymed.nlm.nih.gov/dailymed/services/v2/spls.json"
@@ -482,18 +482,40 @@ def _purple_match(rows: List[Dict[str, str]], candidates: List[str]) -> Dict[str
 
 
 async def _build_enrichment_result(payload: EnrichmentRequest) -> Dict[str, Any]:
+    """Staged catalogue-wide identity pass.
+
+    Large catalogue runs intentionally avoid fetching full openFDA label documents,
+    which are much heavier than Drugs@FDA application records and can block a
+    single-worker service. Label/DailyMed enrichment is deferred to the residual
+    tail after this first identity pass.
+    """
     products = payload.products
     candidates = {p.recordId: _brand_candidates(p.name) for p in products}
-    purple, drugs, labels = await asyncio.gather(
+
+    purple, drugs = await asyncio.gather(
         _purple_rows(),
         _batch_drugsfda(products, candidates),
-        _batch_label(products, candidates),
     )
+
+    purple_by_id = {
+        p.recordId: _purple_match(
+            list(purple.get("rows") or []),
+            candidates[p.recordId],
+        )
+        for p in products
+    }
+
+    label_deferred = len(products) > 40
+    if label_deferred:
+        labels = {p.recordId: _empty_label() for p in products}
+    else:
+        labels = await _batch_label(products, candidates)
 
     unresolved = [
         p for p in products
         if not drugs.get(p.recordId, _empty_drugs()).get("matched")
         and not labels.get(p.recordId, _empty_label()).get("matched")
+        and not purple_by_id.get(p.recordId, {}).get("matched")
     ]
 
     daily_results: Dict[str, Dict[str, Any]] = {}
@@ -509,8 +531,22 @@ async def _build_enrichment_result(payload: EnrichmentRequest) -> Dict[str, Any]
     for product in products:
         d = drugs.get(product.recordId, _empty_drugs())
         l = labels.get(product.recordId, _empty_label())
-        dm = daily_results.get(product.recordId, {"matched": False, "setIds": [], "titles": [], "recordCount": 0})
-        pb = _purple_match(list(purple.get("rows") or []), candidates[product.recordId])
+        dm = daily_results.get(
+            product.recordId,
+            {"matched": False, "setIds": [], "titles": [], "recordCount": 0},
+        )
+        pb = purple_by_id.get(
+            product.recordId,
+            {
+                "matched": False,
+                "status": "Not Identified",
+                "blaNumbers": [],
+                "properNames": [],
+                "proprietaryNames": [],
+                "licenseTypes": [],
+                "recordCount": 0,
+            },
+        )
 
         sources = []
         if d.get("matched"):
@@ -522,9 +558,19 @@ async def _build_enrichment_result(payload: EnrichmentRequest) -> Dict[str, Any]
         if pb.get("matched"):
             sources.append("PURPLE_BOOK")
 
-        exact_support = bool(d.get("matched") or l.get("matched") or pb.get("matched"))
-        match_status = "Matched" if exact_support else ("Partial" if dm.get("matched") else "Not Found")
-        confidence = "High" if (d.get("matched") or pb.get("matched")) else ("Medium" if l.get("matched") or dm.get("matched") else "Low")
+        exact_support = bool(
+            d.get("matched") or l.get("matched") or pb.get("matched")
+        )
+        match_status = (
+            "Matched"
+            if exact_support
+            else ("Partial" if dm.get("matched") else "Not Found")
+        )
+        confidence = (
+            "High"
+            if (d.get("matched") or pb.get("matched"))
+            else ("Medium" if l.get("matched") or dm.get("matched") else "Low")
+        )
 
         ingredients = sorted(set(
             list(d.get("activeIngredients") or [])
@@ -537,8 +583,14 @@ async def _build_enrichment_result(payload: EnrichmentRequest) -> Dict[str, Any]
             + list(l.get("applicationNumbers") or [])
             + list(pb.get("blaNumbers") or [])
         ))
-        spls = sorted(set(list(l.get("splSetIds") or []) + list(dm.get("setIds") or [])))
-        types = sorted(set(list(d.get("productTypes") or []) + list(l.get("productTypes") or [])))
+        spls = sorted(set(
+            list(l.get("splSetIds") or [])
+            + list(dm.get("setIds") or [])
+        ))
+        types = sorted(set(
+            list(d.get("productTypes") or [])
+            + list(l.get("productTypes") or [])
+        ))
 
         rows.append({
             "recordId": product.recordId,
@@ -548,7 +600,10 @@ async def _build_enrichment_result(payload: EnrichmentRequest) -> Dict[str, Any]
             "confidence": confidence,
             "applicationNumbers": applications,
             "activeIngredients": ingredients,
-            "sponsorNames": sorted(set(list(d.get("sponsorNames") or []) + list(l.get("manufacturerNames") or []))),
+            "sponsorNames": sorted(set(
+                list(d.get("sponsorNames") or [])
+                + list(l.get("manufacturerNames") or [])
+            )),
             "marketingStatuses": list(d.get("marketingStatuses") or []),
             "productTypes": types,
             "dosageForms": list(d.get("dosageForms") or []),
@@ -578,6 +633,7 @@ async def _build_enrichment_result(payload: EnrichmentRequest) -> Dict[str, Any]
             "purpleBookAvailable": bool(purple.get("rows")),
             "purpleBookError": purple.get("error"),
             "openFdaApiKeyConfigured": bool(os.getenv("OPENFDA_API_KEY", "").strip()),
+            "labelDeferred": label_deferred,
             "dailyMedDeferred": daily_deferred,
             "unresolvedBeforeDailyMed": len(unresolved),
             "portfolioWrites": 0,
@@ -777,108 +833,4 @@ async def us_identity_enrich(
     x_adapter_key: Optional[str] = Header(default=None),
 ) -> Dict[str, Any]:
     _auth(x_adapter_key)
-
-    products = payload.products
-    candidates = {p.recordId: _brand_candidates(p.name) for p in products}
-    purple, drugs, labels = await asyncio.gather(
-        _purple_rows(),
-        _batch_drugsfda(products, candidates),
-        _batch_label(products, candidates),
-    )
-
-    unresolved = [
-        p for p in products
-        if not drugs.get(p.recordId, _empty_drugs()).get("matched")
-        and not labels.get(p.recordId, _empty_label()).get("matched")
-    ]
-
-    # Airtable's outbound fetch has a hard request-time ceiling. Keep the first
-    # catalogue-wide pass fast: use DailyMed only when the unresolved tail is small.
-    # A later targeted pass can work only the residual Not Found set.
-    daily_results: Dict[str, Dict[str, Any]] = {}
-    daily_deferred = len(unresolved) > 12
-    if not daily_deferred:
-        group_results = await asyncio.gather(*[
-            _dailymed(p, candidates[p.recordId]) for p in unresolved
-        ])
-        for p, result in zip(unresolved, group_results):
-            daily_results[p.recordId] = result
-
-    rows = []
-    for product in products:
-        d = drugs.get(product.recordId, _empty_drugs())
-        l = labels.get(product.recordId, _empty_label())
-        dm = daily_results.get(product.recordId, {"matched": False, "setIds": [], "titles": [], "recordCount": 0})
-        pb = _purple_match(list(purple.get("rows") or []), candidates[product.recordId])
-
-        sources = []
-        if d.get("matched"):
-            sources.append("DRUGSATFDA")
-        if l.get("matched"):
-            sources.append("OPENFDA_LABEL")
-        if dm.get("matched"):
-            sources.append("DAILYMED_SPL")
-        if pb.get("matched"):
-            sources.append("PURPLE_BOOK")
-
-        exact_support = bool(d.get("matched") or l.get("matched") or pb.get("matched"))
-        match_status = "Matched" if exact_support else ("Partial" if dm.get("matched") else "Not Found")
-        confidence = "High" if (d.get("matched") or pb.get("matched")) else ("Medium" if l.get("matched") or dm.get("matched") else "Low")
-
-        ingredients = sorted(set(
-            list(d.get("activeIngredients") or [])
-            + list(l.get("genericNames") or [])
-            + list(l.get("substanceNames") or [])
-            + list(pb.get("properNames") or [])
-        ))
-        applications = sorted(set(
-            list(d.get("applicationNumbers") or [])
-            + list(l.get("applicationNumbers") or [])
-            + list(pb.get("blaNumbers") or [])
-        ))
-        spls = sorted(set(list(l.get("splSetIds") or []) + list(dm.get("setIds") or [])))
-        types = sorted(set(list(d.get("productTypes") or []) + list(l.get("productTypes") or [])))
-
-        rows.append({
-            "recordId": product.recordId,
-            "sourceName": product.name,
-            "candidates": candidates[product.recordId],
-            "matchStatus": match_status,
-            "confidence": confidence,
-            "applicationNumbers": applications,
-            "activeIngredients": ingredients,
-            "sponsorNames": sorted(set(list(d.get("sponsorNames") or []) + list(l.get("manufacturerNames") or []))),
-            "marketingStatuses": list(d.get("marketingStatuses") or []),
-            "productTypes": types,
-            "dosageForms": list(d.get("dosageForms") or []),
-            "splSetIds": spls,
-            "purpleBookStatus": pb.get("status") or "Not Identified",
-            "sources": sources,
-            "diagnostics": {
-                "drugsAtFda": d,
-                "label": l,
-                "dailyMed": dm,
-                "purpleBook": pb,
-            },
-        })
-
-    counts = {"Matched": 0, "Partial": 0, "Ambiguous": 0, "Not Found": 0}
-    for row in rows:
-        counts[row["matchStatus"]] = counts.get(row["matchStatus"], 0) + 1
-
-    return {
-        "version": VERSION,
-        "companyName": payload.companyName,
-        "rows": rows,
-        "summary": {
-            "inputCount": len(products),
-            "matchCounts": counts,
-            "purpleBookSourceUrl": purple.get("sourceUrl"),
-            "purpleBookAvailable": bool(purple.get("rows")),
-            "purpleBookError": purple.get("error"),
-            "openFdaApiKeyConfigured": bool(os.getenv("OPENFDA_API_KEY", "").strip()),
-            "dailyMedDeferred": daily_deferred,
-            "unresolvedBeforeDailyMed": len(unresolved),
-            "portfolioWrites": 0,
-        },
-    }
+    return await _build_enrichment_result(payload)

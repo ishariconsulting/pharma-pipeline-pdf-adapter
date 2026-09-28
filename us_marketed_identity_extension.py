@@ -624,6 +624,46 @@ async def get_us_identity_job(
     return response
 
 
+
+
+@app.get("/marketed/us-identity/jobs/{job_id}/wait")
+async def wait_us_identity_job(
+    job_id: str,
+    x_adapter_key: Optional[str] = Header(default=None),
+) -> Dict[str, Any]:
+    """Long-poll one job for up to ~20s.
+
+    Airtable automation scripts do not provide a dependable timer primitive.
+    Keeping the wait on the adapter side lets Airtable make a bounded fetch
+    while the background enrichment continues.
+    """
+    _auth(x_adapter_key)
+    _prune_jobs()
+
+    job = _jobs.get(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="U.S. identity enrichment job not found")
+
+    deadline = time.monotonic() + 20.0
+    while job.get("status") in {"queued", "running"} and time.monotonic() < deadline:
+        await asyncio.sleep(0.5)
+        job = _jobs.get(job_id)
+        if not job:
+            raise HTTPException(status_code=404, detail="U.S. identity enrichment job not found")
+
+    response = {
+        "version": VERSION,
+        "jobId": job_id,
+        "status": job.get("status"),
+        "inputCount": job.get("inputCount"),
+        "companyName": job.get("companyName"),
+    }
+    if job.get("status") == "complete":
+        response["result"] = job.get("result")
+    if job.get("status") == "error":
+        response["error"] = job.get("error")
+    return response
+
 @app.get("/marketed/us-identity/health")
 async def us_identity_health() -> Dict[str, Any]:
     purple = await _purple_rows()

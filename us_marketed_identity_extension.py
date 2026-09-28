@@ -18,6 +18,7 @@ import os
 import re
 import time
 import uuid
+import threading
 from collections import defaultdict
 from typing import Any, Dict, Iterable, List, Optional
 
@@ -28,7 +29,7 @@ from pydantic import BaseModel, Field
 from main import _auth, app
 
 
-VERSION = "US_MARKETED_IDENTITY_V1.5_STAGED_FIRST_PASS"
+VERSION = "US_MARKETED_IDENTITY_V1.6_THREAD_ISOLATED"
 MAX_PRODUCTS = 400
 OPENFDA_BASE = "https://api.fda.gov"
 DAILYMED_SPLS = "https://dailymed.nlm.nih.gov/dailymed/services/v2/spls.json"
@@ -37,7 +38,16 @@ CACHE_TTL = 86400.0
 
 _http_cache: Dict[str, tuple[float, Any]] = {}
 _purple_cache: Dict[str, Any] = {"ts": 0.0, "rows": [], "sourceUrl": None, "error": None}
-_sem = asyncio.Semaphore(12)
+_loop_semaphores: Dict[int, asyncio.Semaphore] = {}
+
+def _get_loop_semaphore() -> asyncio.Semaphore:
+    loop = asyncio.get_running_loop()
+    key = id(loop)
+    sem = _loop_semaphores.get(key)
+    if sem is None:
+        sem = asyncio.Semaphore(10)
+        _loop_semaphores[key] = sem
+    return sem
 _jobs: Dict[str, Dict[str, Any]] = {}
 _job_tasks: set[asyncio.Task] = set()
 JOB_TTL_SECONDS = 7200.0
@@ -127,7 +137,7 @@ async def _json_get(url: str, params: Optional[Dict[str, Any]] = None, timeout_s
         "User-Agent": "PharmaCommercialIntelligence/1.2 (+read-only official-source identity)",
         "Accept": "application/json",
     }
-    async with _sem:
+    async with _get_loop_semaphore():
         timeout = httpx.Timeout(timeout_seconds, connect=min(8.0, timeout_seconds))
         async with httpx.AsyncClient(timeout=timeout, follow_redirects=True, headers=headers) as client:
             response = await client.get(url, params=params)
@@ -669,6 +679,16 @@ async def _run_enrichment_job(job_id: str, payload: EnrichmentRequest) -> None:
         })
 
 
+def _run_enrichment_job_thread(job_id: str, payload_dict: Dict[str, Any]) -> None:
+    """Run one enrichment job on a separate thread + event loop.
+
+    This keeps the FastAPI/Uvicorn event loop responsive for /health and
+    Airtable polling while large FDA responses are fetched and normalized.
+    """
+    payload = EnrichmentRequest(**payload_dict)
+    asyncio.run(_run_enrichment_job(job_id, payload))
+
+
 @app.post("/marketed/us-identity/jobs")
 async def create_us_identity_job(
     payload: EnrichmentRequest,
@@ -688,7 +708,13 @@ async def create_us_identity_job(
         "companyName": payload.companyName,
     }
 
-    task = asyncio.create_task(_run_enrichment_job(job_id, payload))
+    task = asyncio.create_task(
+        asyncio.to_thread(
+            _run_enrichment_job_thread,
+            job_id,
+            payload.model_dump(),
+        )
+    )
     _job_tasks.add(task)
     task.add_done_callback(_job_tasks.discard)
 

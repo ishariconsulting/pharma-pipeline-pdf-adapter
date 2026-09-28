@@ -28,7 +28,7 @@ from pydantic import BaseModel, Field
 from main import _auth, app
 
 
-VERSION = "US_MARKETED_IDENTITY_V1.2_FAST_BATCH"
+VERSION = "US_MARKETED_IDENTITY_V1.3_LOW_LATENCY"
 MAX_PRODUCTS = 400
 OPENFDA_BASE = "https://api.fda.gov"
 DAILYMED_SPLS = "https://dailymed.nlm.nih.gov/dailymed/services/v2/spls.json"
@@ -37,7 +37,7 @@ CACHE_TTL = 86400.0
 
 _http_cache: Dict[str, tuple[float, Any]] = {}
 _purple_cache: Dict[str, Any] = {"ts": 0.0, "rows": [], "sourceUrl": None, "error": None}
-_sem = asyncio.Semaphore(8)
+_sem = asyncio.Semaphore(12)
 _jobs: Dict[str, Dict[str, Any]] = {}
 _job_tasks: set[asyncio.Task] = set()
 JOB_TTL_SECONDS = 7200.0
@@ -189,7 +189,7 @@ async def _batch_drugsfda(products: List[ProductInput], candidates: Dict[str, Li
     raw: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
     terms = _query_terms(products, candidates)
 
-    groups = list(_chunks(terms, 20))
+    groups = list(_chunks(terms, 25))
     payloads = await asyncio.gather(*[
         _openfda(
             "/drug/drugsfda.json",
@@ -257,7 +257,7 @@ async def _batch_label(products: List[ProductInput], candidates: Dict[str, List[
     raw: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
     terms = _query_terms(products, candidates)
 
-    groups = list(_chunks(terms, 20))
+    groups = list(_chunks(terms, 25))
     payloads = await asyncio.gather(*[
         _openfda(
             "/drug/label.json",
@@ -631,7 +631,7 @@ async def wait_us_identity_job(
     job_id: str,
     x_adapter_key: Optional[str] = Header(default=None),
 ) -> Dict[str, Any]:
-    """Long-poll one job for up to ~20s.
+    """Long-poll one job for up to ~6s.
 
     Airtable automation scripts do not provide a dependable timer primitive.
     Keeping the wait on the adapter side lets Airtable make a bounded fetch
@@ -644,7 +644,7 @@ async def wait_us_identity_job(
     if not job:
         raise HTTPException(status_code=404, detail="U.S. identity enrichment job not found")
 
-    deadline = time.monotonic() + 20.0
+    deadline = time.monotonic() + 6.0
     while job.get("status") in {"queued", "running"} and time.monotonic() < deadline:
         await asyncio.sleep(0.5)
         job = _jobs.get(job_id)

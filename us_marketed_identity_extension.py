@@ -28,7 +28,7 @@ from pydantic import BaseModel, Field
 from main import _auth, app
 
 
-VERSION = "US_MARKETED_IDENTITY_V1.3_LOW_LATENCY"
+VERSION = "US_MARKETED_IDENTITY_V1.4_INDEXED_MATCH"
 MAX_PRODUCTS = 400
 OPENFDA_BASE = "https://api.fda.gov"
 DAILYMED_SPLS = "https://dailymed.nlm.nih.gov/dailymed/services/v2/spls.json"
@@ -189,6 +189,16 @@ async def _batch_drugsfda(products: List[ProductInput], candidates: Dict[str, Li
     raw: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
     terms = _query_terms(products, candidates)
 
+    # Exact normalized candidate index keeps this pass high-precision and avoids
+    # O(source_rows × catalogue_products) matching on the event loop.
+    candidate_index: Dict[str, set[str]] = defaultdict(set)
+    candidate_sets: Dict[str, set[str]] = {}
+    for product in products:
+        norms = {_norm(x) for x in candidates[product.recordId] if _norm(x)}
+        candidate_sets[product.recordId] = norms
+        for n in norms:
+            candidate_index[n].add(product.recordId)
+
     groups = list(_chunks(terms, 25))
     payloads = await asyncio.gather(*[
         _openfda(
@@ -199,17 +209,31 @@ async def _batch_drugsfda(products: List[ProductInput], candidates: Dict[str, Li
         for group in groups
     ])
 
+    seen_by_product: Dict[str, set[str]] = defaultdict(set)
+
     for payload in payloads:
-        rows = list(payload.get("results") or [])
-        for row in rows:
-            brands = [str(p.get("brand_name") or "") for p in (row.get("products") or [])]
-            for product in products:
-                if any(_candidate_matches(b, candidates[product.recordId]) for b in brands):
-                    raw[product.recordId].append(row)
+        for row in list(payload.get("results") or []):
+            target_ids: set[str] = set()
+            for p in (row.get("products") or []):
+                bn = _norm(p.get("brand_name"))
+                if bn:
+                    target_ids.update(candidate_index.get(bn, set()))
+
+            if not target_ids:
+                continue
+
+            row_identity = str(row.get("application_number") or "") + "|" + str(row.get("sponsor_name") or "")
+            for record_id in target_ids:
+                dedupe_key = row_identity + "|" + record_id
+                if dedupe_key in seen_by_product[record_id]:
+                    continue
+                seen_by_product[record_id].add(dedupe_key)
+                raw[record_id].append(row)
 
     out: Dict[str, Dict[str, Any]] = {}
     for product in products:
         rows = raw.get(product.recordId, [])
+        allowed = candidate_sets.get(product.recordId, set())
         apps = set()
         sponsors = set()
         brands = set()
@@ -223,8 +247,9 @@ async def _batch_drugsfda(products: List[ProductInput], candidates: Dict[str, Li
                 apps.add(str(row["application_number"]).strip())
             if row.get("sponsor_name"):
                 sponsors.add(str(row["sponsor_name"]).strip())
+
             for p in (row.get("products") or []):
-                if not _candidate_matches(p.get("brand_name"), candidates[product.recordId]):
+                if _norm(p.get("brand_name")) not in allowed:
                     continue
                 if p.get("brand_name"):
                     brands.add(str(p["brand_name"]).strip())
@@ -235,6 +260,7 @@ async def _batch_drugsfda(products: List[ProductInput], candidates: Dict[str, Li
                 for ai in (p.get("active_ingredients") or []):
                     if ai.get("name"):
                         ingredients.add(str(ai["name"]).strip())
+
             for value in ((row.get("openfda") or {}).get("product_type") or []):
                 if value:
                     product_types.add(str(value).strip())
@@ -257,6 +283,13 @@ async def _batch_label(products: List[ProductInput], candidates: Dict[str, List[
     raw: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
     terms = _query_terms(products, candidates)
 
+    candidate_index: Dict[str, set[str]] = defaultdict(set)
+    for product in products:
+        for candidate in candidates[product.recordId]:
+            n = _norm(candidate)
+            if n:
+                candidate_index[n].add(product.recordId)
+
     groups = list(_chunks(terms, 25))
     payloads = await asyncio.gather(*[
         _openfda(
@@ -267,13 +300,27 @@ async def _batch_label(products: List[ProductInput], candidates: Dict[str, List[
         for group in groups
     ])
 
+    seen_by_product: Dict[str, set[str]] = defaultdict(set)
+
     for payload in payloads:
-        rows = list(payload.get("results") or [])
-        for row in rows:
-            brands = [str(x) for x in ((row.get("openfda") or {}).get("brand_name") or [])]
-            for product in products:
-                if any(_candidate_matches(b, candidates[product.recordId]) for b in brands):
-                    raw[product.recordId].append(row)
+        for row in list(payload.get("results") or []):
+            target_ids: set[str] = set()
+            ofda = row.get("openfda") or {}
+            for brand in (ofda.get("brand_name") or []):
+                nb = _norm(brand)
+                if nb:
+                    target_ids.update(candidate_index.get(nb, set()))
+
+            if not target_ids:
+                continue
+
+            row_identity = str(row.get("id") or "") + "|" + "|".join(ofda.get("spl_set_id") or [])
+            for record_id in target_ids:
+                dedupe_key = row_identity + "|" + record_id
+                if dedupe_key in seen_by_product[record_id]:
+                    continue
+                seen_by_product[record_id].add(dedupe_key)
+                raw[record_id].append(row)
 
     out: Dict[str, Dict[str, Any]] = {}
     for product in products:

@@ -13,7 +13,9 @@ from __future__ import annotations
 
 import asyncio
 import csv
+import hashlib
 import io
+import json
 import os
 import re
 import time
@@ -29,7 +31,7 @@ from pydantic import BaseModel, Field
 from main import _auth, app
 
 
-VERSION = "US_MARKETED_IDENTITY_V1.6_THREAD_ISOLATED"
+VERSION = "US_MARKETED_IDENTITY_V1.7_IDEMPOTENT_JOBS"
 MAX_PRODUCTS = 400
 OPENFDA_BASE = "https://api.fda.gov"
 DAILYMED_SPLS = "https://dailymed.nlm.nih.gov/dailymed/services/v2/spls.json"
@@ -49,6 +51,8 @@ def _get_loop_semaphore() -> asyncio.Semaphore:
         _loop_semaphores[key] = sem
     return sem
 _jobs: Dict[str, Dict[str, Any]] = {}
+_job_key_index: Dict[str, str] = {}
+_jobs_lock = threading.Lock()
 _job_tasks: set[asyncio.Task] = set()
 JOB_TTL_SECONDS = 7200.0
 
@@ -651,32 +655,98 @@ async def _build_enrichment_result(payload: EnrichmentRequest) -> Dict[str, Any]
     }
 
 
+def _job_request_key(payload: EnrichmentRequest) -> str:
+    """Deterministic identity for one company catalogue request.
+
+    Re-submitting the same catalogue within the job TTL reuses the existing
+    queued/running/complete job instead of starting duplicate FDA work.
+    """
+    normalized = {
+        "companyName": str(payload.companyName or "").strip(),
+        "products": sorted(
+            [
+                {
+                    "recordId": p.recordId,
+                    "name": str(p.name or "").strip(),
+                    "molecule": str(p.molecule or "").strip(),
+                }
+                for p in payload.products
+            ],
+            key=lambda x: x["recordId"],
+        ),
+    }
+    raw = json.dumps(normalized, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+
 def _prune_jobs() -> None:
     cutoff = time.time() - JOB_TTL_SECONDS
-    stale = [
-        job_id
-        for job_id, job in _jobs.items()
-        if float(job.get("updatedAt") or job.get("createdAt") or 0) < cutoff
-    ]
-    for job_id in stale:
-        _jobs.pop(job_id, None)
+    with _jobs_lock:
+        stale = [
+            job_id
+            for job_id, job in list(_jobs.items())
+            if float(job.get("updatedAt") or job.get("createdAt") or 0) < cutoff
+        ]
+        for job_id in stale:
+            job = _jobs.pop(job_id, None) or {}
+            request_key = str(job.get("requestKey") or "")
+            if request_key and _job_key_index.get(request_key) == job_id:
+                _job_key_index.pop(request_key, None)
 
 
 async def _run_enrichment_job(job_id: str, payload: EnrichmentRequest) -> None:
+    started = time.time()
     try:
-        _jobs[job_id].update({"status": "running", "updatedAt": time.time()})
+        with _jobs_lock:
+            if job_id not in _jobs:
+                return
+            _jobs[job_id].update({"status": "running", "updatedAt": time.time()})
+
         result = await _build_enrichment_result(payload)
-        _jobs[job_id].update({
-            "status": "complete",
-            "updatedAt": time.time(),
-            "result": result,
-        })
+
+        with _jobs_lock:
+            if job_id not in _jobs:
+                return
+            _jobs[job_id].update({
+                "status": "complete",
+                "updatedAt": time.time(),
+                "result": result,
+            })
+
+        print(
+            "US_IDENTITY_JOB_COMPLETE "
+            + json.dumps(
+                {
+                    "jobId": job_id,
+                    "inputCount": len(payload.products),
+                    "durationSeconds": round(time.time() - started, 2),
+                    "matchCounts": (result.get("summary") or {}).get("matchCounts"),
+                },
+                separators=(",", ":"),
+            ),
+            flush=True,
+        )
     except Exception as exc:
-        _jobs[job_id].update({
-            "status": "error",
-            "updatedAt": time.time(),
-            "error": f"{type(exc).__name__}: {str(exc)[:1200]}",
-        })
+        with _jobs_lock:
+            if job_id in _jobs:
+                _jobs[job_id].update({
+                    "status": "error",
+                    "updatedAt": time.time(),
+                    "error": f"{type(exc).__name__}: {str(exc)[:1200]}",
+                })
+        print(
+            "US_IDENTITY_JOB_ERROR "
+            + json.dumps(
+                {
+                    "jobId": job_id,
+                    "inputCount": len(payload.products),
+                    "durationSeconds": round(time.time() - started, 2),
+                    "error": f"{type(exc).__name__}: {str(exc)[:500]}",
+                },
+                separators=(",", ":"),
+            ),
+            flush=True,
+        )
 
 
 def _run_enrichment_job_thread(job_id: str, payload_dict: Dict[str, Any]) -> None:
@@ -697,16 +767,34 @@ async def create_us_identity_job(
     _auth(x_adapter_key)
     _prune_jobs()
 
-    job_id = "usmi_" + uuid.uuid4().hex
+    request_key = _job_request_key(payload)
     now = time.time()
-    _jobs[job_id] = {
-        "jobId": job_id,
-        "status": "queued",
-        "createdAt": now,
-        "updatedAt": now,
-        "inputCount": len(payload.products),
-        "companyName": payload.companyName,
-    }
+
+    with _jobs_lock:
+        existing_id = _job_key_index.get(request_key)
+        existing = _jobs.get(existing_id) if existing_id else None
+
+        if existing and existing.get("status") in {"queued", "running", "complete"}:
+            return {
+                "version": VERSION,
+                "jobId": existing_id,
+                "status": existing.get("status"),
+                "inputCount": existing.get("inputCount"),
+                "writeMode": "READ_ONLY",
+                "reused": True,
+            }
+
+        job_id = "usmi_" + uuid.uuid4().hex
+        _jobs[job_id] = {
+            "jobId": job_id,
+            "requestKey": request_key,
+            "status": "queued",
+            "createdAt": now,
+            "updatedAt": now,
+            "inputCount": len(payload.products),
+            "companyName": payload.companyName,
+        }
+        _job_key_index[request_key] = job_id
 
     task = asyncio.create_task(
         asyncio.to_thread(
@@ -724,6 +812,7 @@ async def create_us_identity_job(
         "status": "queued",
         "inputCount": len(payload.products),
         "writeMode": "READ_ONLY",
+        "reused": False,
     }
 
 

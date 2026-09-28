@@ -29,3 +29,4 @@ import drupal_views_pipeline_extension  # noqa: E402,F401
 import merck_kgaa_js_pipeline_extension  # noqa: E402,F401
 import biontech_graphql_pipeline_extension  # noqa: E402,F401
 import wave_pipeline_extension  # noqa: E402,F401
+import us_marketed_identity_extension  # noqa: E402,F401

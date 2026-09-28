@@ -27,7 +27,7 @@ from pydantic import BaseModel, Field
 from main import _auth, app
 
 
-VERSION = "US_MARKETED_IDENTITY_V1.1_BATCHED"
+VERSION = "US_MARKETED_IDENTITY_V1.2_FAST_BATCH"
 MAX_PRODUCTS = 100
 OPENFDA_BASE = "https://api.fda.gov"
 DAILYMED_SPLS = "https://dailymed.nlm.nih.gov/dailymed/services/v2/spls.json"
@@ -120,7 +120,7 @@ async def _json_get(url: str, params: Optional[Dict[str, Any]] = None, timeout_s
         return cached[1]
 
     headers = {
-        "User-Agent": "PharmaCommercialIntelligence/1.1 (+read-only official-source identity)",
+        "User-Agent": "PharmaCommercialIntelligence/1.2 (+read-only official-source identity)",
         "Accept": "application/json",
     }
     async with _sem:
@@ -156,7 +156,7 @@ def _query_terms(products: List[ProductInput], candidates: Dict[str, List[str]])
     terms: List[str] = []
     seen = set()
     for p in products:
-        for candidate in candidates[p.recordId][:2]:
+        for candidate in candidates[p.recordId][:1]:
             n = _norm(candidate)
             if not n or n in seen:
                 continue
@@ -185,11 +185,18 @@ async def _batch_drugsfda(products: List[ProductInput], candidates: Dict[str, Li
     raw: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
     terms = _query_terms(products, candidates)
 
-    for group in _chunks(terms, 10):
-        search = " OR ".join(f'products.brand_name:"{term}"' for term in group)
-        payload = await _openfda("/drug/drugsfda.json", search, limit=99)
-        rows = list(payload.get("results") or [])
+    groups = list(_chunks(terms, 20))
+    payloads = await asyncio.gather(*[
+        _openfda(
+            "/drug/drugsfda.json",
+            " OR ".join(f'products.brand_name:"{term}"' for term in group),
+            limit=99,
+        )
+        for group in groups
+    ])
 
+    for payload in payloads:
+        rows = list(payload.get("results") or [])
         for row in rows:
             brands = [str(p.get("brand_name") or "") for p in (row.get("products") or [])]
             for product in products:
@@ -246,11 +253,18 @@ async def _batch_label(products: List[ProductInput], candidates: Dict[str, List[
     raw: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
     terms = _query_terms(products, candidates)
 
-    for group in _chunks(terms, 10):
-        search = " OR ".join(f'openfda.brand_name:"{term}"' for term in group)
-        payload = await _openfda("/drug/label.json", search, limit=1000)
-        rows = list(payload.get("results") or [])
+    groups = list(_chunks(terms, 20))
+    payloads = await asyncio.gather(*[
+        _openfda(
+            "/drug/label.json",
+            " OR ".join(f'openfda.brand_name:"{term}"' for term in group),
+            limit=1000,
+        )
+        for group in groups
+    ])
 
+    for payload in payloads:
+        rows = list(payload.get("results") or [])
         for row in rows:
             brands = [str(x) for x in ((row.get("openfda") or {}).get("brand_name") or [])]
             for product in products:
@@ -324,7 +338,7 @@ async def _purple_rows() -> Dict[str, Any]:
     if now - float(_purple_cache.get("ts") or 0) < CACHE_TTL and (_purple_cache.get("rows") or _purple_cache.get("error")):
         return _purple_cache
 
-    headers = {"User-Agent": "PharmaCommercialIntelligence/1.1 (+read-only official-source identity)"}
+    headers = {"User-Agent": "PharmaCommercialIntelligence/1.2 (+read-only official-source identity)"}
     try:
         async with httpx.AsyncClient(timeout=httpx.Timeout(25.0, connect=8.0), follow_redirects=True, headers=headers) as client:
             page = await client.get(PURPLE_DOWNLOADS)
@@ -452,11 +466,16 @@ async def us_identity_enrich(
         and not labels.get(p.recordId, _empty_label()).get("matched")
     ]
 
-    # DailyMed is a bounded fallback rather than the primary transport.
+    # Airtable's outbound fetch has a hard request-time ceiling. Keep the first
+    # catalogue-wide pass fast: use DailyMed only when the unresolved tail is small.
+    # A later targeted pass can work only the residual Not Found set.
     daily_results: Dict[str, Dict[str, Any]] = {}
-    for group in _chunks(unresolved, 10):
-        group_results = await asyncio.gather(*[_dailymed(p, candidates[p.recordId]) for p in group])
-        for p, result in zip(group, group_results):
+    daily_deferred = len(unresolved) > 12
+    if not daily_deferred:
+        group_results = await asyncio.gather(*[
+            _dailymed(p, candidates[p.recordId]) for p in unresolved
+        ])
+        for p, result in zip(unresolved, group_results):
             daily_results[p.recordId] = result
 
     rows = []
@@ -532,6 +551,8 @@ async def us_identity_enrich(
             "purpleBookAvailable": bool(purple.get("rows")),
             "purpleBookError": purple.get("error"),
             "openFdaApiKeyConfigured": bool(os.getenv("OPENFDA_API_KEY", "").strip()),
+            "dailyMedDeferred": daily_deferred,
+            "unresolvedBeforeDailyMed": len(unresolved),
             "portfolioWrites": 0,
         },
     }

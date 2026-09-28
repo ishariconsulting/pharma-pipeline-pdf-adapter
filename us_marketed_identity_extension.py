@@ -31,7 +31,7 @@ from pydantic import BaseModel, Field
 from main import _auth, app
 
 
-VERSION = "US_MARKETED_IDENTITY_V1.8_PURPLE_INDEXED"
+VERSION = "US_MARKETED_IDENTITY_V1.9_LABEL_RESIDUAL"
 MAX_PRODUCTS = 400
 OPENFDA_BASE = "https://api.fda.gov"
 DAILYMED_SPLS = "https://dailymed.nlm.nih.gov/dailymed/services/v2/spls.json"
@@ -536,17 +536,24 @@ async def _build_enrichment_result(payload: EnrichmentRequest) -> Dict[str, Any]
             candidates[p.recordId],
         )
 
-    label_deferred = len(products) > 40
-    if label_deferred:
-        labels = {p.recordId: _empty_label() for p in products}
-    else:
-        labels = await _batch_label(products, candidates)
-
-    unresolved = [
+    # Run the heavier label search only for the residual that Drugs@FDA and
+    # Purple Book did not identify. This keeps catalogue-scale payloads bounded
+    # while still resolving obvious current brands through SPL identity.
+    residual_for_label = [
         p for p in products
         if not drugs.get(p.recordId, _empty_drugs()).get("matched")
-        and not labels.get(p.recordId, _empty_label()).get("matched")
         and not purple_by_id.get(p.recordId, {}).get("matched")
+    ]
+
+    labels = {p.recordId: _empty_label() for p in products}
+    label_deferred = False
+    if residual_for_label:
+        residual_labels = await _batch_label(residual_for_label, candidates)
+        labels.update(residual_labels)
+
+    unresolved = [
+        p for p in residual_for_label
+        if not labels.get(p.recordId, _empty_label()).get("matched")
     ]
 
     daily_results: Dict[str, Dict[str, Any]] = {}

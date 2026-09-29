@@ -28,6 +28,8 @@ import re
 import threading
 import time
 import uuid
+import xml.etree.ElementTree as ET
+from datetime import datetime
 from collections import defaultdict
 from typing import Any, Dict, Iterable, List, Optional
 
@@ -38,8 +40,11 @@ from pydantic import BaseModel, Field
 from main import _auth, app
 
 
-VERSION = "US_MARKETED_BASELINE_EVIDENCE_V1.0"
+VERSION = "US_MARKETED_BASELINE_EVIDENCE_V1.1_DAILYMED_FALLBACK"
 OPENFDA_LABEL_URL = "https://api.fda.gov/drug/label.json"
+DAILYMED_SPLS_URL = "https://dailymed.nlm.nih.gov/dailymed/services/v2/spls.json"
+DAILYMED_APPLICATIONS_URL = "https://dailymed.nlm.nih.gov/dailymed/services/v2/applicationnumbers.json"
+DAILYMED_SPL_XML_URL = "https://dailymed.nlm.nih.gov/dailymed/services/v2/spls/{setid}.xml"
 MAX_PRODUCTS = 150
 CACHE_TTL = 86400.0
 JOB_TTL_SECONDS = 7200.0
@@ -231,6 +236,407 @@ async def _json_get(params: Dict[str, Any], timeout_seconds: float = 25.0) -> An
     _http_cache[key] = (now, payload)
     return payload
 
+
+
+def _dailymed_application_candidates(values: List[str]) -> List[str]:
+    """DailyMed can expose application numbers with or without NDA/ANDA/BLA prefixes."""
+    out: List[str] = []
+    seen = set()
+
+    for value in values:
+        token = re.sub(r"\s+", "", str(value or "").upper()).strip()
+        if not token:
+            continue
+
+        candidates = [token]
+        m = re.fullmatch(r"(?:NDA|ANDA|BLA)(\d{5,6})", token)
+        if m:
+            candidates.append(m.group(1))
+        elif re.fullmatch(r"\d{5,6}", token):
+            candidates.extend([f"BLA{token}", f"NDA{token}", f"ANDA{token}"])
+
+        for candidate in candidates:
+            if candidate not in seen:
+                seen.add(candidate)
+                out.append(candidate)
+
+    return out[:30]
+
+
+def _parse_daily_date(value: Any) -> float:
+    text = str(value or "").strip()
+    if not text:
+        return 0.0
+    for fmt in ("%b %d, %Y", "%Y-%m-%d", "%m/%d/%Y"):
+        try:
+            return datetime.strptime(text, fmt).timestamp()
+        except Exception:
+            pass
+    return 0.0
+
+
+def _xml_local(tag: Any) -> str:
+    return str(tag or "").split("}")[-1]
+
+
+def _extract_indications_from_spl_xml(xml_text: str) -> str:
+    """
+    Extract only the FDA/NLM INDICATIONS AND USAGE section (LOINC 34067-9).
+    No warnings, contraindications, or limitations sections are mined.
+    """
+    try:
+        root = ET.fromstring(xml_text)
+    except Exception:
+        return ""
+
+    sections: List[str] = []
+
+    for section in root.iter():
+        if _xml_local(section.tag) != "section":
+            continue
+
+        section_code = None
+        for child in list(section):
+            if _xml_local(child.tag) == "code":
+                section_code = str(child.attrib.get("code") or "").strip()
+                break
+
+        if section_code != "34067-9":
+            continue
+
+        title_text = ""
+        body_text = ""
+
+        for child in list(section):
+            local = _xml_local(child.tag)
+            if local == "title":
+                title_text = " ".join(
+                    str(x).strip() for x in child.itertext() if str(x).strip()
+                )
+            elif local == "text":
+                body_text = " ".join(
+                    str(x).strip() for x in child.itertext() if str(x).strip()
+                )
+
+        combined = re.sub(
+            r"\s+",
+            " ",
+            " ".join(x for x in [title_text, body_text] if x).strip(),
+        ).strip()
+
+        if combined:
+            sections.append(combined)
+
+    return _canonical_indication_text(sections)
+
+
+async def _dailymed_json_get(
+    url: str,
+    params: Dict[str, Any],
+    timeout_seconds: float = 25.0,
+) -> Any:
+    key = url + "?" + "&".join(f"{k}={params[k]}" for k in sorted(params))
+    now = time.time()
+    cached = _http_cache.get(key)
+    if cached and now - cached[0] < CACHE_TTL:
+        return cached[1]
+
+    headers = {
+        "User-Agent": "PharmaCommercialIntelligence/1.0 (+DailyMed official SPL fallback)",
+        "Accept": "application/json",
+    }
+
+    async with _sem():
+        async with httpx.AsyncClient(
+            timeout=httpx.Timeout(timeout_seconds, connect=8.0),
+            follow_redirects=True,
+            headers=headers,
+        ) as client:
+            response = await client.get(url, params=params)
+
+    if response.status_code == 404:
+        payload = {"data": []}
+        _http_cache[key] = (now, payload)
+        return payload
+
+    if response.status_code >= 400:
+        raise HTTPException(
+            status_code=502,
+            detail=f"DailyMed request failed {response.status_code}",
+        )
+
+    try:
+        payload = response.json()
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail="DailyMed returned invalid JSON") from exc
+
+    _http_cache[key] = (now, payload)
+    return payload
+
+
+async def _dailymed_xml_get(setid: str, timeout_seconds: float = 25.0) -> str:
+    url = DAILYMED_SPL_XML_URL.format(setid=setid)
+    now = time.time()
+    cached = _http_cache.get(url)
+    if cached and now - cached[0] < CACHE_TTL:
+        return str(cached[1] or "")
+
+    headers = {
+        "User-Agent": "PharmaCommercialIntelligence/1.0 (+DailyMed official SPL fallback)",
+        "Accept": "application/xml,text/xml",
+    }
+
+    async with _sem():
+        async with httpx.AsyncClient(
+            timeout=httpx.Timeout(timeout_seconds, connect=8.0),
+            follow_redirects=True,
+            headers=headers,
+        ) as client:
+            response = await client.get(url)
+
+    if response.status_code == 404:
+        _http_cache[url] = (now, "")
+        return ""
+
+    if response.status_code >= 400:
+        raise HTTPException(
+            status_code=502,
+            detail=f"DailyMed SPL XML request failed {response.status_code}",
+        )
+
+    value = response.text
+    _http_cache[url] = (now, value)
+    return value
+
+
+async def _daily_spls_by_application(app: str) -> List[Dict[str, Any]]:
+    payload = await _dailymed_json_get(
+        DAILYMED_SPLS_URL,
+        {"application_number": app, "pagesize": 100, "page": 1},
+    )
+    return list(payload.get("data") or [])
+
+
+async def _daily_spls_by_brand(brand: str) -> List[Dict[str, Any]]:
+    payload = await _dailymed_json_get(
+        DAILYMED_SPLS_URL,
+        {"drug_name": brand, "name_type": "b", "pagesize": 100, "page": 1},
+    )
+    return list(payload.get("data") or [])
+
+
+async def _daily_apps_for_setid(setid: str) -> List[str]:
+    payload = await _dailymed_json_get(
+        DAILYMED_APPLICATIONS_URL,
+        {"setid": setid, "pagesize": 100, "page": 1},
+    )
+    values = []
+    for row in list(payload.get("data") or []):
+        value = re.sub(
+            r"\s+",
+            "",
+            str(row.get("application_number") or "").upper(),
+        ).strip()
+        if value:
+            values.append(value)
+    return sorted(set(values))
+
+
+async def _resolve_dailymed_product(
+    product: BaselineProductInput,
+    brand_candidates: List[str],
+    openfda_apps: List[str],
+) -> Dict[str, Any]:
+    """
+    Deterministic fallback when openFDA label harmonization has no exact row.
+
+    Route A: DailyMed current SPLs filtered by application number + brand title.
+    Route B: DailyMed current SPLs filtered by brand, then application-number
+             overlap is re-verified through /applicationnumbers?setid=...
+    """
+    daily_apps = _dailymed_application_candidates(product.applicationNumbers)
+    candidates_by_setid: Dict[str, Dict[str, Any]] = {}
+    matched_route = None
+
+    # Route A: application number first.
+    for app in daily_apps:
+        try:
+            rows = await _daily_spls_by_application(app)
+        except Exception:
+            rows = []
+
+        for row in rows:
+            setid = str(row.get("setid") or "").strip()
+            title = str(row.get("title") or "").strip()
+            if not setid or not title:
+                continue
+            if not _brand_matches(title, brand_candidates):
+                continue
+            candidates_by_setid[setid] = row
+
+    if candidates_by_setid:
+        matched_route = "DAILYMED_APPLICATION_PLUS_BRAND"
+
+    # Route B: brand search, then exact application-number verification.
+    if not candidates_by_setid:
+        for brand in brand_candidates[:3]:
+            try:
+                rows = await _daily_spls_by_brand(brand)
+            except Exception:
+                rows = []
+
+            for row in rows:
+                setid = str(row.get("setid") or "").strip()
+                title = str(row.get("title") or "").strip()
+                if not setid or not title:
+                    continue
+                if not _brand_matches(title, brand_candidates):
+                    continue
+
+                try:
+                    set_apps = await _daily_apps_for_setid(setid)
+                except Exception:
+                    continue
+
+                normalized_set_apps = set(_dailymed_application_candidates(set_apps))
+                if normalized_set_apps.intersection(set(daily_apps)):
+                    candidates_by_setid[setid] = row
+
+        if candidates_by_setid:
+            matched_route = "DAILYMED_BRAND_PLUS_APPLICATION_VERIFY"
+
+    if not candidates_by_setid:
+        return {
+            "recordId": product.recordId,
+            "sourceName": product.name,
+            "status": "Not Found",
+            "confidence": "Low",
+            "applicationNumbers": sorted(set(openfda_apps)),
+            "splSetIds": [],
+            "activeIngredients": product.activeIngredients,
+            "indicationText": "",
+            "sourceUrl": None,
+            "authority": "DailyMed SPL API",
+            "ambiguous": False,
+            "diagnostics": {
+                "fallbackRoute": "DAILYMED_NONE",
+                "candidateBrands": brand_candidates,
+                "applicationCandidates": daily_apps,
+                "candidateSplCount": 0,
+            },
+        }
+
+    # Fetch only a bounded number of current matching SPLs.
+    selected = sorted(
+        candidates_by_setid.values(),
+        key=lambda x: _parse_daily_date(x.get("published_date")),
+        reverse=True,
+    )[:8]
+
+    fetched = await asyncio.gather(
+        *[
+            _dailymed_xml_get(str(row.get("setid") or "").strip())
+            for row in selected
+        ],
+        return_exceptions=True,
+    )
+
+    label_rows = []
+    for row, xml_value in zip(selected, fetched):
+        if isinstance(xml_value, Exception):
+            continue
+
+        setid = str(row.get("setid") or "").strip()
+        indication_text = _extract_indications_from_spl_xml(str(xml_value or ""))
+        if not indication_text:
+            continue
+
+        title = str(row.get("title") or "").strip()
+        bracket = re.search(r"\[([^\]]+)\]\s*$", title)
+        labeler = bracket.group(1).strip() if bracket else ""
+        sponsor_score = _sponsor_score(
+            [labeler] if labeler else [],
+            product.sponsorNames,
+        )
+
+        label_rows.append({
+            "setid": setid,
+            "title": title,
+            "publishedDate": str(row.get("published_date") or ""),
+            "publishedTimestamp": _parse_daily_date(row.get("published_date")),
+            "indicationText": indication_text,
+            "normalizedIndicationText": _norm(indication_text),
+            "sponsorScore": sponsor_score,
+        })
+
+    if not label_rows:
+        return {
+            "recordId": product.recordId,
+            "sourceName": product.name,
+            "status": "No Indication Text",
+            "confidence": "Low",
+            "applicationNumbers": sorted(set(openfda_apps)),
+            "splSetIds": sorted(candidates_by_setid.keys()),
+            "activeIngredients": product.activeIngredients,
+            "indicationText": "",
+            "sourceUrl": None,
+            "authority": "DailyMed SPL API",
+            "ambiguous": False,
+            "diagnostics": {
+                "fallbackRoute": matched_route,
+                "candidateBrands": brand_candidates,
+                "applicationCandidates": daily_apps,
+                "candidateSplCount": len(candidates_by_setid),
+                "splsWithIndicationText": 0,
+            },
+        }
+
+    best_sponsor_score = max(x["sponsorScore"] for x in label_rows)
+    sponsor_pool = (
+        [x for x in label_rows if x["sponsorScore"] == best_sponsor_score]
+        if best_sponsor_score > 0
+        else label_rows
+    )
+
+    distinct_texts: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
+    for item in sponsor_pool:
+        if item["normalizedIndicationText"]:
+            distinct_texts[item["normalizedIndicationText"]].append(item)
+
+    ambiguous = len(distinct_texts) > 1
+    chosen = sorted(
+        sponsor_pool,
+        key=lambda x: (x["sponsorScore"], x["publishedTimestamp"]),
+        reverse=True,
+    )[0]
+
+    return {
+        "recordId": product.recordId,
+        "sourceName": product.name,
+        "status": "Ambiguous" if ambiguous else "Matched",
+        "confidence": "Medium" if ambiguous else "High",
+        "applicationNumbers": sorted(set(openfda_apps)),
+        "splSetIds": sorted({x["setid"] for x in sponsor_pool}),
+        "activeIngredients": product.activeIngredients,
+        "indicationText": chosen["indicationText"],
+        "sourceUrl": (
+            "https://dailymed.nlm.nih.gov/dailymed/drugInfo.cfm?setid="
+            + chosen["setid"]
+        ),
+        "authority": "DailyMed SPL API",
+        "effectiveTime": chosen["publishedDate"] or None,
+        "ambiguous": ambiguous,
+        "diagnostics": {
+            "fallbackRoute": matched_route,
+            "candidateBrands": brand_candidates,
+            "applicationCandidates": daily_apps,
+            "candidateSplCount": len(candidates_by_setid),
+            "splsWithIndicationText": len(label_rows),
+            "bestSponsorScore": best_sponsor_score,
+            "distinctIndicationStatements": len(distinct_texts),
+            "titles": sorted({x["title"] for x in sponsor_pool}),
+        },
+    }
 
 async def _batch_label_rows(
     products: List[BaselineProductInput],
@@ -490,6 +896,41 @@ async def _build_result(payload: BaselineEvidenceRequest) -> Dict[str, Any]:
         for product in products
     ]
 
+    # Official DailyMed API fallback for products absent from openFDA label
+    # harmonization. The fallback remains application-number + brand verified
+    # and read-only.
+    fallback_indexes = [
+        i for i, row in enumerate(rows)
+        if row.get("status") in {"Not Found", "No Indication Text"}
+    ]
+
+    if fallback_indexes:
+        fallback_results = await asyncio.gather(
+            *[
+                _resolve_dailymed_product(
+                    products[i],
+                    brand_candidates[products[i].recordId],
+                    app_candidates[products[i].recordId],
+                )
+                for i in fallback_indexes
+            ],
+            return_exceptions=True,
+        )
+
+        for i, fallback in zip(fallback_indexes, fallback_results):
+            if isinstance(fallback, Exception):
+                rows[i].setdefault("diagnostics", {})["dailyMedFallbackError"] = (
+                    f"{type(fallback).__name__}: {str(fallback)[:500]}"
+                )
+                continue
+
+            rows[i].setdefault("diagnostics", {})["dailyMedFallback"] = (
+                fallback.get("diagnostics") or {}
+            )
+
+            if fallback.get("status") in {"Matched", "Ambiguous"}:
+                rows[i] = fallback
+
     counts: Dict[str, int] = defaultdict(int)
     for row in rows:
         counts[row["status"]] += 1
@@ -735,6 +1176,6 @@ async def baseline_evidence_health() -> Dict[str, Any]:
         "ok": True,
         "version": VERSION,
         "writeMode": "READ_ONLY",
-        "source": "openFDA drug labeling / DailyMed SPL",
+        "source": "openFDA drug labeling + DailyMed v2 SPL API fallback",
         "maxProductsPerRequest": MAX_PRODUCTS,
     }

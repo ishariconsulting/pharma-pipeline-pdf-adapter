@@ -46,7 +46,7 @@ from main import _auth, app
 from routed_html_extension import _browser_payload
 
 
-VERSION = "US_MARKETED_BASELINE_EVIDENCE_V1.7_PFIZER_LABEL_PORTAL_SEARCH"
+VERSION = "US_MARKETED_BASELINE_EVIDENCE_V1.8_OPENFDA_BRAND_INGREDIENT_FALLBACK"
 OPENFDA_LABEL_URL = "https://api.fda.gov/drug/label.json"
 DAILYMED_SPLS_URL = "https://dailymed.nlm.nih.gov/dailymed/services/v2/spls.json"
 DAILYMED_APPLICATIONS_URL = "https://dailymed.nlm.nih.gov/dailymed/services/v2/applicationnumbers.json"
@@ -1495,6 +1495,282 @@ async def _resolve_pfizer_current_label(
         },
     }
 
+
+def _ingredient_compatibility(
+    product_ingredients: List[str],
+    label_values: List[str],
+) -> Dict[str, Any]:
+    product_norm = [_norm(x) for x in product_ingredients if _norm(x)]
+    label_norm = [_norm(x) for x in label_values if _norm(x)]
+    label_joined = " | ".join(label_norm)
+
+    matched = []
+    unmatched = []
+
+    for ingredient in product_norm:
+        compatible = any(
+            ingredient == label
+            or ingredient in label
+            or label in ingredient
+            for label in label_norm
+            if len(label) >= 4
+        )
+        if not compatible and ingredient:
+            compatible = ingredient in label_joined
+        (matched if compatible else unmatched).append(ingredient)
+
+    return {
+        "productCount": len(product_norm),
+        "matchedCount": len(matched),
+        "matched": matched,
+        "unmatched": unmatched,
+        "allMatched": bool(product_norm) and not unmatched,
+        "anyMatched": bool(matched),
+    }
+
+
+async def _openfda_brand_rows(product: BaselineProductInput) -> List[Dict[str, Any]]:
+    brands = _brand_candidates(product.name)
+    rows: List[Dict[str, Any]] = []
+    seen = set()
+
+    for brand in brands[:3]:
+        clean = _clean_brand(brand)
+        if not clean:
+            continue
+
+        params: Dict[str, Any] = {
+            "search": f'openfda.brand_name:"{clean}"',
+            "limit": 100,
+        }
+        api_key = os.getenv("OPENFDA_API_KEY", "").strip()
+        if api_key:
+            params["api_key"] = api_key
+
+        try:
+            payload = await _json_get(params)
+        except Exception:
+            continue
+
+        for row in list(payload.get("results") or []):
+            ofda = row.get("openfda") or {}
+            row_brands = [str(x) for x in (ofda.get("brand_name") or [])]
+            if not any(_brand_matches(x, brands) for x in row_brands):
+                continue
+
+            marker = (
+                str(row.get("id") or "")
+                + "|"
+                + "|".join(ofda.get("spl_set_id") or [])
+                + "|"
+                + str(row.get("effective_time") or "")
+            )
+            if marker in seen:
+                continue
+            seen.add(marker)
+            rows.append(row)
+
+    return rows
+
+
+async def _resolve_openfda_brand_product(
+    product: BaselineProductInput,
+    input_apps: List[str],
+) -> Dict[str, Any]:
+    rows = await _openfda_brand_rows(product)
+    brands = _brand_candidates(product.name)
+
+    compatible = []
+    diagnostics = []
+
+    for row in rows:
+        ofda = row.get("openfda") or {}
+        label_ingredients = [
+            str(x)
+            for x in (
+                list(ofda.get("generic_name") or [])
+                + list(ofda.get("substance_name") or [])
+            )
+        ]
+        compatibility = _ingredient_compatibility(
+            list(product.activeIngredients or []),
+            label_ingredients,
+        )
+
+        indication_text = _canonical_indication_text(
+            [str(x) for x in (row.get("indications_and_usage") or [])]
+        )
+
+        diagnostics.append({
+            "brands": [str(x) for x in (ofda.get("brand_name") or [])],
+            "genericNames": [str(x) for x in (ofda.get("generic_name") or [])],
+            "substanceNames": [str(x) for x in (ofda.get("substance_name") or [])],
+            "manufacturers": [str(x) for x in (ofda.get("manufacturer_name") or [])],
+            "applicationNumbers": [str(x) for x in (ofda.get("application_number") or [])],
+            "splSetIds": [str(x) for x in (ofda.get("spl_set_id") or [])],
+            "effectiveTime": str(row.get("effective_time") or ""),
+            "ingredientCompatibility": compatibility,
+            "hasIndicationText": bool(indication_text),
+        })
+
+        if not indication_text:
+            continue
+
+        # For a single-ingredient product, exact brand + one compatible active
+        # ingredient is sufficient. For multi-ingredient families require at
+        # least half of the source ingredients and never zero. This allows
+        # formulation families such as VIBRAMYCIN while failing closed when
+        # the brand name is reused for a materially different composition.
+        product_count = int(compatibility["productCount"] or 0)
+        matched_count = int(compatibility["matchedCount"] or 0)
+        min_required = 1 if product_count <= 2 else max(2, (product_count + 1) // 2)
+
+        if matched_count < min_required:
+            continue
+
+        sponsor_score = _sponsor_score(
+            [str(x) for x in (ofda.get("manufacturer_name") or [])],
+            product.sponsorNames,
+        )
+
+        compatible.append({
+            "row": row,
+            "indicationText": indication_text,
+            "normalizedIndicationText": _norm(indication_text),
+            "effectiveTime": str(row.get("effective_time") or ""),
+            "sponsorScore": sponsor_score,
+            "ingredientCompatibility": compatibility,
+        })
+
+    if not compatible:
+        return {
+            "recordId": product.recordId,
+            "sourceName": product.name,
+            "status": "Not Found",
+            "confidence": "Low",
+            "applicationNumbers": sorted(set(input_apps)),
+            "splSetIds": [],
+            "activeIngredients": product.activeIngredients,
+            "indicationText": "",
+            "sourceUrl": None,
+            "authority": "FDA / DailyMed SPL",
+            "ambiguous": False,
+            "diagnostics": {
+                "fallbackRoute": "OPENFDA_BRAND_INGREDIENT_NONE",
+                "candidateBrands": brands,
+                "inputApplicationNumbers": sorted(set(input_apps)),
+                "brandRows": diagnostics[:20],
+            },
+        }
+
+    # Prefer the latest exact-brand current SPL. Sponsor agreement is a
+    # tiebreaker, not a hard requirement, because Pfizer catalogue families
+    # include legacy holders and acquired products.
+    latest_effective = max(x["effectiveTime"] for x in compatible)
+    latest_pool = [
+        x for x in compatible
+        if x["effectiveTime"] == latest_effective
+    ]
+
+    best_sponsor_score = max(x["sponsorScore"] for x in latest_pool)
+    sponsor_pool = (
+        [x for x in latest_pool if x["sponsorScore"] == best_sponsor_score]
+        if best_sponsor_score > 0
+        else latest_pool
+    )
+
+    distinct: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
+    for item in sponsor_pool:
+        if item["normalizedIndicationText"]:
+            distinct[item["normalizedIndicationText"]].append(item)
+
+    ambiguous = len(distinct) > 1
+    chosen = sorted(
+        sponsor_pool,
+        key=lambda x: (
+            x["sponsorScore"],
+            x["ingredientCompatibility"]["matchedCount"],
+            x["effectiveTime"],
+        ),
+        reverse=True,
+    )[0]
+
+    ofda = chosen["row"].get("openfda") or {}
+    source_apps = sorted({
+        re.sub(r"\s+", "", str(x or "").upper())
+        for x in (ofda.get("application_number") or [])
+        if str(x or "").strip()
+    })
+    spl_ids = sorted({
+        str(x).strip()
+        for x in (ofda.get("spl_set_id") or [])
+        if str(x).strip()
+    })
+    source_url = (
+        "https://dailymed.nlm.nih.gov/dailymed/drugInfo.cfm?setid="
+        + spl_ids[0]
+        if spl_ids
+        else None
+    )
+
+    print(
+        "US_BASELINE_OPENFDA_BRAND_MATCH "
+        + json.dumps(
+            {
+                "recordId": product.recordId,
+                "name": product.name,
+                "status": "Ambiguous" if ambiguous else "Matched",
+                "inputApps": sorted(set(input_apps)),
+                "sourceApps": source_apps,
+                "applicationMismatch": bool(
+                    source_apps
+                    and not set(source_apps).intersection(set(input_apps))
+                ),
+                "splSetIds": spl_ids,
+                "effectiveTime": chosen["effectiveTime"],
+            },
+            separators=(",", ":"),
+        ),
+        flush=True,
+    )
+
+    return {
+        "recordId": product.recordId,
+        "sourceName": product.name,
+        "status": "Ambiguous" if ambiguous else "Matched",
+        "confidence": "Medium" if ambiguous else "High",
+        "applicationNumbers": source_apps or sorted(set(input_apps)),
+        "splSetIds": spl_ids,
+        "activeIngredients": sorted({
+            str(x).strip()
+            for x in (
+                list(product.activeIngredients or [])
+                + list(ofda.get("generic_name") or [])
+                + list(ofda.get("substance_name") or [])
+            )
+            if str(x).strip()
+        }),
+        "indicationText": chosen["indicationText"],
+        "sourceUrl": source_url,
+        "authority": "FDA / DailyMed SPL",
+        "effectiveTime": chosen["effectiveTime"] or None,
+        "ambiguous": ambiguous,
+        "diagnostics": {
+            "fallbackRoute": "OPENFDA_BRAND_INGREDIENT_CURRENT",
+            "candidateBrands": brands,
+            "inputApplicationNumbers": sorted(set(input_apps)),
+            "sourceApplicationNumbers": source_apps,
+            "applicationMismatch": bool(
+                source_apps
+                and not set(source_apps).intersection(set(input_apps))
+            ),
+            "ingredientCompatibility": chosen["ingredientCompatibility"],
+            "bestSponsorScore": best_sponsor_score,
+            "distinctIndicationStatements": len(distinct),
+            "brandRowsConsidered": len(rows),
+        },
+    }
+
 async def _batch_label_rows(
     products: List[BaselineProductInput],
     app_candidates: Dict[str, List[str]],
@@ -1753,9 +2029,45 @@ async def _build_result(payload: BaselineEvidenceRequest) -> Dict[str, Any]:
         for product in products
     ]
 
-    # Official DailyMed API fallback for products absent from openFDA label
-    # harmonization. The fallback remains application-number + brand verified
-    # and read-only.
+    # Current openFDA SPL fallback by exact brand + active ingredient.
+    # This deliberately does not require the input application number because
+    # one marketed brand can span multiple related NDA/BLA applications, while
+    # the current SPL may expose only one of them (e.g. SUTENT).
+    brand_fallback_indexes = [
+        i for i, row in enumerate(rows)
+        if row.get("status") in {"Not Found", "No Indication Text"}
+    ]
+
+    if brand_fallback_indexes:
+        brand_fallback_results = await asyncio.gather(
+            *[
+                _resolve_openfda_brand_product(
+                    products[i],
+                    app_candidates[products[i].recordId],
+                )
+                for i in brand_fallback_indexes
+            ],
+            return_exceptions=True,
+        )
+
+        for i, fallback in zip(
+            brand_fallback_indexes,
+            brand_fallback_results,
+        ):
+            if isinstance(fallback, Exception):
+                rows[i].setdefault("diagnostics", {})[
+                    "openFdaBrandFallbackError"
+                ] = f"{type(fallback).__name__}: {str(fallback)[:500]}"
+                continue
+
+            rows[i].setdefault("diagnostics", {})[
+                "openFdaBrandFallback"
+            ] = fallback.get("diagnostics") or {}
+
+            if fallback.get("status") in {"Matched", "Ambiguous"}:
+                rows[i] = fallback
+
+    # Official DailyMed API fallback for products still absent from openFDA.
     fallback_indexes = [
         i for i, row in enumerate(rows)
         if row.get("status") in {"Not Found", "No Indication Text"}
@@ -2072,6 +2384,6 @@ async def baseline_evidence_health() -> Dict[str, Any]:
         "ok": True,
         "version": VERSION,
         "writeMode": "READ_ONLY",
-        "source": "openFDA + DailyMed v2 + current Pfizer U.S. prescribing information fallback",
+        "source": "openFDA application + current brand/ingredient SPL + DailyMed + Pfizer labeling fallback",
         "maxProductsPerRequest": MAX_PRODUCTS,
     }

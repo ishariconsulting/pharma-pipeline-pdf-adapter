@@ -32,17 +32,20 @@ import uuid
 import xml.etree.ElementTree as ET
 import zipfile
 from datetime import datetime
+from html import unescape
+from urllib.parse import parse_qs, urlencode, urlparse
 from collections import defaultdict
 from typing import Any, Dict, Iterable, List, Optional
 
 import httpx
+import fitz
 from fastapi import Header, HTTPException
 from pydantic import BaseModel, Field
 
 from main import _auth, app
 
 
-VERSION = "US_MARKETED_BASELINE_EVIDENCE_V1.4_NESTED_SPL_INDICATIONS"
+VERSION = "US_MARKETED_BASELINE_EVIDENCE_V1.5_PFIZER_CURRENT_LABEL_FALLBACK"
 OPENFDA_LABEL_URL = "https://api.fda.gov/drug/label.json"
 DAILYMED_SPLS_URL = "https://dailymed.nlm.nih.gov/dailymed/services/v2/spls.json"
 DAILYMED_APPLICATIONS_URL = "https://dailymed.nlm.nih.gov/dailymed/services/v2/applicationnumbers.json"
@@ -1187,6 +1190,18 @@ async def _resolve_pfizer_current_label(
     brand_candidates = _brand_candidates(product.name)
 
     if not links:
+        print(
+            "US_BASELINE_PFIZER_CURRENT_LABEL_NONE "
+            + json.dumps(
+                {
+                    "recordId": product.recordId,
+                    "name": product.name,
+                    "reason": "NO_PRODUCT_DETAIL_LABEL_LINK",
+                },
+                separators=(",", ":"),
+            ),
+            flush=True,
+        )
         return {
             "recordId": product.recordId,
             "sourceName": product.name,
@@ -1246,6 +1261,19 @@ async def _resolve_pfizer_current_label(
         })
 
     if not resolved:
+        print(
+            "US_BASELINE_PFIZER_CURRENT_LABEL_NO_TEXT "
+            + json.dumps(
+                {
+                    "recordId": product.recordId,
+                    "name": product.name,
+                    "linkCount": len(links),
+                    "links": [x.get("href") for x in links],
+                },
+                separators=(",", ":"),
+            ),
+            flush=True,
+        )
         return {
             "recordId": product.recordId,
             "sourceName": product.name,

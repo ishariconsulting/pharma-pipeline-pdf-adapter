@@ -31,7 +31,7 @@ from pydantic import BaseModel, Field
 from main import _auth, app
 
 
-VERSION = "US_MARKETED_IDENTITY_V1.10_PURPLE_DAILYMED_RESIDUAL"
+VERSION = "US_MARKETED_IDENTITY_V1.11_BRAND_INGREDIENT_APPLICATION_FAMILY"
 MAX_PRODUCTS = 400
 OPENFDA_BASE = "https://api.fda.gov"
 DAILYMED_SPLS = "https://dailymed.nlm.nih.gov/dailymed/services/v2/spls.json"
@@ -183,6 +183,52 @@ def _query_terms(products: List[ProductInput], candidates: Dict[str, List[str]])
     return terms
 
 
+
+def _molecule_components(value: Any) -> List[str]:
+    raw = str(value or "")
+    parts = re.split(r"\s+\+\s+|[\n;]+", raw)
+    out: List[str] = []
+    seen = set()
+    for part in parts:
+        n = _norm(part)
+        if n and n not in seen:
+            seen.add(n)
+            out.append(n)
+    return out
+
+
+def _source_ingredient_set(values: Iterable[Any]) -> set[str]:
+    return {
+        _norm(v)
+        for v in values
+        if _norm(v)
+    }
+
+
+def _exact_ingredient_family_match(
+    product_molecule: Any,
+    source_values: Iterable[Any],
+) -> bool:
+    """
+    Application-family guard.
+
+    FDA applications under the same brand are treated as one marketed family
+    only when the catalogue molecule components are present exactly in the
+    source active-ingredient identity. This intentionally distinguishes, for
+    example, methylprednisolone acetate from methylprednisolone and different
+    CORTISPORIN formulations.
+    """
+    product_components = _molecule_components(product_molecule)
+    if not product_components:
+        return True
+
+    source = _source_ingredient_set(source_values)
+    if not source:
+        return False
+
+    return all(component in source for component in product_components)
+
+
 def _empty_drugs() -> Dict[str, Any]:
     return {
         "matched": False, "applicationNumbers": [], "sponsorNames": [],
@@ -248,6 +294,50 @@ async def _batch_drugsfda(products: List[ProductInput], candidates: Dict[str, Li
     for product in products:
         rows = raw.get(product.recordId, [])
         allowed = candidate_sets.get(product.recordId, set())
+
+        compatible_rows = []
+        rejected_variants = []
+
+        for row in rows:
+            exact_brand_products = [
+                p for p in (row.get("products") or [])
+                if _norm(p.get("brand_name")) in allowed
+            ]
+
+            row_ingredients = [
+                str(ai.get("name") or "").strip()
+                for p in exact_brand_products
+                for ai in (p.get("active_ingredients") or [])
+                if str(ai.get("name") or "").strip()
+            ]
+
+            compatible = _exact_ingredient_family_match(
+                product.molecule,
+                row_ingredients,
+            )
+
+            variant = {
+                "applicationNumber": str(row.get("application_number") or "").strip(),
+                "sponsorName": str(row.get("sponsor_name") or "").strip(),
+                "activeIngredients": sorted(set(row_ingredients)),
+                "dosageForms": sorted({
+                    str(p.get("dosage_form") or "").strip()
+                    for p in exact_brand_products
+                    if str(p.get("dosage_form") or "").strip()
+                }),
+                "marketingStatuses": sorted({
+                    str(p.get("marketing_status") or "").strip()
+                    for p in exact_brand_products
+                    if str(p.get("marketing_status") or "").strip()
+                }),
+                "ingredientFamilyCompatible": compatible,
+            }
+
+            if compatible:
+                compatible_rows.append((row, exact_brand_products, variant))
+            else:
+                rejected_variants.append(variant)
+
         apps = set()
         sponsors = set()
         brands = set()
@@ -255,16 +345,17 @@ async def _batch_drugsfda(products: List[ProductInput], candidates: Dict[str, Li
         forms = set()
         marketing = set()
         product_types = set()
+        application_variants = []
 
-        for row in rows:
+        for row, exact_brand_products, variant in compatible_rows:
+            application_variants.append(variant)
+
             if row.get("application_number"):
                 apps.add(str(row["application_number"]).strip())
             if row.get("sponsor_name"):
                 sponsors.add(str(row["sponsor_name"]).strip())
 
-            for p in (row.get("products") or []):
-                if _norm(p.get("brand_name")) not in allowed:
-                    continue
+            for p in exact_brand_products:
                 if p.get("brand_name"):
                     brands.add(str(p["brand_name"]).strip())
                 if p.get("dosage_form"):
@@ -280,7 +371,7 @@ async def _batch_drugsfda(products: List[ProductInput], candidates: Dict[str, Li
                     product_types.add(str(value).strip())
 
         out[product.recordId] = {
-            "matched": bool(rows),
+            "matched": bool(compatible_rows),
             "applicationNumbers": sorted(apps),
             "sponsorNames": sorted(sponsors),
             "brandNames": sorted(brands),
@@ -288,7 +379,9 @@ async def _batch_drugsfda(products: List[ProductInput], candidates: Dict[str, Li
             "dosageForms": sorted(forms),
             "marketingStatuses": sorted(marketing),
             "productTypes": sorted(product_types),
-            "recordCount": len(rows),
+            "recordCount": len(compatible_rows),
+            "applicationVariants": application_variants,
+            "rejectedBrandVariants": rejected_variants[:20],
         }
     return out
 
@@ -338,7 +431,47 @@ async def _batch_label(products: List[ProductInput], candidates: Dict[str, List[
 
     out: Dict[str, Dict[str, Any]] = {}
     for product in products:
-        rows = raw.get(product.recordId, [])
+        candidate_rows = raw.get(product.recordId, [])
+
+        rows = []
+        rejected = []
+
+        for row in candidate_rows:
+            ofda = row.get("openfda") or {}
+            source_ingredients = [
+                str(v).strip()
+                for v in (
+                    list(ofda.get("substance_name") or [])
+                    + list(ofda.get("generic_name") or [])
+                )
+                if str(v).strip()
+            ]
+
+            compatible = _exact_ingredient_family_match(
+                product.molecule,
+                source_ingredients,
+            )
+
+            if compatible:
+                rows.append(row)
+            else:
+                rejected.append({
+                    "applicationNumbers": [
+                        str(v).strip()
+                        for v in (ofda.get("application_number") or [])
+                        if str(v).strip()
+                    ],
+                    "genericNames": [
+                        str(v).strip()
+                        for v in (ofda.get("generic_name") or [])
+                        if str(v).strip()
+                    ],
+                    "substanceNames": [
+                        str(v).strip()
+                        for v in (ofda.get("substance_name") or [])
+                        if str(v).strip()
+                    ],
+                })
 
         def collect(field: str) -> List[str]:
             return sorted({
@@ -359,6 +492,7 @@ async def _batch_label(products: List[ProductInput], candidates: Dict[str, List[
             "substanceNames": collect("substance_name"),
             "splSetIds": collect("spl_set_id"),
             "recordCount": len(rows),
+            "rejectedBrandVariants": rejected[:20],
         }
     return out
 

@@ -453,6 +453,198 @@ async def _browser_fetch(
             await browser.close()
 
 
+async def _pfizer_label_search(
+    brand: str,
+    timeout_seconds: float = DEFAULT_TIMEOUT_SECONDS,
+) -> Dict[str, Any]:
+    """Search Pfizer's public labeling portal for a brand and return label links.
+
+    Read-only browser interaction. The portal is an ASP.NET-style search page
+    whose result links are not reliably exposed to server-side HTTP.
+    """
+    clean_brand = re.sub(r"\s+", " ", str(brand or "")).strip()
+    if not clean_brand:
+        raise HTTPException(status_code=400, detail="brand is required")
+
+    url = "https://labeling.pfizer.com/"
+    await _assert_public_http_url(url)
+    timeout_ms = int(timeout_seconds * 1000)
+
+    async with async_playwright() as pw:
+        browser: Browser = await pw.chromium.launch(
+            headless=True,
+            args=["--no-sandbox", "--disable-dev-shm-usage", "--disable-gpu"],
+        )
+        context: Optional[BrowserContext] = None
+        try:
+            context = await browser.new_context(
+                user_agent=(
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                    "AppleWebKit/537.36 (KHTML, like Gecko) "
+                    "Chrome/124.0.0.0 Safari/537.36"
+                ),
+                locale="en-US",
+                viewport={"width": 1365, "height": 900},
+                java_script_enabled=True,
+            )
+            page = await context.new_page()
+            await _install_request_guard(page)
+
+            try:
+                response = await page.goto(
+                    url,
+                    wait_until="domcontentloaded",
+                    timeout=timeout_ms,
+                )
+            except Exception as exc:
+                raise HTTPException(
+                    status_code=504,
+                    detail=f"Pfizer labeling search navigation failed: {type(exc).__name__}",
+                ) from exc
+
+            if response is None:
+                raise HTTPException(
+                    status_code=502,
+                    detail="Pfizer labeling search returned no document response",
+                )
+            if int(response.status) >= 400:
+                raise HTTPException(
+                    status_code=502,
+                    detail=f"Pfizer labeling search returned HTTP {int(response.status)}",
+                )
+
+            try:
+                await page.wait_for_load_state(
+                    "networkidle",
+                    timeout=min(10_000, timeout_ms),
+                )
+            except Exception:
+                pass
+
+            input_diagnostics = await page.evaluate(
+                """() => Array.from(document.querySelectorAll('input,button,select'))
+                  .slice(0,80)
+                  .map(el => ({
+                    tag: el.tagName.toLowerCase(),
+                    type: String(el.getAttribute('type') || ''),
+                    id: String(el.id || ''),
+                    name: String(el.getAttribute('name') || ''),
+                    value: String(el.getAttribute('value') || ''),
+                    placeholder: String(el.getAttribute('placeholder') || ''),
+                    ariaLabel: String(el.getAttribute('aria-label') || ''),
+                    text: String(el.innerText || el.textContent || '').replace(/\\s+/g,' ').trim().slice(0,160)
+                  }))"""
+            )
+
+            text_inputs = page.locator(
+                'input[type="text"], input[type="search"], input:not([type])'
+            )
+            input_count = await text_inputs.count()
+            target = None
+            for idx in range(min(input_count, 12)):
+                candidate = text_inputs.nth(idx)
+                try:
+                    if await candidate.is_visible():
+                        target = candidate
+                        break
+                except Exception:
+                    continue
+
+            if target is None:
+                raise HTTPException(
+                    status_code=502,
+                    detail="Pfizer labeling search exposed no visible text/search input",
+                )
+
+            await target.fill(clean_brand, timeout=5_000)
+
+            # Prefer an explicit Search control; fall back to Enter on the field.
+            clicked = False
+            search_controls = page.locator(
+                'button, input[type="submit"], input[type="button"], input[type="image"]'
+            )
+            control_count = await search_controls.count()
+            for idx in range(min(control_count, 20)):
+                candidate = search_controls.nth(idx)
+                try:
+                    if not await candidate.is_visible():
+                        continue
+                    label = " ".join(
+                        filter(
+                            None,
+                            [
+                                await candidate.inner_text(timeout=1_000),
+                                await candidate.get_attribute("value"),
+                                await candidate.get_attribute("aria-label"),
+                                await candidate.get_attribute("title"),
+                            ],
+                        )
+                    )
+                    if re.search(r"\b(search|find|submit)\b", label, re.I):
+                        await candidate.click(timeout=5_000)
+                        clicked = True
+                        break
+                except Exception:
+                    continue
+
+            if not clicked:
+                await target.press("Enter", timeout=5_000)
+
+            try:
+                await page.wait_for_load_state(
+                    "networkidle",
+                    timeout=min(12_000, timeout_ms),
+                )
+            except Exception:
+                await page.wait_for_timeout(2_000)
+
+            await page.wait_for_timeout(800)
+
+            anchors = await page.evaluate(
+                """() => Array.from(document.querySelectorAll('a[href]'))
+                  .map(a => ({
+                    text: String(a.innerText || a.textContent || '').replace(/\\s+/g,' ').trim().slice(0,300),
+                    href: String(a.href || '')
+                  }))
+                  .filter(x => /ShowLabeling\\.aspx/i.test(x.href))
+                  .slice(0,100)"""
+            )
+
+            visible = ""
+            try:
+                visible = await page.locator("body").inner_text(timeout=3_000)
+            except Exception:
+                pass
+
+            return {
+                "ok": True,
+                "version": BROWSER_FETCH_VERSION,
+                "brand": clean_brand,
+                "finalUrl": page.url,
+                "links": anchors,
+                "visibleTextHead": re.sub(r"\s+", " ", visible or "").strip()[:3000],
+                "inputDiagnostics": input_diagnostics,
+                "readOnly": True,
+            }
+        finally:
+            if context is not None:
+                await context.close()
+            await browser.close()
+
+
+@app.get("/pfizer/label-search")
+async def pfizer_label_search(
+    brand: str = Query(..., min_length=1, max_length=240),
+    timeout_seconds: float = Query(DEFAULT_TIMEOUT_SECONDS, ge=5.0, le=35.0),
+    x_browser_key: Optional[str] = Header(default=None),
+) -> Dict[str, Any]:
+    _auth(x_browser_key)
+    return await _pfizer_label_search(
+        brand,
+        timeout_seconds=timeout_seconds,
+    )
+
+
 @app.get("/health")
 async def health() -> Dict[str, Any]:
     return {

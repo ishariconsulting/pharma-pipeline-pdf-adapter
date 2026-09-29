@@ -94,8 +94,15 @@ def _brand_candidates(raw: str) -> List[str]:
     if cleaned:
         values.append(cleaned)
 
+    cleaned_first = _norm(cleaned.split()[0]) if cleaned else ""
+    cleaned_word_count = len(cleaned.split()) if cleaned else 0
+
     for match in re.finditer(r"([A-Za-z0-9][A-Za-z0-9-]{2,})\s*[®™]", str(raw or "")):
-        values.append(match.group(1))
+        token = match.group(1)
+        # Avoid treating a trademarked suffix in a multi-word brand as a
+        # standalone brand candidate (e.g. DAYPRO ALTA™ -> "ALTA").
+        if cleaned_word_count <= 1 or _norm(token) == cleaned_first:
+            values.append(token)
 
     if cleaned:
         first = cleaned.split()[0]
@@ -995,9 +1002,22 @@ async def _build_enrichment_result(payload: EnrichmentRequest) -> Dict[str, Any]
             if exact_support
             else ("Partial" if dm.get("matched") else "Not Found")
         )
+        exact_label_identity = bool(
+            l.get("matched")
+            and (l.get("applicationNumbers") or [])
+            and (
+                (l.get("substanceNames") or [])
+                or (l.get("genericNames") or [])
+            )
+        )
+
         confidence = (
             "High"
-            if (d.get("matched") or pb.get("matched"))
+            if (
+                d.get("matched")
+                or pb.get("matched")
+                or exact_label_identity
+            )
             else ("Medium" if l.get("matched") or dm.get("matched") else "Low")
         )
 

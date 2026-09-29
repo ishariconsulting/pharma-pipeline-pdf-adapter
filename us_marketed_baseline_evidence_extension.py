@@ -43,9 +43,10 @@ from fastapi import Header, HTTPException
 from pydantic import BaseModel, Field
 
 from main import _auth, app
+from routed_html_extension import _browser_payload
 
 
-VERSION = "US_MARKETED_BASELINE_EVIDENCE_V1.5_PFIZER_CURRENT_LABEL_FALLBACK"
+VERSION = "US_MARKETED_BASELINE_EVIDENCE_V1.6_PFIZER_BROWSER_LABEL_FALLBACK"
 OPENFDA_LABEL_URL = "https://api.fda.gov/drug/label.json"
 DAILYMED_SPLS_URL = "https://dailymed.nlm.nih.gov/dailymed/services/v2/spls.json"
 DAILYMED_APPLICATIONS_URL = "https://dailymed.nlm.nih.gov/dailymed/services/v2/applicationnumbers.json"
@@ -1120,60 +1121,104 @@ async def _pfizer_current_label_links(product: BaselineProductInput) -> List[Dic
     links: List[Dict[str, str]] = []
     seen = set()
 
+    def add_link(href: str, anchor: str, product_url: str) -> None:
+        href = str(href or "").strip()
+        anchor = re.sub(r"\s+", " ", str(anchor or "")).strip()
+        if "labeling.pfizer.com" not in href.lower():
+            return
+
+        na = _norm(anchor)
+        if any(
+            blocked in na
+            for blocked in [
+                "medication guide",
+                "patient information",
+                "patient leaflet",
+                "instructions for use",
+                "ifu",
+            ]
+        ):
+            return
+
+        score = 0
+        if "prescribing information" in na:
+            score += 5
+        if "physician" in na:
+            score += 2
+        if any(_norm(c) in na for c in candidates):
+            score += 2
+
+        key = href.lower()
+        if key in seen:
+            return
+        seen.add(key)
+        links.append({
+            "href": href,
+            "anchor": anchor,
+            "score": str(score),
+            "productDetailUrl": product_url,
+        })
+
     for slug in _pfizer_slug_candidates(product.name):
         url = PFIZER_PRODUCT_DETAIL_URL.format(slug=slug)
+        status = None
+        html = ""
+
         try:
             status, _ctype, html = await _text_get(url)
         except Exception:
-            continue
+            pass
 
-        if status != 200 or not html:
-            continue
+        if status == 200 and html:
+            page_text = _strip_html(html)
+            if any(_norm(c) in _norm(page_text[:7000]) for c in candidates):
+                for m in re.finditer(
+                    r'(?is)<a\b[^>]*href=["\']([^"\']+)["\'][^>]*>(.*?)</a>',
+                    html,
+                ):
+                    add_link(
+                        unescape(str(m.group(1) or "")),
+                        _strip_html(str(m.group(2) or "")),
+                        url,
+                    )
 
-        page_text = _strip_html(html)
-        if not any(_norm(c) in _norm(page_text[:7000]) for c in candidates):
-            continue
+        # Pfizer product-detail pages are JavaScript-rendered in production.
+        # If static HTML did not expose a U.S. PI link, use the existing
+        # read-only Playwright browser worker and consume its structured anchors.
+        if not links:
+            try:
+                browser = await _browser_payload(
+                    url=url,
+                    timeout_seconds=35.0,
+                    reason="PFIZER_PRODUCT_DETAIL_JS_RENDER",
+                    direct_status=status,
+                    direct_version=None,
+                )
+            except Exception as exc:
+                print(
+                    "US_BASELINE_PFIZER_BROWSER_ERROR "
+                    + json.dumps(
+                        {
+                            "recordId": product.recordId,
+                            "name": product.name,
+                            "url": url,
+                            "error": f"{type(exc).__name__}: {str(exc)[:400]}",
+                        },
+                        separators=(",", ":"),
+                    ),
+                    flush=True,
+                )
+                browser = None
 
-        for m in re.finditer(
-            r'(?is)<a\b[^>]*href=["\']([^"\']+)["\'][^>]*>(.*?)</a>',
-            html,
-        ):
-            href = unescape(str(m.group(1) or "")).strip()
-            anchor = _strip_html(str(m.group(2) or ""))
-            if "labeling.pfizer.com" not in href.lower():
-                continue
-
-            na = _norm(anchor)
-            if any(
-                blocked in na
-                for blocked in [
-                    "medication guide",
-                    "patient information",
-                    "patient leaflet",
-                    "instructions for use",
-                    "ifu",
-                ]
-            ):
-                continue
-
-            score = 0
-            if "prescribing information" in na:
-                score += 5
-            if "physician" in na:
-                score += 2
-            if any(_norm(c) in na for c in candidates):
-                score += 2
-
-            key = href.lower()
-            if key in seen:
-                continue
-            seen.add(key)
-            links.append({
-                "href": href,
-                "anchor": anchor,
-                "score": str(score),
-                "productDetailUrl": url,
-            })
+            if browser:
+                visible = _norm(browser.get("visibleText") or "")
+                if any(_norm(c) in visible for c in candidates):
+                    for item in list(browser.get("anchors") or []):
+                        add_link(
+                            str(item.get("url") or item.get("href") or ""),
+                            str(item.get("text") or ""),
+                            url,
+                        )
 
         if links:
             break

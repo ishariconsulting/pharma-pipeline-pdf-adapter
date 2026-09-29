@@ -46,7 +46,7 @@ from main import _auth, app
 from routed_html_extension import _browser_payload
 
 
-VERSION = "US_MARKETED_BASELINE_EVIDENCE_V1.8_OPENFDA_BRAND_INGREDIENT_FALLBACK"
+VERSION = "US_MARKETED_BASELINE_EVIDENCE_V1.9_DAILYMED_BRAND_INGREDIENT_FALLBACK"
 OPENFDA_LABEL_URL = "https://api.fda.gov/drug/label.json"
 DAILYMED_SPLS_URL = "https://dailymed.nlm.nih.gov/dailymed/services/v2/spls.json"
 DAILYMED_APPLICATIONS_URL = "https://dailymed.nlm.nih.gov/dailymed/services/v2/applicationnumbers.json"
@@ -1771,6 +1771,260 @@ async def _resolve_openfda_brand_product(
         },
     }
 
+
+def _extract_active_ingredients_from_spl_xml(xml_text: str) -> List[str]:
+    try:
+        root = ET.fromstring(str(xml_text or ""))
+    except Exception:
+        return []
+
+    out: List[str] = []
+    seen = set()
+
+    for ingredient in root.iter():
+        if _xml_local(ingredient.tag) != "ingredient":
+            continue
+        class_code = str(ingredient.attrib.get("classCode") or "").upper()
+        if class_code and class_code != "ACTIB":
+            continue
+
+        for descendant in ingredient.iter():
+            if _xml_local(descendant.tag) != "name":
+                continue
+            value = re.sub(
+                r"\s+",
+                " ",
+                " ".join(
+                    str(x).strip()
+                    for x in descendant.itertext()
+                    if str(x).strip()
+                ),
+            ).strip()
+            n = _norm(value)
+            if value and n and n not in seen:
+                seen.add(n)
+                out.append(value)
+
+    return out
+
+
+async def _resolve_dailymed_brand_product(
+    product: BaselineProductInput,
+    input_apps: List[str],
+) -> Dict[str, Any]:
+    brands = _brand_candidates(product.name)
+    candidates_by_setid: Dict[str, Dict[str, Any]] = {}
+
+    for brand in brands[:3]:
+        try:
+            rows = await _daily_spls_by_brand(brand)
+        except Exception:
+            continue
+
+        for row in rows:
+            setid = str(row.get("setid") or "").strip()
+            title = str(row.get("title") or "").strip()
+            if not setid or not title:
+                continue
+            if not _brand_matches(title, brands):
+                continue
+            candidates_by_setid[setid] = row
+
+    if not candidates_by_setid:
+        return {
+            "recordId": product.recordId,
+            "sourceName": product.name,
+            "status": "Not Found",
+            "confidence": "Low",
+            "applicationNumbers": sorted(set(input_apps)),
+            "splSetIds": [],
+            "activeIngredients": product.activeIngredients,
+            "indicationText": "",
+            "sourceUrl": None,
+            "authority": "DailyMed SPL API",
+            "ambiguous": False,
+            "diagnostics": {
+                "fallbackRoute": "DAILYMED_BRAND_INGREDIENT_NONE",
+                "candidateBrands": brands,
+            },
+        }
+
+    selected = sorted(
+        candidates_by_setid.values(),
+        key=lambda x: _parse_daily_date(x.get("published_date")),
+        reverse=True,
+    )[:15]
+
+    fetched = await asyncio.gather(
+        *[
+            _dailymed_xml_get(str(row.get("setid") or "").strip())
+            for row in selected
+        ],
+        return_exceptions=True,
+    )
+
+    compatible = []
+    diagnostic_rows = []
+
+    for row, xml_value in zip(selected, fetched):
+        if isinstance(xml_value, Exception):
+            continue
+
+        xml_text = str(xml_value or "")
+        setid = str(row.get("setid") or "").strip()
+        title = str(row.get("title") or "").strip()
+        if not xml_text:
+            continue
+
+        label_ingredients = _extract_active_ingredients_from_spl_xml(xml_text)
+        # Title is also a useful source for older SPLs where ACTIB markup is
+        # incomplete.
+        label_ingredients.append(title)
+
+        compatibility = _ingredient_compatibility(
+            list(product.activeIngredients or []),
+            label_ingredients,
+        )
+        indication_text = _extract_indications_from_spl_xml(xml_text)
+        source_apps = _dailymed_application_candidates(
+            _extract_application_numbers_from_spl_xml(xml_text)
+        )
+
+        diagnostic_rows.append({
+            "setid": setid,
+            "title": title,
+            "publishedDate": str(row.get("published_date") or ""),
+            "sourceApplicationNumbers": source_apps,
+            "activeIngredients": label_ingredients[:20],
+            "ingredientCompatibility": compatibility,
+            "hasIndicationText": bool(indication_text),
+        })
+
+        if not indication_text:
+            continue
+
+        product_count = int(compatibility["productCount"] or 0)
+        matched_count = int(compatibility["matchedCount"] or 0)
+        min_required = 1 if product_count <= 2 else max(2, (product_count + 1) // 2)
+        if matched_count < min_required:
+            continue
+
+        compatible.append({
+            "setid": setid,
+            "title": title,
+            "publishedDate": str(row.get("published_date") or ""),
+            "publishedTimestamp": _parse_daily_date(row.get("published_date")),
+            "indicationText": indication_text,
+            "normalizedIndicationText": _norm(indication_text),
+            "sourceApplicationNumbers": source_apps,
+            "activeIngredients": label_ingredients,
+            "ingredientCompatibility": compatibility,
+        })
+
+    if not compatible:
+        return {
+            "recordId": product.recordId,
+            "sourceName": product.name,
+            "status": "Not Found",
+            "confidence": "Low",
+            "applicationNumbers": sorted(set(input_apps)),
+            "splSetIds": [],
+            "activeIngredients": product.activeIngredients,
+            "indicationText": "",
+            "sourceUrl": None,
+            "authority": "DailyMed SPL API",
+            "ambiguous": False,
+            "diagnostics": {
+                "fallbackRoute": "DAILYMED_BRAND_INGREDIENT_NONE",
+                "candidateBrands": brands,
+                "candidateSplCount": len(candidates_by_setid),
+                "rows": diagnostic_rows[:20],
+            },
+        }
+
+    latest_timestamp = max(x["publishedTimestamp"] for x in compatible)
+    latest_pool = [
+        x for x in compatible
+        if x["publishedTimestamp"] == latest_timestamp
+    ]
+
+    distinct: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
+    for item in latest_pool:
+        if item["normalizedIndicationText"]:
+            distinct[item["normalizedIndicationText"]].append(item)
+
+    ambiguous = len(distinct) > 1
+    chosen = sorted(
+        latest_pool,
+        key=lambda x: (
+            x["ingredientCompatibility"]["matchedCount"],
+            x["publishedTimestamp"],
+        ),
+        reverse=True,
+    )[0]
+
+    source_apps = sorted(set(chosen["sourceApplicationNumbers"]))
+    source_url = (
+        "https://dailymed.nlm.nih.gov/dailymed/drugInfo.cfm?setid="
+        + chosen["setid"]
+    )
+
+    print(
+        "US_BASELINE_DAILYMED_BRAND_MATCH "
+        + json.dumps(
+            {
+                "recordId": product.recordId,
+                "name": product.name,
+                "status": "Ambiguous" if ambiguous else "Matched",
+                "inputApps": sorted(set(input_apps)),
+                "sourceApps": source_apps,
+                "applicationMismatch": bool(
+                    source_apps
+                    and not set(source_apps).intersection(set(input_apps))
+                ),
+                "setid": chosen["setid"],
+                "publishedDate": chosen["publishedDate"],
+            },
+            separators=(",", ":"),
+        ),
+        flush=True,
+    )
+
+    return {
+        "recordId": product.recordId,
+        "sourceName": product.name,
+        "status": "Ambiguous" if ambiguous else "Matched",
+        "confidence": "Medium" if ambiguous else "High",
+        "applicationNumbers": source_apps or sorted(set(input_apps)),
+        "splSetIds": [chosen["setid"]],
+        "activeIngredients": sorted({
+            str(x).strip()
+            for x in (
+                list(product.activeIngredients or [])
+                + chosen["activeIngredients"]
+            )
+            if str(x).strip()
+        }),
+        "indicationText": chosen["indicationText"],
+        "sourceUrl": source_url,
+        "authority": "DailyMed SPL API",
+        "effectiveTime": chosen["publishedDate"] or None,
+        "ambiguous": ambiguous,
+        "diagnostics": {
+            "fallbackRoute": "DAILYMED_BRAND_INGREDIENT_CURRENT",
+            "candidateBrands": brands,
+            "inputApplicationNumbers": sorted(set(input_apps)),
+            "sourceApplicationNumbers": source_apps,
+            "applicationMismatch": bool(
+                source_apps
+                and not set(source_apps).intersection(set(input_apps))
+            ),
+            "ingredientCompatibility": chosen["ingredientCompatibility"],
+            "candidateSplCount": len(candidates_by_setid),
+            "distinctIndicationStatements": len(distinct),
+        },
+    }
+
 async def _batch_label_rows(
     products: List[BaselineProductInput],
     app_candidates: Dict[str, List[str]],
@@ -2100,45 +2354,47 @@ async def _build_result(payload: BaselineEvidenceRequest) -> Dict[str, Any]:
             if fallback.get("status") in {"Matched", "Ambiguous"}:
                 rows[i] = fallback
 
-    # Current manufacturer-label fallback for Pfizer catalogue rows that still
-    # have no usable openFDA/DailyMed indication evidence. The Pfizer product
-    # detail page is used only to discover the current U.S. prescribing-
-    # information link; the label itself remains read-only evidence.
-    if "pfizer" in _norm(payload.companyName or ""):
-        manufacturer_indexes = [
-            i for i, row in enumerate(rows)
-            if row.get("status") in {"Not Found", "No Indication Text"}
-        ]
+    # Current DailyMed brand + active-ingredient fallback. This is official,
+    # company-agnostic, and handles brands whose current SPL exposes a related
+    # application number rather than the application captured upstream.
+    current_brand_indexes = [
+        i for i, row in enumerate(rows)
+        if row.get("status") in {"Not Found", "No Indication Text"}
+    ]
 
-        if manufacturer_indexes:
-            manufacturer_results = await asyncio.gather(
-                *[
-                    _resolve_pfizer_current_label(
-                        products[i],
-                        app_candidates[products[i].recordId],
-                    )
-                    for i in manufacturer_indexes
-                ],
-                return_exceptions=True,
-            )
+    if current_brand_indexes:
+        current_brand_results = await asyncio.gather(
+            *[
+                _resolve_dailymed_brand_product(
+                    products[i],
+                    app_candidates[products[i].recordId],
+                )
+                for i in current_brand_indexes
+            ],
+            return_exceptions=True,
+        )
 
-            for i, fallback in zip(
-                manufacturer_indexes,
-                manufacturer_results,
-            ):
-                if isinstance(fallback, Exception):
-                    rows[i].setdefault("diagnostics", {})[
-                        "pfizerCurrentLabelFallbackError"
-                    ] = f"{type(fallback).__name__}: {str(fallback)[:500]}"
-                    continue
-
+        for i, fallback in zip(
+            current_brand_indexes,
+            current_brand_results,
+        ):
+            if isinstance(fallback, Exception):
                 rows[i].setdefault("diagnostics", {})[
-                    "pfizerCurrentLabelFallback"
-                ] = fallback.get("diagnostics") or {}
+                    "dailyMedBrandFallbackError"
+                ] = f"{type(fallback).__name__}: {str(fallback)[:500]}"
+                continue
 
-                if fallback.get("status") in {"Matched", "Ambiguous"}:
-                    rows[i] = fallback
+            rows[i].setdefault("diagnostics", {})[
+                "dailyMedBrandFallback"
+            ] = fallback.get("diagnostics") or {}
 
+            if fallback.get("status") in {"Matched", "Ambiguous"}:
+                rows[i] = fallback
+
+    # Pfizer portal fallback is intentionally disabled for automated runs:
+    # labeling.pfizer.com currently exposes no searchable public form to the
+    # browser worker, while Pfizer.com product-detail pages return HTTP 403.
+    # DailyMed/openFDA remain the authoritative scalable path.
     counts: Dict[str, int] = defaultdict(int)
     for row in rows:
         counts[row["status"]] += 1
@@ -2384,6 +2640,6 @@ async def baseline_evidence_health() -> Dict[str, Any]:
         "ok": True,
         "version": VERSION,
         "writeMode": "READ_ONLY",
-        "source": "openFDA application + current brand/ingredient SPL + DailyMed + Pfizer labeling fallback",
+        "source": "openFDA application + current brand/ingredient SPL + DailyMed current-brand fallback",
         "maxProductsPerRequest": MAX_PRODUCTS,
     }

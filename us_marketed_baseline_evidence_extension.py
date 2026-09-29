@@ -46,7 +46,7 @@ from main import _auth, app
 from routed_html_extension import _browser_payload
 
 
-VERSION = "US_MARKETED_BASELINE_EVIDENCE_V1.10_APPLICATION_FAMILY_RECONCILIATION"
+VERSION = "US_MARKETED_BASELINE_EVIDENCE_V1.11_CURRENT_PI_IDENTITY"
 OPENFDA_LABEL_URL = "https://api.fda.gov/drug/label.json"
 OPENFDA_DRUGSFDA_URL = "https://api.fda.gov/drug/drugsfda.json"
 DAILYMED_SPLS_URL = "https://dailymed.nlm.nih.gov/dailymed/services/v2/spls.json"
@@ -114,8 +114,15 @@ def _brand_candidates(raw: str) -> List[str]:
     if cleaned:
         values.append(cleaned)
 
+    cleaned_first = _norm(cleaned.split()[0]) if cleaned else ""
+    cleaned_word_count = len(cleaned.split()) if cleaned else 0
+
     for m in re.finditer(r"([A-Za-z0-9][A-Za-z0-9-]{2,})\s*[®™]", str(raw or "")):
-        values.append(m.group(1))
+        token = m.group(1)
+        # Prevent suffix-only candidates from multi-word brands such as
+        # DAYPRO ALTA™ -> "ALTA".
+        if cleaned_word_count <= 1 or _norm(token) == cleaned_first:
+            values.append(token)
 
     if cleaned:
         first = cleaned.split()[0]
@@ -933,7 +940,14 @@ async def _resolve_dailymed_product(
         "confidence": "Medium" if ambiguous else "High",
         "applicationNumbers": sorted(set(openfda_apps)),
         "splSetIds": sorted({x["setid"] for x in sponsor_pool}),
-        "activeIngredients": product.activeIngredients,
+        "activeIngredients": sorted({
+            str(x).strip()
+            for x in (
+                list(product.activeIngredients or [])
+                + list(chosen.get("activeIngredients") or [])
+            )
+            if str(x).strip()
+        }),
         "indicationText": chosen["indicationText"],
         "sourceUrl": (
             "https://dailymed.nlm.nih.gov/dailymed/drugInfo.cfm?setid="
@@ -1340,6 +1354,47 @@ async def _pfizer_current_label_links(product: BaselineProductInput) -> List[Dic
     return links[:6]
 
 
+
+def _extract_label_active_ingredients(
+    label_text: str,
+    brand_candidates: List[str],
+) -> List[str]:
+    """
+    Recover the labelled active ingredient from the title/header of a current
+    manufacturer PI, e.g. "MEDROL (methylprednisolone) Tablets".
+    """
+    raw = re.sub(r"\s+", " ", str(label_text or "")[:5000]).strip()
+    if not raw:
+        return []
+
+    out: List[str] = []
+    seen = set()
+
+    for brand in brand_candidates:
+        escaped = re.escape(_clean_brand(brand))
+        if not escaped:
+            continue
+
+        patterns = [
+            rf"(?i)\b{escaped}\b\s*[®™]?\s*\(([^)]{{2,180}})\)",
+            rf"(?i)\b{escaped}\b\s*[®™]?\s+([a-z][a-z0-9 -]{{2,120}}?)\s+(?:tablets?|capsules?|injection|oral solution|cream|ointment)\b",
+        ]
+
+        for pattern in patterns:
+            m = re.search(pattern, raw)
+            if not m:
+                continue
+
+            value = re.sub(r"\s+", " ", str(m.group(1) or "")).strip(" ,;:-")
+            n = _norm(value)
+            if value and n and n not in seen:
+                seen.add(n)
+                out.append(value)
+
+    return out[:10]
+
+
+
 async def _resolve_pfizer_current_label(
     product: BaselineProductInput,
     openfda_apps: List[str],
@@ -1416,6 +1471,10 @@ async def _resolve_pfizer_current_label(
             "score": int(link.get("score") or 0),
             "indicationText": indication_text,
             "normalizedIndicationText": _norm(indication_text),
+            "activeIngredients": _extract_label_active_ingredients(
+                label_text,
+                brand_candidates,
+            ),
         })
 
     if not resolved:
@@ -1492,6 +1551,7 @@ async def _resolve_pfizer_current_label(
             "productDetailUrl": chosen["productDetailUrl"],
             "candidateLabelCount": len(score_pool),
             "candidateAnchors": [x["anchor"] for x in score_pool],
+            "activeIngredients": chosen.get("activeIngredients") or [],
             "distinctIndicationStatements": len(distinct),
         },
     }

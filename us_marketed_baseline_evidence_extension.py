@@ -47,6 +47,8 @@ OPENFDA_LABEL_URL = "https://api.fda.gov/drug/label.json"
 DAILYMED_SPLS_URL = "https://dailymed.nlm.nih.gov/dailymed/services/v2/spls.json"
 DAILYMED_APPLICATIONS_URL = "https://dailymed.nlm.nih.gov/dailymed/services/v2/applicationnumbers.json"
 DAILYMED_SPL_XML_URL = "https://dailymed.nlm.nih.gov/dailymed/services/v2/spls/{setid}.xml"
+PFIZER_PRODUCT_DETAIL_URL = "https://www.pfizer.com/products/product-detail/{slug}"
+PFIZER_LABEL_BASE = "https://labeling.pfizer.com/ShowLabeling.aspx"
 DAILYMED_SPL_ZIP_URL = "https://dailymed.nlm.nih.gov/dailymed/downloadzipfile.cfm"
 MAX_PRODUCTS = 150
 CACHE_TTL = 86400.0
@@ -947,6 +949,367 @@ async def _resolve_dailymed_product(
         },
     }
 
+
+def _pfizer_slug_candidates(raw_name: str) -> List[str]:
+    cleaned = _clean_brand(raw_name)
+    values = [cleaned]
+    if cleaned:
+        first = cleaned.split()[0]
+        if len(first) >= 4:
+            values.append(first)
+
+    out: List[str] = []
+    seen = set()
+    for value in values:
+        slug = re.sub(r"[^a-z0-9]+", "-", str(value or "").lower()).strip("-")
+        if slug and slug not in seen:
+            seen.add(slug)
+            out.append(slug)
+    return out[:3]
+
+
+def _strip_html(value: str) -> str:
+    text = re.sub(r"(?is)<script[^>]*>.*?</script>", " ", str(value or ""))
+    text = re.sub(r"(?is)<style[^>]*>.*?</style>", " ", text)
+    text = re.sub(r"(?is)<[^>]+>", " ", text)
+    text = unescape(text)
+    return re.sub(r"\s+", " ", text).strip()
+
+
+async def _text_get(url: str, timeout_seconds: float = 30.0) -> tuple[int, str, str]:
+    now = time.time()
+    cached = _http_cache.get(url)
+    if cached and now - cached[0] < CACHE_TTL:
+        payload = cached[1]
+        if isinstance(payload, dict) and payload.get("__text_cache__"):
+            return (
+                int(payload.get("status") or 200),
+                str(payload.get("contentType") or ""),
+                str(payload.get("text") or ""),
+            )
+
+    headers = {
+        "User-Agent": "PharmaCommercialIntelligence/1.0 (+current manufacturer label verification)",
+        "Accept": "text/html,application/pdf,application/xhtml+xml,*/*",
+    }
+
+    async with _sem():
+        async with httpx.AsyncClient(
+            timeout=httpx.Timeout(timeout_seconds, connect=8.0),
+            follow_redirects=True,
+            headers=headers,
+        ) as client:
+            response = await client.get(url)
+
+    value = {
+        "__text_cache__": True,
+        "status": response.status_code,
+        "contentType": str(response.headers.get("content-type") or ""),
+        "text": response.text if "pdf" not in str(response.headers.get("content-type") or "").lower() else "",
+    }
+    _http_cache[url] = (now, value)
+    return response.status_code, value["contentType"], value["text"]
+
+
+async def _bytes_get(url: str, timeout_seconds: float = 35.0) -> tuple[int, str, bytes]:
+    headers = {
+        "User-Agent": "PharmaCommercialIntelligence/1.0 (+current manufacturer label verification)",
+        "Accept": "application/pdf,text/html,*/*",
+    }
+    async with _sem():
+        async with httpx.AsyncClient(
+            timeout=httpx.Timeout(timeout_seconds, connect=8.0),
+            follow_redirects=True,
+            headers=headers,
+        ) as client:
+            response = await client.get(url)
+    return (
+        response.status_code,
+        str(response.headers.get("content-type") or ""),
+        response.content,
+    )
+
+
+def _pfizer_label_pdf_url(url: str) -> Optional[str]:
+    parsed = urlparse(str(url or ""))
+    if "labeling.pfizer.com" not in parsed.netloc.lower():
+        return None
+    qs = parse_qs(parsed.query)
+    label_ids = qs.get("id") or qs.get("ID") or []
+    if not label_ids:
+        return None
+    label_id = str(label_ids[0]).strip()
+    if not label_id:
+        return None
+    return PFIZER_LABEL_BASE + "?" + urlencode({"format": "PDF", "id": label_id})
+
+
+def _extract_pdf_text(content: bytes) -> str:
+    if not content or not content.startswith(b"%PDF"):
+        return ""
+    try:
+        doc = fitz.open(stream=content, filetype="pdf")
+        parts = []
+        for page in doc:
+            parts.append(page.get_text("text"))
+        return "\n".join(parts)
+    except Exception:
+        return ""
+
+
+def _extract_current_indications(text: str) -> str:
+    raw = str(text or "").replace("\r", "\n")
+    raw = re.sub(r"[ \t]+", " ", raw)
+    raw = re.sub(r"\n{3,}", "\n\n", raw)
+
+    start_patterns = [
+        r"(?im)^\s*1\s+INDICATIONS\s+AND\s+USAGE\s*$",
+        r"(?im)^\s*INDICATIONS\s+AND\s+USAGE\s*$",
+        r"(?im)^\s*INDICATIONS\s*$",
+    ]
+    end_patterns = [
+        r"(?im)^\s*2\s+DOSAGE\s+AND\s+ADMINISTRATION\b",
+        r"(?im)^\s*DOSAGE\s+AND\s+ADMINISTRATION\b",
+        r"(?im)^\s*4\s+CONTRAINDICATIONS\b",
+        r"(?im)^\s*CONTRAINDICATIONS\b",
+        r"(?im)^\s*WARNINGS\b",
+    ]
+
+    starts: List[int] = []
+    for pattern in start_patterns:
+        starts.extend(m.start() for m in re.finditer(pattern, raw))
+
+    candidates: List[str] = []
+    for start in sorted(set(starts)):
+        tail = raw[start:]
+        end_positions = []
+        for pattern in end_patterns:
+            m = re.search(pattern, tail[20:])
+            if m:
+                end_positions.append(20 + m.start())
+        end = min(end_positions) if end_positions else min(len(tail), 16000)
+        segment = tail[:end].strip()
+        n = _norm(segment)
+        if len(n) < 30:
+            continue
+        indication_signal = len(re.findall(r"\bindicat(?:ed|ion)\b", n))
+        if indication_signal == 0:
+            continue
+        candidates.append(segment)
+
+    if not candidates:
+        return ""
+
+    # Prefer the candidate with the richest actual indication wording, not a
+    # table-of-contents line.
+    chosen = max(
+        candidates,
+        key=lambda x: (
+            len(re.findall(r"\bindicat(?:ed|ion)\b", _norm(x))),
+            min(len(x), 12000),
+        ),
+    )
+    return re.sub(r"\s+", " ", chosen).strip()
+
+
+async def _pfizer_current_label_links(product: BaselineProductInput) -> List[Dict[str, str]]:
+    candidates = _brand_candidates(product.name)
+    links: List[Dict[str, str]] = []
+    seen = set()
+
+    for slug in _pfizer_slug_candidates(product.name):
+        url = PFIZER_PRODUCT_DETAIL_URL.format(slug=slug)
+        try:
+            status, _ctype, html = await _text_get(url)
+        except Exception:
+            continue
+
+        if status != 200 or not html:
+            continue
+
+        page_text = _strip_html(html)
+        if not any(_norm(c) in _norm(page_text[:7000]) for c in candidates):
+            continue
+
+        for m in re.finditer(
+            r'(?is)<a\b[^>]*href=["\']([^"\']+)["\'][^>]*>(.*?)</a>',
+            html,
+        ):
+            href = unescape(str(m.group(1) or "")).strip()
+            anchor = _strip_html(str(m.group(2) or ""))
+            if "labeling.pfizer.com" not in href.lower():
+                continue
+
+            na = _norm(anchor)
+            if any(
+                blocked in na
+                for blocked in [
+                    "medication guide",
+                    "patient information",
+                    "patient leaflet",
+                    "instructions for use",
+                    "ifu",
+                ]
+            ):
+                continue
+
+            score = 0
+            if "prescribing information" in na:
+                score += 5
+            if "physician" in na:
+                score += 2
+            if any(_norm(c) in na for c in candidates):
+                score += 2
+
+            key = href.lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            links.append({
+                "href": href,
+                "anchor": anchor,
+                "score": str(score),
+                "productDetailUrl": url,
+            })
+
+        if links:
+            break
+
+    links.sort(key=lambda x: int(x.get("score") or 0), reverse=True)
+    return links[:6]
+
+
+async def _resolve_pfizer_current_label(
+    product: BaselineProductInput,
+    openfda_apps: List[str],
+) -> Dict[str, Any]:
+    links = await _pfizer_current_label_links(product)
+    brand_candidates = _brand_candidates(product.name)
+
+    if not links:
+        return {
+            "recordId": product.recordId,
+            "sourceName": product.name,
+            "status": "Not Found",
+            "confidence": "Low",
+            "applicationNumbers": sorted(set(openfda_apps)),
+            "splSetIds": [],
+            "activeIngredients": product.activeIngredients,
+            "indicationText": "",
+            "sourceUrl": None,
+            "authority": "Pfizer U.S. Prescribing Information",
+            "ambiguous": False,
+            "diagnostics": {
+                "fallbackRoute": "PFIZER_PRODUCT_DETAIL_NONE",
+            },
+        }
+
+    resolved = []
+    for link in links:
+        href = link["href"]
+        pdf_url = _pfizer_label_pdf_url(href) or href
+        try:
+            status, content_type, content = await _bytes_get(pdf_url)
+        except Exception:
+            continue
+
+        if status != 200 or not content:
+            continue
+
+        if content.startswith(b"%PDF") or "pdf" in content_type.lower():
+            label_text = _extract_pdf_text(content)
+        else:
+            try:
+                label_text = _strip_html(content.decode("utf-8", errors="ignore"))
+            except Exception:
+                label_text = ""
+
+        if not label_text:
+            continue
+
+        top = _norm(label_text[:6000])
+        if not any(_norm(c) in top for c in brand_candidates):
+            continue
+
+        indication_text = _extract_current_indications(label_text)
+        if not indication_text:
+            continue
+
+        resolved.append({
+            "sourceUrl": href,
+            "pdfUrl": pdf_url,
+            "productDetailUrl": link["productDetailUrl"],
+            "anchor": link["anchor"],
+            "score": int(link.get("score") or 0),
+            "indicationText": indication_text,
+            "normalizedIndicationText": _norm(indication_text),
+        })
+
+    if not resolved:
+        return {
+            "recordId": product.recordId,
+            "sourceName": product.name,
+            "status": "No Indication Text",
+            "confidence": "Low",
+            "applicationNumbers": sorted(set(openfda_apps)),
+            "splSetIds": [],
+            "activeIngredients": product.activeIngredients,
+            "indicationText": "",
+            "sourceUrl": None,
+            "authority": "Pfizer U.S. Prescribing Information",
+            "ambiguous": False,
+            "diagnostics": {
+                "fallbackRoute": "PFIZER_PRODUCT_DETAIL_LABEL_NO_TEXT",
+                "linkCount": len(links),
+            },
+        }
+
+    best_score = max(x["score"] for x in resolved)
+    score_pool = [x for x in resolved if x["score"] == best_score]
+
+    distinct: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
+    for item in score_pool:
+        distinct[item["normalizedIndicationText"]].append(item)
+
+    ambiguous = len(distinct) > 1
+    chosen = score_pool[0]
+
+    print(
+        "US_BASELINE_PFIZER_CURRENT_LABEL "
+        + json.dumps(
+            {
+                "recordId": product.recordId,
+                "name": product.name,
+                "sourceUrl": chosen["sourceUrl"],
+                "ambiguous": ambiguous,
+                "candidateLabels": len(score_pool),
+            },
+            separators=(",", ":"),
+        ),
+        flush=True,
+    )
+
+    return {
+        "recordId": product.recordId,
+        "sourceName": product.name,
+        "status": "Ambiguous" if ambiguous else "Matched",
+        "confidence": "Medium" if ambiguous else "High",
+        "applicationNumbers": sorted(set(openfda_apps)),
+        "splSetIds": [],
+        "activeIngredients": product.activeIngredients,
+        "indicationText": chosen["indicationText"],
+        "sourceUrl": chosen["sourceUrl"],
+        "authority": "Pfizer U.S. Prescribing Information",
+        "ambiguous": ambiguous,
+        "diagnostics": {
+            "fallbackRoute": "PFIZER_PRODUCT_DETAIL_CURRENT_US_PI",
+            "productDetailUrl": chosen["productDetailUrl"],
+            "candidateLabelCount": len(score_pool),
+            "candidateAnchors": [x["anchor"] for x in score_pool],
+            "distinctIndicationStatements": len(distinct),
+        },
+    }
+
 async def _batch_label_rows(
     products: List[BaselineProductInput],
     app_candidates: Dict[str, List[str]],
@@ -1240,6 +1603,45 @@ async def _build_result(payload: BaselineEvidenceRequest) -> Dict[str, Any]:
             if fallback.get("status") in {"Matched", "Ambiguous"}:
                 rows[i] = fallback
 
+    # Current manufacturer-label fallback for Pfizer catalogue rows that still
+    # have no usable openFDA/DailyMed indication evidence. The Pfizer product
+    # detail page is used only to discover the current U.S. prescribing-
+    # information link; the label itself remains read-only evidence.
+    if "pfizer" in _norm(payload.companyName or ""):
+        manufacturer_indexes = [
+            i for i, row in enumerate(rows)
+            if row.get("status") in {"Not Found", "No Indication Text"}
+        ]
+
+        if manufacturer_indexes:
+            manufacturer_results = await asyncio.gather(
+                *[
+                    _resolve_pfizer_current_label(
+                        products[i],
+                        app_candidates[products[i].recordId],
+                    )
+                    for i in manufacturer_indexes
+                ],
+                return_exceptions=True,
+            )
+
+            for i, fallback in zip(
+                manufacturer_indexes,
+                manufacturer_results,
+            ):
+                if isinstance(fallback, Exception):
+                    rows[i].setdefault("diagnostics", {})[
+                        "pfizerCurrentLabelFallbackError"
+                    ] = f"{type(fallback).__name__}: {str(fallback)[:500]}"
+                    continue
+
+                rows[i].setdefault("diagnostics", {})[
+                    "pfizerCurrentLabelFallback"
+                ] = fallback.get("diagnostics") or {}
+
+                if fallback.get("status") in {"Matched", "Ambiguous"}:
+                    rows[i] = fallback
+
     counts: Dict[str, int] = defaultdict(int)
     for row in rows:
         counts[row["status"]] += 1
@@ -1485,6 +1887,6 @@ async def baseline_evidence_health() -> Dict[str, Any]:
         "ok": True,
         "version": VERSION,
         "writeMode": "READ_ONLY",
-        "source": "openFDA drug labeling + DailyMed v2 SPL API fallback",
+        "source": "openFDA + DailyMed v2 + current Pfizer U.S. prescribing information fallback",
         "maxProductsPerRequest": MAX_PRODUCTS,
     }

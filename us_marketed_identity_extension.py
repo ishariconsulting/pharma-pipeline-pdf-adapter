@@ -31,7 +31,7 @@ from pydantic import BaseModel, Field
 from main import _auth, app
 
 
-VERSION = "US_MARKETED_IDENTITY_V1.11_BRAND_INGREDIENT_APPLICATION_FAMILY"
+VERSION = "US_MARKETED_IDENTITY_V1.12_COMPLETE_BRAND_FAMILY"
 MAX_PRODUCTS = 400
 OPENFDA_BASE = "https://api.fda.gov"
 DAILYMED_SPLS = "https://dailymed.nlm.nih.gov/dailymed/services/v2/spls.json"
@@ -229,6 +229,58 @@ def _exact_ingredient_family_match(
     return all(component in source for component in product_components)
 
 
+def _compatible_family_row_indexes(
+    product_molecule: Any,
+    ingredient_rows: List[List[str]],
+) -> tuple[List[int], str]:
+    """
+    Decide which exact-brand FDA application rows belong to one catalogue
+    product family.
+
+    1. Prefer strict fixed-combination identity: every catalogue molecule
+       component appears in the same FDA product row.
+    2. If no row contains all components, allow an alternate-formulation
+       family only when the union of clean exact-brand rows covers every
+       catalogue component and each accepted row contains no off-family active
+       ingredient. This handles brands such as VIBRAMYCIN where catalogue
+       identity spans calcium/hyclate formulations without weakening
+       fixed-combination products such as CORTISPORIN.
+    """
+    components = set(_molecule_components(product_molecule))
+    if not components:
+        return list(range(len(ingredient_rows))), "NO_MOLECULE_GUARD"
+
+    normalized_rows = [
+        _source_ingredient_set(values)
+        for values in ingredient_rows
+    ]
+
+    strict = [
+        idx
+        for idx, source in enumerate(normalized_rows)
+        if source and components.issubset(source)
+    ]
+    if strict:
+        return strict, "STRICT_ALL_COMPONENTS"
+
+    if len(components) <= 1:
+        return [], "NO_COMPATIBLE_ROW"
+
+    clean_subset_indexes = [
+        idx
+        for idx, source in enumerate(normalized_rows)
+        if source and source.issubset(components)
+    ]
+    clean_union: set[str] = set()
+    for idx in clean_subset_indexes:
+        clean_union.update(normalized_rows[idx])
+
+    if components.issubset(clean_union):
+        return clean_subset_indexes, "ALTERNATE_FORMULATION_COMPONENTS"
+
+    return [], "NO_COMPATIBLE_ROW"
+
+
 def _empty_drugs() -> Dict[str, Any]:
     return {
         "matched": False, "applicationNumbers": [], "sponsorNames": [],
@@ -290,13 +342,63 @@ async def _batch_drugsfda(products: List[ProductInput], candidates: Dict[str, Li
                 seen_by_product[record_id].add(dedupe_key)
                 raw[record_id].append(row)
 
+    # OR-batched Drugs@FDA queries can hit the endpoint result limit when a
+    # group contains prolific brands. Retry only products with no exact-brand
+    # source rows using one bounded exact-brand query each.
+    missing_products = [
+        product
+        for product in products
+        if not raw.get(product.recordId)
+    ]
+
+    if missing_products:
+        retry_payloads = await asyncio.gather(*[
+            _openfda(
+                "/drug/drugsfda.json",
+                f'products.brand_name:"{candidates[product.recordId][0].replace(chr(34), "").strip()}"',
+                limit=99,
+            )
+            for product in missing_products
+            if candidates.get(product.recordId)
+            and candidates[product.recordId]
+        ], return_exceptions=True)
+
+        retry_products = [
+            product
+            for product in missing_products
+            if candidates.get(product.recordId)
+            and candidates[product.recordId]
+        ]
+
+        for product, payload in zip(retry_products, retry_payloads):
+            if isinstance(payload, Exception):
+                continue
+            allowed = candidate_sets.get(product.recordId, set())
+            seen = seen_by_product[product.recordId]
+            for row in list((payload or {}).get("results") or []):
+                if not any(
+                    _norm(p.get("brand_name")) in allowed
+                    for p in (row.get("products") or [])
+                ):
+                    continue
+                row_identity = (
+                    str(row.get("application_number") or "")
+                    + "|"
+                    + str(row.get("sponsor_name") or "")
+                )
+                dedupe_key = row_identity + "|" + product.recordId
+                if dedupe_key in seen:
+                    continue
+                seen.add(dedupe_key)
+                raw[product.recordId].append(row)
+
     out: Dict[str, Dict[str, Any]] = {}
     for product in products:
         rows = raw.get(product.recordId, [])
         allowed = candidate_sets.get(product.recordId, set())
 
-        compatible_rows = []
-        rejected_variants = []
+        row_parts = []
+        ingredient_rows: List[List[str]] = []
 
         for row in rows:
             exact_brand_products = [
@@ -310,11 +412,20 @@ async def _batch_drugsfda(products: List[ProductInput], candidates: Dict[str, Li
                 for ai in (p.get("active_ingredients") or [])
                 if str(ai.get("name") or "").strip()
             ]
+            row_parts.append((row, exact_brand_products, row_ingredients))
+            ingredient_rows.append(row_ingredients)
 
-            compatible = _exact_ingredient_family_match(
-                product.molecule,
-                row_ingredients,
-            )
+        compatible_indexes, family_mode = _compatible_family_row_indexes(
+            product.molecule,
+            ingredient_rows,
+        )
+        compatible_index_set = set(compatible_indexes)
+
+        compatible_rows = []
+        rejected_variants = []
+
+        for idx, (row, exact_brand_products, row_ingredients) in enumerate(row_parts):
+            compatible = idx in compatible_index_set
 
             variant = {
                 "applicationNumber": str(row.get("application_number") or "").strip(),
@@ -331,6 +442,7 @@ async def _batch_drugsfda(products: List[ProductInput], candidates: Dict[str, Li
                     if str(p.get("marketing_status") or "").strip()
                 }),
                 "ingredientFamilyCompatible": compatible,
+                "ingredientFamilyMode": family_mode,
             }
 
             if compatible:
@@ -381,6 +493,11 @@ async def _batch_drugsfda(products: List[ProductInput], candidates: Dict[str, Li
             "productTypes": sorted(product_types),
             "recordCount": len(compatible_rows),
             "applicationVariants": application_variants,
+            "ingredientFamilyMode": (
+                application_variants[0].get("ingredientFamilyMode")
+                if application_variants
+                else "NO_COMPATIBLE_ROW"
+            ),
             "rejectedBrandVariants": rejected_variants[:20],
         }
     return out
@@ -433,24 +550,30 @@ async def _batch_label(products: List[ProductInput], candidates: Dict[str, List[
     for product in products:
         candidate_rows = raw.get(product.recordId, [])
 
-        rows = []
-        rejected = []
-
+        ingredient_rows = []
         for row in candidate_rows:
             ofda = row.get("openfda") or {}
-            source_ingredients = [
+            ingredient_rows.append([
                 str(v).strip()
                 for v in (
                     list(ofda.get("substance_name") or [])
                     + list(ofda.get("generic_name") or [])
                 )
                 if str(v).strip()
-            ]
+            ])
 
-            compatible = _exact_ingredient_family_match(
-                product.molecule,
-                source_ingredients,
-            )
+        compatible_indexes, family_mode = _compatible_family_row_indexes(
+            product.molecule,
+            ingredient_rows,
+        )
+        compatible_index_set = set(compatible_indexes)
+
+        rows = []
+        rejected = []
+
+        for idx, row in enumerate(candidate_rows):
+            ofda = row.get("openfda") or {}
+            compatible = idx in compatible_index_set
 
             if compatible:
                 rows.append(row)
@@ -471,6 +594,7 @@ async def _batch_label(products: List[ProductInput], candidates: Dict[str, List[
                         for v in (ofda.get("substance_name") or [])
                         if str(v).strip()
                     ],
+                    "ingredientFamilyMode": family_mode,
                 })
 
         def collect(field: str) -> List[str]:
@@ -492,6 +616,7 @@ async def _batch_label(products: List[ProductInput], candidates: Dict[str, List[
             "substanceNames": collect("substance_name"),
             "splSetIds": collect("spl_set_id"),
             "recordCount": len(rows),
+            "ingredientFamilyMode": family_mode,
             "rejectedBrandVariants": rejected[:20],
         }
     return out

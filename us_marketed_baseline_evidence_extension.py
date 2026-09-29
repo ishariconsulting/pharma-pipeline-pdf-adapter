@@ -40,7 +40,7 @@ from pydantic import BaseModel, Field
 from main import _auth, app
 
 
-VERSION = "US_MARKETED_BASELINE_EVIDENCE_V1.1_DAILYMED_FALLBACK"
+VERSION = "US_MARKETED_BASELINE_EVIDENCE_V1.2_DAILYMED_XML_IDENTITY_FALLBACK"
 OPENFDA_LABEL_URL = "https://api.fda.gov/drug/label.json"
 DAILYMED_SPLS_URL = "https://dailymed.nlm.nih.gov/dailymed/services/v2/spls.json"
 DAILYMED_APPLICATIONS_URL = "https://dailymed.nlm.nih.gov/dailymed/services/v2/applicationnumbers.json"
@@ -330,6 +330,44 @@ def _extract_indications_from_spl_xml(xml_text: str) -> str:
     return _canonical_indication_text(sections)
 
 
+
+def _extract_application_numbers_from_spl_xml(xml_text: str) -> List[str]:
+    """
+    Read NDA/ANDA/BLA identifiers directly from the official SPL XML.
+
+    DailyMed's application-number index is useful but some biologic/vaccine
+    labels are not consistently discoverable through that index. The SPL
+    itself contains the marketing application identifier, so brand-search
+    fallback verifies identity against the source document rather than
+    trusting the search result alone.
+    """
+    found = set()
+    pattern = re.compile(r"\b(?:NDA|ANDA|BLA)\s*[- ]?\s*\d{5,6}\b", re.I)
+
+    try:
+        root = ET.fromstring(xml_text)
+    except Exception:
+        root = None
+
+    values: List[str] = []
+    if root is not None:
+        for node in root.iter():
+            if node.text:
+                values.append(str(node.text))
+            for attr_value in node.attrib.values():
+                values.append(str(attr_value))
+
+    values.append(str(xml_text or ""))
+
+    for value in values:
+        for match in pattern.findall(value):
+            token = re.sub(r"[^A-Za-z0-9]", "", match).upper()
+            if token:
+                found.add(token)
+
+    return sorted(found)
+
+
 async def _dailymed_json_get(
     url: str,
     params: Dict[str, Any],
@@ -477,8 +515,14 @@ async def _resolve_dailymed_product(
     if candidates_by_setid:
         matched_route = "DAILYMED_APPLICATION_PLUS_BRAND"
 
-    # Route B: brand search, then exact application-number verification.
+    # Route B: brand search, then verify the application number directly
+    # from the official SPL XML. This is more robust for BLAs/vaccines and
+    # legacy labels that are not consistently indexed by /applicationnumbers.
+    prefetched_xml: Dict[str, str] = {}
+
     if not candidates_by_setid:
+        brand_rows: Dict[str, Dict[str, Any]] = {}
+
         for brand in brand_candidates[:3]:
             try:
                 rows = await _daily_spls_by_brand(brand)
@@ -492,18 +536,46 @@ async def _resolve_dailymed_product(
                     continue
                 if not _brand_matches(title, brand_candidates):
                     continue
+                brand_rows[setid] = row
 
-                try:
-                    set_apps = await _daily_apps_for_setid(setid)
-                except Exception:
+        ordered_brand_rows = sorted(
+            brand_rows.values(),
+            key=lambda x: _parse_daily_date(x.get("published_date")),
+            reverse=True,
+        )[:12]
+
+        if ordered_brand_rows:
+            xml_values = await asyncio.gather(
+                *[
+                    _dailymed_xml_get(str(row.get("setid") or "").strip())
+                    for row in ordered_brand_rows
+                ],
+                return_exceptions=True,
+            )
+
+            input_apps = set(_dailymed_application_candidates(daily_apps))
+
+            for row, xml_value in zip(ordered_brand_rows, xml_values):
+                if isinstance(xml_value, Exception):
                     continue
 
-                normalized_set_apps = set(_dailymed_application_candidates(set_apps))
-                if normalized_set_apps.intersection(set(daily_apps)):
+                setid = str(row.get("setid") or "").strip()
+                xml_text = str(xml_value or "")
+                if not setid or not xml_text:
+                    continue
+
+                source_apps = set(
+                    _dailymed_application_candidates(
+                        _extract_application_numbers_from_spl_xml(xml_text)
+                    )
+                )
+
+                if source_apps.intersection(input_apps):
                     candidates_by_setid[setid] = row
+                    prefetched_xml[setid] = xml_text
 
         if candidates_by_setid:
-            matched_route = "DAILYMED_BRAND_PLUS_APPLICATION_VERIFY"
+            matched_route = "DAILYMED_BRAND_PLUS_SPL_XML_APPLICATION_VERIFY"
 
     if not candidates_by_setid:
         return {
@@ -535,7 +607,18 @@ async def _resolve_dailymed_product(
 
     fetched = await asyncio.gather(
         *[
-            _dailymed_xml_get(str(row.get("setid") or "").strip())
+            (
+                asyncio.sleep(
+                    0,
+                    result=prefetched_xml[
+                        str(row.get("setid") or "").strip()
+                    ],
+                )
+                if str(row.get("setid") or "").strip() in prefetched_xml
+                else _dailymed_xml_get(
+                    str(row.get("setid") or "").strip()
+                )
+            )
             for row in selected
         ],
         return_exceptions=True,

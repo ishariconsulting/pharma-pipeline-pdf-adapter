@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import io
 import json
 import os
 import re
@@ -29,6 +30,7 @@ import threading
 import time
 import uuid
 import xml.etree.ElementTree as ET
+import zipfile
 from datetime import datetime
 from collections import defaultdict
 from typing import Any, Dict, Iterable, List, Optional
@@ -40,11 +42,12 @@ from pydantic import BaseModel, Field
 from main import _auth, app
 
 
-VERSION = "US_MARKETED_BASELINE_EVIDENCE_V1.2_DAILYMED_XML_IDENTITY_FALLBACK"
+VERSION = "US_MARKETED_BASELINE_EVIDENCE_V1.3_DAILYMED_ZIP_FALLBACK"
 OPENFDA_LABEL_URL = "https://api.fda.gov/drug/label.json"
 DAILYMED_SPLS_URL = "https://dailymed.nlm.nih.gov/dailymed/services/v2/spls.json"
 DAILYMED_APPLICATIONS_URL = "https://dailymed.nlm.nih.gov/dailymed/services/v2/applicationnumbers.json"
 DAILYMED_SPL_XML_URL = "https://dailymed.nlm.nih.gov/dailymed/services/v2/spls/{setid}.xml"
+DAILYMED_SPL_ZIP_URL = "https://dailymed.nlm.nih.gov/dailymed/downloadzipfile.cfm"
 MAX_PRODUCTS = 150
 CACHE_TTL = 86400.0
 JOB_TTL_SECONDS = 7200.0
@@ -412,39 +415,150 @@ async def _dailymed_json_get(
     return payload
 
 
-async def _dailymed_xml_get(setid: str, timeout_seconds: float = 25.0) -> str:
+async def _dailymed_xml_get(setid: str, timeout_seconds: float = 30.0) -> str:
+    """
+    Fetch the current SPL XML.
+
+    DailyMed's REST /spls/{SETID}.xml endpoint can return an empty/404 response
+    for labels that are nevertheless available in the official DailyMed ZIP
+    download. Fall back to downloadzipfile.cfm and extract the SPL XML from
+    that official package.
+    """
     url = DAILYMED_SPL_XML_URL.format(setid=setid)
+    cache_key = "SPLXML|" + setid
     now = time.time()
-    cached = _http_cache.get(url)
+    cached = _http_cache.get(cache_key)
     if cached and now - cached[0] < CACHE_TTL:
         return str(cached[1] or "")
 
     headers = {
         "User-Agent": "PharmaCommercialIntelligence/1.0 (+DailyMed official SPL fallback)",
-        "Accept": "application/xml,text/xml",
+        "Accept": "application/xml,text/xml,*/*",
     }
 
-    async with _sem():
-        async with httpx.AsyncClient(
-            timeout=httpx.Timeout(timeout_seconds, connect=8.0),
-            follow_redirects=True,
-            headers=headers,
-        ) as client:
-            response = await client.get(url)
+    rest_text = ""
+    rest_status = None
 
-    if response.status_code == 404:
-        _http_cache[url] = (now, "")
-        return ""
+    try:
+        async with _sem():
+            async with httpx.AsyncClient(
+                timeout=httpx.Timeout(timeout_seconds, connect=8.0),
+                follow_redirects=True,
+                headers=headers,
+            ) as client:
+                response = await client.get(url)
 
-    if response.status_code >= 400:
-        raise HTTPException(
-            status_code=502,
-            detail=f"DailyMed SPL XML request failed {response.status_code}",
+        rest_status = response.status_code
+        if response.status_code < 400:
+            rest_text = response.text or ""
+            if rest_text.strip():
+                _http_cache[cache_key] = (now, rest_text)
+                return rest_text
+    except Exception:
+        rest_status = None
+
+    # Official ZIP fallback.
+    zip_headers = {
+        "User-Agent": "PharmaCommercialIntelligence/1.0 (+DailyMed official SPL ZIP fallback)",
+        "Accept": "application/zip,application/octet-stream,*/*",
+    }
+
+    try:
+        async with _sem():
+            async with httpx.AsyncClient(
+                timeout=httpx.Timeout(timeout_seconds, connect=8.0),
+                follow_redirects=True,
+                headers=zip_headers,
+            ) as client:
+                zip_response = await client.get(
+                    DAILYMED_SPL_ZIP_URL,
+                    params={"setId": setid},
+                )
+
+        if zip_response.status_code >= 400:
+            print(
+                "US_BASELINE_DAILYMED_ZIP_HTTP_ERROR "
+                + json.dumps(
+                    {
+                        "setid": setid,
+                        "restStatus": rest_status,
+                        "zipStatus": zip_response.status_code,
+                    },
+                    separators=(",", ":"),
+                ),
+                flush=True,
+            )
+            _http_cache[cache_key] = (now, "")
+            return ""
+
+        try:
+            with zipfile.ZipFile(io.BytesIO(zip_response.content)) as zf:
+                xml_names = [
+                    name for name in zf.namelist()
+                    if name.lower().endswith(".xml")
+                    and not name.endswith("/")
+                ]
+
+                if not xml_names:
+                    _http_cache[cache_key] = (now, "")
+                    return ""
+
+                # Main SPL XML is normally the largest XML document in the ZIP.
+                ranked = sorted(
+                    xml_names,
+                    key=lambda name: zf.getinfo(name).file_size,
+                    reverse=True,
+                )
+
+                xml_bytes = zf.read(ranked[0])
+                xml_text = xml_bytes.decode("utf-8", errors="replace")
+
+                print(
+                    "US_BASELINE_DAILYMED_ZIP_USED "
+                    + json.dumps(
+                        {
+                            "setid": setid,
+                            "restStatus": rest_status,
+                            "zipStatus": zip_response.status_code,
+                            "xmlFile": ranked[0],
+                            "xmlChars": len(xml_text),
+                        },
+                        separators=(",", ":"),
+                    ),
+                    flush=True,
+                )
+
+                _http_cache[cache_key] = (now, xml_text)
+                return xml_text
+        except Exception as exc:
+            print(
+                "US_BASELINE_DAILYMED_ZIP_PARSE_ERROR "
+                + json.dumps(
+                    {
+                        "setid": setid,
+                        "error": f"{type(exc).__name__}: {str(exc)[:500]}",
+                    },
+                    separators=(",", ":"),
+                ),
+                flush=True,
+            )
+            _http_cache[cache_key] = (now, "")
+            return ""
+    except Exception as exc:
+        print(
+            "US_BASELINE_DAILYMED_ZIP_FETCH_ERROR "
+            + json.dumps(
+                {
+                    "setid": setid,
+                    "restStatus": rest_status,
+                    "error": f"{type(exc).__name__}: {str(exc)[:500]}",
+                },
+                separators=(",", ":"),
+            ),
+            flush=True,
         )
-
-    value = response.text
-    _http_cache[url] = (now, value)
-    return value
+        _http_cache[cache_key] = (now, "")
+        return ""
 
 
 async def _daily_spls_by_application(app: str) -> List[Dict[str, Any]]:

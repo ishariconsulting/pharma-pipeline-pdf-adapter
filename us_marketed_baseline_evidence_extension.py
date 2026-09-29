@@ -46,8 +46,9 @@ from main import _auth, app
 from routed_html_extension import _browser_payload
 
 
-VERSION = "US_MARKETED_BASELINE_EVIDENCE_V1.9_DAILYMED_BRAND_INGREDIENT_FALLBACK"
+VERSION = "US_MARKETED_BASELINE_EVIDENCE_V1.10_APPLICATION_FAMILY_RECONCILIATION"
 OPENFDA_LABEL_URL = "https://api.fda.gov/drug/label.json"
+OPENFDA_DRUGSFDA_URL = "https://api.fda.gov/drug/drugsfda.json"
 DAILYMED_SPLS_URL = "https://dailymed.nlm.nih.gov/dailymed/services/v2/spls.json"
 DAILYMED_APPLICATIONS_URL = "https://dailymed.nlm.nih.gov/dailymed/services/v2/applicationnumbers.json"
 DAILYMED_SPL_XML_URL = "https://dailymed.nlm.nih.gov/dailymed/services/v2/spls/{setid}.xml"
@@ -1496,6 +1497,188 @@ async def _resolve_pfizer_current_label(
     }
 
 
+
+async def _drugsfda_json_get(
+    params: Dict[str, Any],
+    timeout_seconds: float = 25.0,
+) -> Any:
+    key = OPENFDA_DRUGSFDA_URL + "?" + "&".join(
+        f"{k}={params[k]}" for k in sorted(params)
+    )
+    now = time.time()
+    cached = _http_cache.get(key)
+    if cached and now - cached[0] < CACHE_TTL:
+        return cached[1]
+
+    headers = {
+        "User-Agent": "PharmaCommercialIntelligence/1.0 (+FDA application-family reconciliation)",
+        "Accept": "application/json",
+    }
+
+    async with _sem():
+        async with httpx.AsyncClient(
+            timeout=httpx.Timeout(timeout_seconds, connect=8.0),
+            follow_redirects=True,
+            headers=headers,
+        ) as client:
+            response = await client.get(
+                OPENFDA_DRUGSFDA_URL,
+                params=params,
+            )
+
+    if response.status_code == 404:
+        payload = {"results": []}
+        _http_cache[key] = (now, payload)
+        return payload
+
+    if response.status_code >= 400:
+        raise HTTPException(
+            status_code=502,
+            detail=f"openFDA Drugs@FDA request failed {response.status_code}",
+        )
+
+    try:
+        payload = response.json()
+    except Exception as exc:
+        raise HTTPException(
+            status_code=502,
+            detail="openFDA Drugs@FDA returned invalid JSON",
+        ) from exc
+
+    _http_cache[key] = (now, payload)
+    return payload
+
+
+def _strict_ingredient_family_match(
+    product_ingredients: List[str],
+    source_ingredients: List[str],
+) -> bool:
+    product_norm = {
+        _norm(x)
+        for x in product_ingredients
+        if _norm(x)
+    }
+    source_norm = {
+        _norm(x)
+        for x in source_ingredients
+        if _norm(x)
+    }
+
+    if not product_norm:
+        return False
+    if not source_norm:
+        return False
+
+    return product_norm.issubset(source_norm)
+
+
+async def _drugsfda_application_family(
+    product: BaselineProductInput,
+) -> Dict[str, Any]:
+    brands = _brand_candidates(product.name)
+    applications = set()
+    variants = []
+    rejected = []
+
+    for brand in brands[:3]:
+        clean = _clean_brand(brand)
+        if not clean:
+            continue
+
+        params: Dict[str, Any] = {
+            "search": f'products.brand_name:"{clean}"',
+            "limit": 99,
+        }
+        api_key = os.getenv("OPENFDA_API_KEY", "").strip()
+        if api_key:
+            params["api_key"] = api_key
+
+        try:
+            payload = await _drugsfda_json_get(params)
+        except Exception:
+            continue
+
+        for row in list(payload.get("results") or []):
+            app = str(row.get("application_number") or "").strip()
+            sponsor = str(row.get("sponsor_name") or "").strip()
+
+            exact_brand_products = [
+                p
+                for p in (row.get("products") or [])
+                if any(
+                    _brand_matches(
+                        p.get("brand_name"),
+                        brands,
+                    )
+                    for _ in [0]
+                )
+            ]
+
+            if not exact_brand_products:
+                continue
+
+            ingredients = sorted({
+                str(ai.get("name") or "").strip()
+                for p in exact_brand_products
+                for ai in (p.get("active_ingredients") or [])
+                if str(ai.get("name") or "").strip()
+            })
+
+            compatible = _strict_ingredient_family_match(
+                list(product.activeIngredients or []),
+                ingredients,
+            )
+
+            variant = {
+                "applicationNumber": app,
+                "sponsorName": sponsor,
+                "activeIngredients": ingredients,
+                "dosageForms": sorted({
+                    str(p.get("dosage_form") or "").strip()
+                    for p in exact_brand_products
+                    if str(p.get("dosage_form") or "").strip()
+                }),
+                "marketingStatuses": sorted({
+                    str(p.get("marketing_status") or "").strip()
+                    for p in exact_brand_products
+                    if str(p.get("marketing_status") or "").strip()
+                }),
+                "ingredientFamilyCompatible": compatible,
+            }
+
+            if compatible:
+                if app:
+                    applications.add(app)
+                variants.append(variant)
+            else:
+                rejected.append(variant)
+
+    return {
+        "applicationNumbers": sorted(applications),
+        "variants": variants,
+        "rejectedVariants": rejected[:20],
+    }
+
+
+def _application_family_reconciles(
+    input_apps: List[str],
+    source_apps: List[str],
+    family_apps: List[str],
+) -> bool:
+    expanded_input = set(_application_candidates(input_apps))
+    expanded_source = set(_application_candidates(source_apps))
+    expanded_family = set(_application_candidates(family_apps))
+
+    return bool(
+        expanded_input
+        and expanded_source
+        and expanded_family
+        and expanded_input.intersection(expanded_family)
+        and expanded_source.intersection(expanded_family)
+    )
+
+
+
 def _ingredient_compatibility(
     product_ingredients: List[str],
     label_values: List[str],
@@ -1713,16 +1896,34 @@ async def _resolve_openfda_brand_product(
         else None
     )
 
-    application_mismatch = bool(
+    raw_application_mismatch = bool(
         source_apps
         and input_apps
         and not set(source_apps).intersection(set(input_apps))
     )
 
-    # Fail closed when exact brand + ingredient resolves to a different FDA
-    # application than the catalogue identity. Brand families can span
-    # different dosage forms / routes / formulations with materially different
-    # indications. Do not silently substitute one application for another.
+    application_family = await _drugsfda_application_family(product)
+    family_apps = list(application_family.get("applicationNumbers") or [])
+
+    family_reconciled = (
+        raw_application_mismatch
+        and _application_family_reconciles(
+            list(input_apps),
+            list(source_apps),
+            family_apps,
+        )
+    )
+
+    application_mismatch = (
+        raw_application_mismatch
+        and not family_reconciled
+    )
+
+    # Different FDA application numbers can legitimately belong to one exact
+    # brand + active-ingredient family (e.g. SUTENT approvals submitted under
+    # separate NDAs). Accept only when Drugs@FDA independently confirms both
+    # the catalogue and label application inside that same strict ingredient
+    # family. Otherwise fail closed.
     if application_mismatch:
         status = "Application Mismatch"
         confidence = "Low"
@@ -1740,6 +1941,8 @@ async def _resolve_openfda_brand_product(
                 "inputApps": sorted(set(input_apps)),
                 "sourceApps": source_apps,
                 "applicationMismatch": application_mismatch,
+                "applicationFamilyReconciled": family_reconciled,
+                "applicationFamily": family_apps,
                 "splSetIds": spl_ids,
                 "effectiveTime": chosen["effectiveTime"],
             },
@@ -1775,6 +1978,10 @@ async def _resolve_openfda_brand_product(
             "inputApplicationNumbers": sorted(set(input_apps)),
             "sourceApplicationNumbers": source_apps,
             "applicationMismatch": application_mismatch,
+            "applicationFamilyReconciled": family_reconciled,
+            "applicationFamily": family_apps,
+            "applicationFamilyVariants": application_family.get("variants") or [],
+            "applicationFamilyRejectedVariants": application_family.get("rejectedVariants") or [],
             "ingredientCompatibility": chosen["ingredientCompatibility"],
             "bestSponsorScore": best_sponsor_score,
             "distinctIndicationStatements": len(distinct),
@@ -1980,15 +2187,31 @@ async def _resolve_dailymed_brand_product(
         + chosen["setid"]
     )
 
-    application_mismatch = bool(
+    raw_application_mismatch = bool(
         source_apps
         and input_apps
         and not set(source_apps).intersection(set(input_apps))
     )
 
-    # Fail closed on brand+ingredient matches that belong to a different FDA
-    # application. A marketed brand family can have multiple formulations,
-    # routes, or strengths with materially different indication sets.
+    application_family = await _drugsfda_application_family(product)
+    family_apps = list(application_family.get("applicationNumbers") or [])
+
+    family_reconciled = (
+        raw_application_mismatch
+        and _application_family_reconciles(
+            list(input_apps),
+            list(source_apps),
+            family_apps,
+        )
+    )
+
+    application_mismatch = (
+        raw_application_mismatch
+        and not family_reconciled
+    )
+
+    # Reconcile different application numbers only when Drugs@FDA confirms
+    # the same strict brand + active-ingredient application family.
     if application_mismatch:
         status = "Application Mismatch"
         confidence = "Low"
@@ -2006,6 +2229,8 @@ async def _resolve_dailymed_brand_product(
                 "inputApps": sorted(set(input_apps)),
                 "sourceApps": source_apps,
                 "applicationMismatch": application_mismatch,
+                "applicationFamilyReconciled": family_reconciled,
+                "applicationFamily": family_apps,
                 "setid": chosen["setid"],
                 "publishedDate": chosen["publishedDate"],
             },
@@ -2039,10 +2264,11 @@ async def _resolve_dailymed_brand_product(
             "candidateBrands": brands,
             "inputApplicationNumbers": sorted(set(input_apps)),
             "sourceApplicationNumbers": source_apps,
-            "applicationMismatch": bool(
-                source_apps
-                and not set(source_apps).intersection(set(input_apps))
-            ),
+            "applicationMismatch": application_mismatch,
+            "applicationFamilyReconciled": family_reconciled,
+            "applicationFamily": family_apps,
+            "applicationFamilyVariants": application_family.get("variants") or [],
+            "applicationFamilyRejectedVariants": application_family.get("rejectedVariants") or [],
             "ingredientCompatibility": chosen["ingredientCompatibility"],
             "candidateSplCount": len(candidates_by_setid),
             "distinctIndicationStatements": len(distinct),

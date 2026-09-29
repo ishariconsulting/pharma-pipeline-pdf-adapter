@@ -578,6 +578,19 @@ async def _resolve_dailymed_product(
             matched_route = "DAILYMED_BRAND_PLUS_SPL_XML_APPLICATION_VERIFY"
 
     if not candidates_by_setid:
+        print(
+            "US_BASELINE_DAILYMED_FALLBACK_NONE "
+            + json.dumps(
+                {
+                    "recordId": product.recordId,
+                    "name": product.name,
+                    "brandCandidates": brand_candidates,
+                    "applicationCandidates": daily_apps,
+                },
+                separators=(",", ":"),
+            ),
+            flush=True,
+        )
         return {
             "recordId": product.recordId,
             "sourceName": product.name,
@@ -653,6 +666,26 @@ async def _resolve_dailymed_product(
         })
 
     if not label_rows:
+        print(
+            "US_BASELINE_DAILYMED_FALLBACK_NO_TEXT "
+            + json.dumps(
+                {
+                    "recordId": product.recordId,
+                    "name": product.name,
+                    "route": matched_route,
+                    "candidateSpls": [
+                        {
+                            "setid": str(x.get("setid") or ""),
+                            "title": str(x.get("title") or ""),
+                            "publishedDate": str(x.get("published_date") or ""),
+                        }
+                        for x in selected
+                    ],
+                },
+                separators=(",", ":"),
+            ),
+            flush=True,
+        )
         return {
             "recordId": product.recordId,
             "sourceName": product.name,
@@ -692,6 +725,21 @@ async def _resolve_dailymed_product(
         key=lambda x: (x["sponsorScore"], x["publishedTimestamp"]),
         reverse=True,
     )[0]
+
+    print(
+        "US_BASELINE_DAILYMED_FALLBACK_MATCH "
+        + json.dumps(
+            {
+                "recordId": product.recordId,
+                "name": product.name,
+                "route": matched_route,
+                "chosenSetid": chosen["setid"],
+                "ambiguous": ambiguous,
+            },
+            separators=(",", ":"),
+        ),
+        flush=True,
+    )
 
     return {
         "recordId": product.recordId,

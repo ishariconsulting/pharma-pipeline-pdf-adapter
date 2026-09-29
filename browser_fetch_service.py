@@ -551,9 +551,22 @@ async def _pfizer_label_search(
                     continue
 
             if target is None:
+                print(
+                    "PFIZER_LABEL_SEARCH_INPUT_DIAGNOSTIC "
+                    + str({
+                        "brand": clean_brand,
+                        "finalUrl": page.url,
+                        "inputs": input_diagnostics,
+                    }),
+                    flush=True,
+                )
                 raise HTTPException(
                     status_code=502,
-                    detail="Pfizer labeling search exposed no visible text/search input",
+                    detail={
+                        "message": "Pfizer labeling search exposed no visible text/search input",
+                        "finalUrl": page.url,
+                        "inputs": input_diagnostics[:30],
+                    },
                 )
 
             await target.fill(clean_brand, timeout=5_000)

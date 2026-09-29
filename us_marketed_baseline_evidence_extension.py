@@ -42,7 +42,7 @@ from pydantic import BaseModel, Field
 from main import _auth, app
 
 
-VERSION = "US_MARKETED_BASELINE_EVIDENCE_V1.3_DAILYMED_ZIP_FALLBACK"
+VERSION = "US_MARKETED_BASELINE_EVIDENCE_V1.4_NESTED_SPL_INDICATIONS"
 OPENFDA_LABEL_URL = "https://api.fda.gov/drug/label.json"
 DAILYMED_SPLS_URL = "https://dailymed.nlm.nih.gov/dailymed/services/v2/spls.json"
 DAILYMED_APPLICATIONS_URL = "https://dailymed.nlm.nih.gov/dailymed/services/v2/applicationnumbers.json"
@@ -285,7 +285,11 @@ def _xml_local(tag: Any) -> str:
 def _extract_indications_from_spl_xml(xml_text: str) -> str:
     """
     Extract only the FDA/NLM INDICATIONS AND USAGE section (LOINC 34067-9).
-    No warnings, contraindications, or limitations sections are mined.
+
+    Prefer the section's own body text. If the coded parent section is only a
+    container, collect text from descendant subsections inside that same
+    indication section. This is required for labels such as immune globulins,
+    whose indication content is split into nested subsections.
     """
     try:
         root = ET.fromstring(xml_text)
@@ -294,37 +298,71 @@ def _extract_indications_from_spl_xml(xml_text: str) -> str:
 
     sections: List[str] = []
 
+    def text_of(node: ET.Element) -> str:
+        return re.sub(
+            r"\s+",
+            " ",
+            " ".join(
+                str(x).strip()
+                for x in node.itertext()
+                if str(x).strip()
+            ),
+        ).strip()
+
     for section in root.iter():
         if _xml_local(section.tag) != "section":
             continue
 
-        section_code = None
-        for child in list(section):
-            if _xml_local(child.tag) == "code":
-                section_code = str(child.attrib.get("code") or "").strip()
+        code_match = False
+        for node in section.iter():
+            if (
+                _xml_local(node.tag) == "code"
+                and str(node.attrib.get("code") or "").strip() == "34067-9"
+            ):
+                code_match = True
                 break
 
-        if section_code != "34067-9":
+        if not code_match:
             continue
 
         title_text = ""
-        body_text = ""
+        direct_body: List[str] = []
+        descendant_body: List[str] = []
 
         for child in list(section):
             local = _xml_local(child.tag)
-            if local == "title":
-                title_text = " ".join(
-                    str(x).strip() for x in child.itertext() if str(x).strip()
-                )
-            elif local == "text":
-                body_text = " ".join(
-                    str(x).strip() for x in child.itertext() if str(x).strip()
-                )
+
+            if local == "title" and not title_text:
+                title_text = text_of(child)
+                continue
+
+            if local == "text":
+                value = text_of(child)
+                if value:
+                    direct_body.append(value)
+
+        if direct_body:
+            body_text = _canonical_indication_text(direct_body)
+        else:
+            # The coded section is sometimes a container whose meaningful
+            # content lives in nested child sections. Collect only descendant
+            # <text> nodes under this coded indication section.
+            for node in section.iter():
+                if node is section or _xml_local(node.tag) != "text":
+                    continue
+                value = text_of(node)
+                if value:
+                    descendant_body.append(value)
+
+            body_text = _canonical_indication_text(descendant_body)
 
         combined = re.sub(
             r"\s+",
             " ",
-            " ".join(x for x in [title_text, body_text] if x).strip(),
+            " ".join(
+                x for x in [title_text, body_text]
+                if x
+            ).strip(),
         ).strip()
 
         if combined:

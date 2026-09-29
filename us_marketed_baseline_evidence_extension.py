@@ -46,7 +46,7 @@ from main import _auth, app
 from routed_html_extension import _browser_payload
 
 
-VERSION = "US_MARKETED_BASELINE_EVIDENCE_V1.6_PFIZER_BROWSER_LABEL_FALLBACK"
+VERSION = "US_MARKETED_BASELINE_EVIDENCE_V1.7_PFIZER_LABEL_PORTAL_SEARCH"
 OPENFDA_LABEL_URL = "https://api.fda.gov/drug/label.json"
 DAILYMED_SPLS_URL = "https://dailymed.nlm.nih.gov/dailymed/services/v2/spls.json"
 DAILYMED_APPLICATIONS_URL = "https://dailymed.nlm.nih.gov/dailymed/services/v2/applicationnumbers.json"
@@ -1116,10 +1116,122 @@ def _extract_current_indications(text: str) -> str:
     return re.sub(r"\s+", " ", chosen).strip()
 
 
+
+async def _pfizer_label_portal_search(
+    product: BaselineProductInput,
+) -> List[Dict[str, str]]:
+    base = os.getenv("BROWSER_FETCH_BASE_URL", "").strip().rstrip("/")
+    key = os.getenv("BROWSER_FETCH_KEY", "").strip()
+    if not base or not key:
+        return []
+
+    brand = _clean_brand(product.name)
+    if not brand:
+        return []
+
+    endpoint = f"{base}/pfizer/label-search"
+    try:
+        async with httpx.AsyncClient(
+            timeout=httpx.Timeout(45.0, connect=12.0),
+            follow_redirects=False,
+        ) as client:
+            response = await client.get(
+                endpoint,
+                params={
+                    "brand": brand,
+                    "timeout_seconds": 35.0,
+                },
+                headers={"X-Browser-Key": key},
+            )
+    except Exception as exc:
+        print(
+            "US_BASELINE_PFIZER_LABEL_PORTAL_ERROR "
+            + json.dumps(
+                {
+                    "recordId": product.recordId,
+                    "name": product.name,
+                    "error": f"{type(exc).__name__}: {str(exc)[:400]}",
+                },
+                separators=(",", ":"),
+            ),
+            flush=True,
+        )
+        return []
+
+    if response.status_code >= 400:
+        print(
+            "US_BASELINE_PFIZER_LABEL_PORTAL_ERROR "
+            + json.dumps(
+                {
+                    "recordId": product.recordId,
+                    "name": product.name,
+                    "status": response.status_code,
+                    "body": response.text[:500],
+                },
+                separators=(",", ":"),
+            ),
+            flush=True,
+        )
+        return []
+
+    try:
+        payload = response.json()
+    except Exception:
+        return []
+
+    results = []
+    for item in list(payload.get("links") or []):
+        href = str(item.get("href") or "").strip()
+        anchor = re.sub(r"\s+", " ", str(item.get("text") or "")).strip()
+        if "labeling.pfizer.com" not in href.lower():
+            continue
+        if "showlabeling.aspx" not in href.lower():
+            continue
+        results.append({
+            "href": href,
+            "anchor": anchor,
+            "productDetailUrl": "https://labeling.pfizer.com/",
+            "score": "9",
+        })
+
+    print(
+        "US_BASELINE_PFIZER_LABEL_PORTAL_RESULT "
+        + json.dumps(
+            {
+                "recordId": product.recordId,
+                "name": product.name,
+                "brand": brand,
+                "linkCount": len(results),
+                "links": [x["href"] for x in results[:10]],
+            },
+            separators=(",", ":"),
+        ),
+        flush=True,
+    )
+
+    return results[:12]
+
 async def _pfizer_current_label_links(product: BaselineProductInput) -> List[Dict[str, str]]:
     candidates = _brand_candidates(product.name)
     links: List[Dict[str, str]] = []
     seen = set()
+
+    # Prefer Pfizer's own labeling portal search. This bypasses Pfizer.com
+    # product-detail pages, which currently return HTTP 403 to cloud/browser
+    # workers even though the labeling portal itself is public.
+    portal_links = await _pfizer_label_portal_search(product)
+    for item in portal_links:
+        href = str(item.get("href") or "").strip()
+        if not href:
+            continue
+        key = href.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        links.append(item)
+
+    if links:
+        return links[:6]
 
     def add_link(href: str, anchor: str, product_url: str) -> None:
         href = str(href or "").strip()

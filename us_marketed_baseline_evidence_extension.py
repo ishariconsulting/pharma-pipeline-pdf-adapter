@@ -666,6 +666,28 @@ async def _resolve_dailymed_product(
         })
 
     if not label_rows:
+        diagnostic_xml = ""
+        diagnostic_setid = ""
+        if selected:
+            diagnostic_setid = str(selected[0].get("setid") or "").strip()
+            diagnostic_xml = str(
+                prefetched_xml.get(diagnostic_setid) or ""
+            )
+            if not diagnostic_xml and fetched:
+                first_xml = fetched[0]
+                if not isinstance(first_xml, Exception):
+                    diagnostic_xml = str(first_xml or "")
+
+        code_index = diagnostic_xml.find("34067-9")
+        code_snippet = (
+            diagnostic_xml[
+                max(0, code_index - 700):
+                code_index + 2600
+            ]
+            if code_index >= 0
+            else diagnostic_xml[:2600]
+        )
+
         print(
             "US_BASELINE_DAILYMED_FALLBACK_NO_TEXT "
             + json.dumps(
@@ -681,6 +703,10 @@ async def _resolve_dailymed_product(
                         }
                         for x in selected
                     ],
+                    "diagnosticSetid": diagnostic_setid,
+                    "xmlChars": len(diagnostic_xml),
+                    "has34067": code_index >= 0,
+                    "xmlSnippet": code_snippet,
                 },
                 separators=(",", ":"),
             ),

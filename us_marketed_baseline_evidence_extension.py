@@ -1713,19 +1713,33 @@ async def _resolve_openfda_brand_product(
         else None
     )
 
+    application_mismatch = bool(
+        source_apps
+        and input_apps
+        and not set(source_apps).intersection(set(input_apps))
+    )
+
+    # Fail closed when exact brand + ingredient resolves to a different FDA
+    # application than the catalogue identity. Brand families can span
+    # different dosage forms / routes / formulations with materially different
+    # indications. Do not silently substitute one application for another.
+    if application_mismatch:
+        status = "Application Mismatch"
+        confidence = "Low"
+    else:
+        status = "Ambiguous" if ambiguous else "Matched"
+        confidence = "Medium" if ambiguous else "High"
+
     print(
         "US_BASELINE_OPENFDA_BRAND_MATCH "
         + json.dumps(
             {
                 "recordId": product.recordId,
                 "name": product.name,
-                "status": "Ambiguous" if ambiguous else "Matched",
+                "status": status,
                 "inputApps": sorted(set(input_apps)),
                 "sourceApps": source_apps,
-                "applicationMismatch": bool(
-                    source_apps
-                    and not set(source_apps).intersection(set(input_apps))
-                ),
+                "applicationMismatch": application_mismatch,
                 "splSetIds": spl_ids,
                 "effectiveTime": chosen["effectiveTime"],
             },
@@ -1737,9 +1751,9 @@ async def _resolve_openfda_brand_product(
     return {
         "recordId": product.recordId,
         "sourceName": product.name,
-        "status": "Ambiguous" if ambiguous else "Matched",
-        "confidence": "Medium" if ambiguous else "High",
-        "applicationNumbers": source_apps or sorted(set(input_apps)),
+        "status": status,
+        "confidence": confidence,
+        "applicationNumbers": sorted(set(input_apps)),
         "splSetIds": spl_ids,
         "activeIngredients": sorted({
             str(x).strip()
@@ -1760,10 +1774,7 @@ async def _resolve_openfda_brand_product(
             "candidateBrands": brands,
             "inputApplicationNumbers": sorted(set(input_apps)),
             "sourceApplicationNumbers": source_apps,
-            "applicationMismatch": bool(
-                source_apps
-                and not set(source_apps).intersection(set(input_apps))
-            ),
+            "applicationMismatch": application_mismatch,
             "ingredientCompatibility": chosen["ingredientCompatibility"],
             "bestSponsorScore": best_sponsor_score,
             "distinctIndicationStatements": len(distinct),

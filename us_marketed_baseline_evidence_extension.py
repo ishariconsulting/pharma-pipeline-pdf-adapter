@@ -46,7 +46,7 @@ from main import _auth, app
 from routed_html_extension import _browser_payload
 
 
-VERSION = "US_MARKETED_BASELINE_EVIDENCE_V1.11_CURRENT_PI_IDENTITY"
+VERSION = "US_MARKETED_BASELINE_EVIDENCE_V1.12_FDA_APPLICATION_LABEL_FALLBACK"
 OPENFDA_LABEL_URL = "https://api.fda.gov/drug/label.json"
 OPENFDA_DRUGSFDA_URL = "https://api.fda.gov/drug/drugsfda.json"
 DAILYMED_SPLS_URL = "https://dailymed.nlm.nih.gov/dailymed/services/v2/spls.json"
@@ -55,6 +55,7 @@ DAILYMED_SPL_XML_URL = "https://dailymed.nlm.nih.gov/dailymed/services/v2/spls/{
 PFIZER_PRODUCT_DETAIL_URL = "https://www.pfizer.com/products/product-detail/{slug}"
 PFIZER_LABEL_BASE = "https://labeling.pfizer.com/ShowLabeling.aspx"
 DAILYMED_SPL_ZIP_URL = "https://dailymed.nlm.nih.gov/dailymed/downloadzipfile.cfm"
+FDA_APPLICATION_OVERVIEW_URL = "https://www.accessdata.fda.gov/scripts/cder/daf/index.cfm?event=overview.process&ApplNo={applno}"
 MAX_PRODUCTS = 150
 CACHE_TTL = 86400.0
 JOB_TTL_SECONDS = 7200.0
@@ -2573,6 +2574,264 @@ def _resolve_product_label(
     }
 
 
+
+def _numeric_application_numbers(values: List[str]) -> List[str]:
+    out: List[str] = []
+    seen = set()
+    for value in values:
+        token = re.sub(r"\s+", "", str(value or "").upper()).strip()
+        m = re.fullmatch(r"(?:NDA|ANDA|BLA)?(\d{5,6})", token)
+        if not m:
+            continue
+        applno = m.group(1)
+        if applno not in seen:
+            seen.add(applno)
+            out.append(applno)
+    return out[:20]
+
+
+def _fda_label_rank(url: str) -> tuple[int, int, str]:
+    text = str(url or "")
+    year_match = re.search(r"/label/(\d{4})/", text, flags=re.I)
+    year = int(year_match.group(1)) if year_match else 0
+    supp_match = re.search(r"s(\d+)[a-z]*lbl\.pdf", text, flags=re.I)
+    supp = int(supp_match.group(1)) if supp_match else -1
+    return (year, supp, text)
+
+
+def _extract_fda_label_links(html: str) -> List[str]:
+    raw = unescape(str(html or ""))
+    found: List[str] = []
+    seen = set()
+
+    patterns = [
+        r'https?://www\.accessdata\.fda\.gov/drugsatfda_docs/label/\d{4}/[^"\'<>\s]+?\.pdf',
+        r'/drugsatfda_docs/label/\d{4}/[^"\'<>\s]+?\.pdf',
+    ]
+
+    for pattern in patterns:
+        for match in re.finditer(pattern, raw, flags=re.I):
+            url = match.group(0)
+            if url.startswith("/"):
+                url = "https://www.accessdata.fda.gov" + url
+            url = url.replace("&amp;", "&")
+            key = url.lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            found.append(url)
+
+    found.sort(key=_fda_label_rank, reverse=True)
+    return found
+
+
+async def _resolve_fda_application_label(
+    product: BaselineProductInput,
+    openfda_apps: List[str],
+) -> Dict[str, Any]:
+    """
+    Official application-level fallback using Drugs@FDA.
+
+    For every exact application captured upstream, fetch the Drugs@FDA
+    application overview, verify brand + ingredient family on that page, then
+    use the newest FDA-hosted label PDF listed for the application.
+
+    If multiple current application labels produce materially different
+    indication sections, fail closed as Ambiguous rather than merging them.
+    """
+    app_numbers = _numeric_application_numbers(
+        list(product.applicationNumbers or []) + list(openfda_apps or [])
+    )
+    brand_candidates = _brand_candidates(product.name)
+    ingredient_norms = {
+        _norm(x)
+        for x in (product.activeIngredients or [])
+        if _norm(x)
+    }
+
+    resolved: List[Dict[str, Any]] = []
+    overview_diagnostics: List[Dict[str, Any]] = []
+
+    for applno in app_numbers:
+        overview_url = FDA_APPLICATION_OVERVIEW_URL.format(applno=applno)
+
+        try:
+            status, _ctype, html = await _text_get(
+                overview_url,
+                timeout_seconds=30.0,
+            )
+        except Exception as exc:
+            overview_diagnostics.append({
+                "applicationNumber": applno,
+                "status": "ERROR",
+                "error": f"{type(exc).__name__}: {str(exc)[:300]}",
+            })
+            continue
+
+        if status != 200 or not html:
+            overview_diagnostics.append({
+                "applicationNumber": applno,
+                "status": f"HTTP_{status}",
+            })
+            continue
+
+        page_text = _strip_html(html)
+        page_norm = _norm(page_text)
+
+        brand_ok = any(
+            _norm(candidate) and _norm(candidate) in page_norm
+            for candidate in brand_candidates
+        )
+
+        ingredient_ok = (
+            not ingredient_norms
+            or any(
+                ingredient in page_norm
+                for ingredient in ingredient_norms
+            )
+        )
+
+        label_links = _extract_fda_label_links(html)
+
+        overview_diagnostics.append({
+            "applicationNumber": applno,
+            "brandVerified": brand_ok,
+            "ingredientVerified": ingredient_ok,
+            "labelLinkCount": len(label_links),
+            "newestLabel": label_links[0] if label_links else None,
+        })
+
+        if not brand_ok or not ingredient_ok or not label_links:
+            continue
+
+        # The Drugs@FDA page is newest-first; inspect a small bounded set in
+        # case the newest link is a patient insert rather than full PI.
+        for label_url in label_links[:3]:
+            try:
+                label_status, label_ctype, content = await _bytes_get(
+                    label_url,
+                    timeout_seconds=40.0,
+                )
+            except Exception:
+                continue
+
+            if label_status != 200 or not content:
+                continue
+
+            if content.startswith(b"%PDF") or "pdf" in label_ctype.lower():
+                label_text = _extract_pdf_text(content)
+            else:
+                label_text = _strip_html(
+                    content.decode("utf-8", errors="ignore")
+                )
+
+            if not label_text:
+                continue
+
+            head_norm = _norm(label_text[:9000])
+            if not any(
+                _norm(candidate) and _norm(candidate) in head_norm
+                for candidate in brand_candidates
+            ):
+                continue
+
+            indication_text = _extract_current_indications(label_text)
+            if not indication_text:
+                continue
+
+            resolved.append({
+                "applicationNumber": applno,
+                "labelUrl": label_url,
+                "indicationText": indication_text,
+                "normalizedIndicationText": _norm(indication_text),
+                "rank": _fda_label_rank(label_url),
+            })
+            break
+
+    if not resolved:
+        return {
+            "recordId": product.recordId,
+            "sourceName": product.name,
+            "status": "Not Found",
+            "confidence": "Low",
+            "applicationNumbers": sorted(set(openfda_apps)),
+            "splSetIds": [],
+            "activeIngredients": product.activeIngredients,
+            "indicationText": "",
+            "sourceUrl": None,
+            "authority": "FDA Drugs@FDA Current Label",
+            "ambiguous": False,
+            "diagnostics": {
+                "fallbackRoute": "FDA_APPLICATION_LABEL_NONE",
+                "applicationsChecked": app_numbers,
+                "overviews": overview_diagnostics,
+            },
+        }
+
+    # Keep the newest label per application first.
+    by_app: Dict[str, Dict[str, Any]] = {}
+    for item in sorted(
+        resolved,
+        key=lambda x: x["rank"],
+        reverse=True,
+    ):
+        by_app.setdefault(item["applicationNumber"], item)
+
+    current_rows = list(by_app.values())
+    distinct: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
+    for item in current_rows:
+        distinct[item["normalizedIndicationText"]].append(item)
+
+    ambiguous = len(distinct) > 1
+    chosen = sorted(
+        current_rows,
+        key=lambda x: x["rank"],
+        reverse=True,
+    )[0]
+
+    print(
+        "US_BASELINE_FDA_APPLICATION_LABEL "
+        + json.dumps(
+            {
+                "recordId": product.recordId,
+                "name": product.name,
+                "applications": sorted(by_app.keys()),
+                "chosenLabel": chosen["labelUrl"],
+                "ambiguous": ambiguous,
+                "distinctIndicationStatements": len(distinct),
+            },
+            separators=(",", ":"),
+        ),
+        flush=True,
+    )
+
+    return {
+        "recordId": product.recordId,
+        "sourceName": product.name,
+        "status": "Ambiguous" if ambiguous else "Matched",
+        "confidence": "Medium" if ambiguous else "High",
+        "applicationNumbers": sorted(by_app.keys()),
+        "splSetIds": [],
+        "activeIngredients": product.activeIngredients,
+        "indicationText": chosen["indicationText"],
+        "sourceUrl": chosen["labelUrl"],
+        "authority": "FDA Drugs@FDA Current Label",
+        "ambiguous": ambiguous,
+        "diagnostics": {
+            "fallbackRoute": "FDA_APPLICATION_CURRENT_LABEL",
+            "applicationsChecked": app_numbers,
+            "currentLabels": [
+                {
+                    "applicationNumber": x["applicationNumber"],
+                    "labelUrl": x["labelUrl"],
+                }
+                for x in current_rows
+            ],
+            "distinctIndicationStatements": len(distinct),
+            "overviews": overview_diagnostics,
+        },
+    }
+
 async def _build_result(payload: BaselineEvidenceRequest) -> Dict[str, Any]:
     products = payload.products
     brand_candidates = {p.recordId: _brand_candidates(p.name) for p in products}
@@ -2701,10 +2960,46 @@ async def _build_result(payload: BaselineEvidenceRequest) -> Dict[str, Any]:
             if fallback.get("status") in {"Matched", "Ambiguous"}:
                 rows[i] = fallback
 
-    # Pfizer portal fallback is intentionally disabled for automated runs:
-    # labeling.pfizer.com currently exposes no searchable public form to the
-    # browser worker, while Pfizer.com product-detail pages return HTTP 403.
-    # DailyMed/openFDA remain the authoritative scalable path.
+    # Official Drugs@FDA application-page fallback. This is company-agnostic
+    # and resolves brands that have no usable openFDA/DailyMed SPL while FDA
+    # still publishes a current application-level label PDF.
+    application_fallback_indexes = [
+        i for i, row in enumerate(rows)
+        if row.get("status") in {"Not Found", "No Indication Text"}
+    ]
+
+    if application_fallback_indexes:
+        application_fallback_results = await asyncio.gather(
+            *[
+                _resolve_fda_application_label(
+                    products[i],
+                    app_candidates[products[i].recordId],
+                )
+                for i in application_fallback_indexes
+            ],
+            return_exceptions=True,
+        )
+
+        for i, fallback in zip(
+            application_fallback_indexes,
+            application_fallback_results,
+        ):
+            if isinstance(fallback, Exception):
+                rows[i].setdefault("diagnostics", {})[
+                    "fdaApplicationLabelFallbackError"
+                ] = f"{type(fallback).__name__}: {str(fallback)[:500]}"
+                continue
+
+            rows[i].setdefault("diagnostics", {})[
+                "fdaApplicationLabelFallback"
+            ] = fallback.get("diagnostics") or {}
+
+            if fallback.get("status") in {"Matched", "Ambiguous"}:
+                rows[i] = fallback
+
+    # Pfizer portal fallback remains disabled for automated runs because the
+    # public labeling portal does not currently expose a searchable form to
+    # the browser worker. Drugs@FDA is now the scalable fallback instead.
     counts: Dict[str, int] = defaultdict(int)
     for row in rows:
         counts[row["status"]] += 1

@@ -1980,19 +1980,32 @@ async def _resolve_dailymed_brand_product(
         + chosen["setid"]
     )
 
+    application_mismatch = bool(
+        source_apps
+        and input_apps
+        and not set(source_apps).intersection(set(input_apps))
+    )
+
+    # Fail closed on brand+ingredient matches that belong to a different FDA
+    # application. A marketed brand family can have multiple formulations,
+    # routes, or strengths with materially different indication sets.
+    if application_mismatch:
+        status = "Application Mismatch"
+        confidence = "Low"
+    else:
+        status = "Ambiguous" if ambiguous else "Matched"
+        confidence = "Medium" if ambiguous else "High"
+
     print(
         "US_BASELINE_DAILYMED_BRAND_MATCH "
         + json.dumps(
             {
                 "recordId": product.recordId,
                 "name": product.name,
-                "status": "Ambiguous" if ambiguous else "Matched",
+                "status": status,
                 "inputApps": sorted(set(input_apps)),
                 "sourceApps": source_apps,
-                "applicationMismatch": bool(
-                    source_apps
-                    and not set(source_apps).intersection(set(input_apps))
-                ),
+                "applicationMismatch": application_mismatch,
                 "setid": chosen["setid"],
                 "publishedDate": chosen["publishedDate"],
             },
@@ -2004,9 +2017,9 @@ async def _resolve_dailymed_brand_product(
     return {
         "recordId": product.recordId,
         "sourceName": product.name,
-        "status": "Ambiguous" if ambiguous else "Matched",
-        "confidence": "Medium" if ambiguous else "High",
-        "applicationNumbers": source_apps or sorted(set(input_apps)),
+        "status": status,
+        "confidence": confidence,
+        "applicationNumbers": sorted(set(input_apps)),
         "splSetIds": [chosen["setid"]],
         "activeIngredients": sorted({
             str(x).strip()

@@ -31,7 +31,7 @@ from pydantic import BaseModel, Field
 from main import _auth, app
 
 
-VERSION = "US_MARKETED_IDENTITY_V1.12_COMPLETE_BRAND_FAMILY"
+VERSION = "US_MARKETED_IDENTITY_V1.13_COMPLETE_BRAND_FAMILY_FAST"
 MAX_PRODUCTS = 400
 OPENFDA_BASE = "https://api.fda.gov"
 DAILYMED_SPLS = "https://dailymed.nlm.nih.gov/dailymed/services/v2/spls.json"
@@ -191,13 +191,26 @@ def _query_terms(products: List[ProductInput], candidates: Dict[str, List[str]])
 
 
 
+def _ingredient_identity_key(value: Any) -> str:
+    """
+    Canonical identity key for ingredient names. FDA/NLM sources often reverse
+    descriptive word order (e.g. CONJUGATED ESTROGENS vs ESTROGENS,
+    CONJUGATED). Sorting normalized tokens preserves exact token identity while
+    removing word-order noise; no stemming or synonym guessing is used.
+    """
+    n = _norm(value)
+    if not n:
+        return ""
+    return " ".join(sorted(n.split()))
+
+
 def _molecule_components(value: Any) -> List[str]:
     raw = str(value or "")
     parts = re.split(r"\s+\+\s+|[\n;]+", raw)
     out: List[str] = []
     seen = set()
     for part in parts:
-        n = _norm(part)
+        n = _ingredient_identity_key(part)
         if n and n not in seen:
             seen.add(n)
             out.append(n)
@@ -206,9 +219,9 @@ def _molecule_components(value: Any) -> List[str]:
 
 def _source_ingredient_set(values: Iterable[Any]) -> set[str]:
     return {
-        _norm(v)
+        _ingredient_identity_key(v)
         for v in values
-        if _norm(v)
+        if _ingredient_identity_key(v)
     }
 
 
@@ -318,7 +331,7 @@ async def _batch_drugsfda(products: List[ProductInput], candidates: Dict[str, Li
         for n in norms:
             candidate_index[n].add(product.recordId)
 
-    groups = list(_chunks(terms, 25))
+    groups = list(_chunks(terms, 10))
     payloads = await asyncio.gather(*[
         _openfda(
             "/drug/drugsfda.json",
@@ -521,7 +534,7 @@ async def _batch_label(products: List[ProductInput], candidates: Dict[str, List[
             if n:
                 candidate_index[n].add(product.recordId)
 
-    groups = list(_chunks(terms, 25))
+    groups = list(_chunks(terms, 10))
     payloads = await asyncio.gather(*[
         _openfda(
             "/drug/label.json",

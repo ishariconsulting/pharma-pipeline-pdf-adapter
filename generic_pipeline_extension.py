@@ -33,12 +33,13 @@ from generic_pipeline_interpreter_canary import (
     VERSION as INTERPRETER_VERSION,
     interpret_pipeline_html,
     interpret_pipeline_structure,
+    interpret_pipeline_layout,
     validate_source,
 )
 
 
 ADAPTER_PROFILE = "PIPELINE_GENERIC_HTML_V1"
-ROUTE_VERSION = "GENERIC_PIPELINE_EXTRACTION_V1.2.4_BROWSER_ON_STRUCTURE_FAIL_READ_ONLY"
+ROUTE_VERSION = "GENERIC_PIPELINE_EXTRACTION_V1.3_VISUAL_LAYOUT_FALLBACK_READ_ONLY"
 
 
 class GenericPipelineExtractionResponse(BaseModel):
@@ -223,6 +224,7 @@ async def _fetch_browser_structure(
                         "url": url,
                         "timeout_seconds": timeout_seconds,
                         "expand_load_more": "true",
+                        "include_layout": "true",
                     },
                     headers={
                         "X-Browser-Key": key,
@@ -295,6 +297,53 @@ async def _fetch_browser_structure(
         )
 
     return payload
+
+
+async def _apply_visual_layout_fallback(
+    *,
+    company: str,
+    final_url: str,
+    browser: Dict[str, Any],
+    rows: List[Any],
+    diagnostics: Dict[str, Any],
+    validation: Dict[str, Any],
+) -> tuple[List[Any], Dict[str, Any], Dict[str, Any]]:
+    """Use rendered layout only after the semantic parser fails.
+
+    This remains read-only and fail-closed. A passing semantic extraction is
+    never replaced by layout inference.
+    """
+    if validation.get("pass"):
+        return rows, diagnostics, validation
+
+    layout_nodes = browser.get("layoutTextNodes")
+    if not isinstance(layout_nodes, list) or not layout_nodes:
+        return rows, diagnostics, validation
+
+    layout_rows, layout_diagnostics = await asyncio.to_thread(
+        interpret_pipeline_layout,
+        company,
+        final_url,
+        layout_nodes,
+    )
+    layout_validation = validate_source(
+        company,
+        layout_rows,
+        layout_diagnostics,
+    )
+
+    if layout_validation.get("pass"):
+        layout_diagnostics = dict(layout_diagnostics)
+        layout_diagnostics["retrievalMode"] = "BROWSER_REQUIRED"
+        layout_diagnostics["routingReason"] = "VISUAL_LAYOUT_FALLBACK"
+        layout_diagnostics["semanticFallbackRows"] = len(rows)
+        return layout_rows, layout_diagnostics, layout_validation
+
+    merged = dict(diagnostics)
+    merged["visualLayoutCandidateRows"] = len(layout_rows)
+    merged["visualLayoutValidationPass"] = False
+    merged["visualLayoutDiagnostics"] = layout_diagnostics
+    return rows, merged, validation
 
 
 async def _extract_generic_pipeline(
@@ -370,6 +419,15 @@ async def _extract_generic_pipeline(
                     rows,
                     diagnostics,
                 )
+
+                rows, diagnostics, validation = await _apply_visual_layout_fallback(
+                    company=company,
+                    final_url=final_url,
+                    browser=browser,
+                    rows=rows,
+                    diagnostics=diagnostics,
+                    validation=validation,
+                )
             else:
                 routing_reason = "DIRECT_STRUCTURE_UNSUPPORTED_BROWSER_NOT_CONFIGURED"
 
@@ -398,6 +456,15 @@ async def _extract_generic_pipeline(
             company,
             rows,
             diagnostics,
+        )
+
+        rows, diagnostics, validation = await _apply_visual_layout_fallback(
+            company=company,
+            final_url=final_url,
+            browser=browser,
+            rows=rows,
+            diagnostics=diagnostics,
+            validation=validation,
         )
 
     diagnostics = dict(diagnostics)

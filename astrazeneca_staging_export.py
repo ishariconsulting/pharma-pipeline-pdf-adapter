@@ -17,7 +17,7 @@ import portfolio_discovery_extension_v12  # noqa: F401
 import portfolio_discovery_extension_v13  # noqa: F401
 import portfolio_discovery_extension_v14  # noqa: F401
 import portfolio_discovery_extension_v15  # noqa: F401 - verified disease aliases
-import portfolio_discovery_regression_canaries_v15  # noqa: F401 - fail closed if Pfizer/Vertex regress
+import portfolio_discovery_regression_canaries_v16  # noqa: F401 - fail closed if Pfizer/Vertex regress
 import astrazeneca_pipeline_adapter as az
 import astrazeneca_pipeline_adapter_v13  # noqa: F401 - patches source parsing globals
 import astrazeneca_pipeline_adapter_v14  # noqa: F401 - prevents study-token splits inside asset names

@@ -46,7 +46,7 @@ from main import _auth, app
 from routed_html_extension import _browser_payload
 
 
-VERSION = "US_MARKETED_BASELINE_EVIDENCE_V1.14_NO_APPLICATION_SCOPE_BRIDGE"
+VERSION = "US_MARKETED_BASELINE_EVIDENCE_V1.15_PRESENTATION_AWARE_DAILYMED_SCOPE_BRIDGE"
 OPENFDA_LABEL_URL = "https://api.fda.gov/drug/label.json"
 OPENFDA_DRUGSFDA_URL = "https://api.fda.gov/drug/drugsfda.json"
 DAILYMED_SPLS_URL = "https://dailymed.nlm.nih.gov/dailymed/services/v2/spls.json"
@@ -129,7 +129,19 @@ def _brand_candidates(raw: str) -> List[str]:
 
     if cleaned:
         first = cleaned.split()[0]
-        if len(first) >= 4:
+        # A bare first-token fallback is unsafe for descriptive multi-word
+        # product names such as "North American Coral Snake Antivenin":
+        # searching "North" can match unrelated DailyMed families. Keep the
+        # first-token fallback only for single-token names or when the raw
+        # catalogue name explicitly marks that first token as the brand.
+        first_is_marked_brand = bool(
+            re.search(
+                rf"^\\s*{re.escape(first)}\\s*[®™]",
+                str(raw or ""),
+                flags=re.I,
+            )
+        )
+        if len(first) >= 4 and (cleaned_word_count == 1 or first_is_marked_brand):
             values.append(first)
 
     out: List[str] = []
@@ -141,6 +153,33 @@ def _brand_candidates(raw: str) -> List[str]:
         seen.add(n)
         out.append(value)
     return out[:5]
+
+
+def _presentation_title_score(raw_name: str, title: str) -> int:
+    """Score title compatibility with an explicit presentation in the source name."""
+    source = _norm(raw_name)
+    target = _norm(title)
+    if not source or not target:
+        return 0
+
+    rules = [
+        (r"\\binhaler\\b", (r"\\binhalant\\b", r"\\binhaler\\b")),
+        (r"\\bns\\b", (r"\\bspray\\b", r"\\bmetered\\b", r"\\bnasal\\b")),
+        (r"\\bnebulizer\\b", (r"\\bnebul",)),
+        (r"\\bcr\\b", (r"\\bextended release\\b", r"\\bcr\\b")),
+        (r"\\biv\\b", (r"\\binjection\\b", r"\\bintravenous\\b")),
+        (r"\\binjection\\b", (r"\\binjection\\b",)),
+        (r"\\btablets?\\b", (r"\\btablets?\\b",)),
+        (r"\\bcapsules?\\b", (r"\\bcapsules?\\b",)),
+    ]
+
+    score = 0
+    for source_pattern, title_patterns in rules:
+        if not re.search(source_pattern, source):
+            continue
+        if any(re.search(p, target) for p in title_patterns):
+            score += 1
+    return score
 
 
 def _application_candidates(values: List[str]) -> List[str]:
@@ -768,8 +807,33 @@ async def _resolve_dailymed_product(
                     if _norm(title) in hinted_titles:
                         candidates_by_setid[setid] = row
 
+                # If the upstream family evidence contains multiple exact
+                # titles, use an explicit presentation token from the source
+                # name only to narrow within those already-corroborated
+                # titles. Never broaden to a title that was not observed by
+                # the identity layer.
+                if len(candidates_by_setid) > 1:
+                    presentation_scores = {
+                        setid: _presentation_title_score(
+                            product.name,
+                            str(row.get("title") or ""),
+                        )
+                        for setid, row in candidates_by_setid.items()
+                    }
+                    best_presentation_score = max(
+                        presentation_scores.values(),
+                        default=0,
+                    )
+                    if best_presentation_score > 0:
+                        candidates_by_setid = {
+                            setid: row
+                            for setid, row in candidates_by_setid.items()
+                            if presentation_scores.get(setid, 0)
+                            == best_presentation_score
+                        }
+
                 if candidates_by_setid:
-                    matched_route = "DAILYMED_SCOPE_CORROBORATED_EXACT_TITLE"
+                    matched_route = "DAILYMED_SCOPE_CORROBORATED_EXACT_TITLE_PRESENTATION_AWARE"
             else:
                 # The authenticated Airtable caller only submits application-
                 # free products through its upstream exact DailyMed family /

@@ -46,7 +46,7 @@ from main import _auth, app
 from routed_html_extension import _browser_payload
 
 
-VERSION = "US_MARKETED_BASELINE_EVIDENCE_V1.15_PRESENTATION_AWARE_DAILYMED_SCOPE_BRIDGE"
+VERSION = "US_MARKETED_BASELINE_EVIDENCE_V1.16_PRESENTATION_REGEX_FIX"
 OPENFDA_LABEL_URL = "https://api.fda.gov/drug/label.json"
 OPENFDA_DRUGSFDA_URL = "https://api.fda.gov/drug/drugsfda.json"
 DAILYMED_SPLS_URL = "https://dailymed.nlm.nih.gov/dailymed/services/v2/spls.json"
@@ -136,7 +136,7 @@ def _brand_candidates(raw: str) -> List[str]:
         # catalogue name explicitly marks that first token as the brand.
         first_is_marked_brand = bool(
             re.search(
-                rf"^\\s*{re.escape(first)}\\s*[®™]",
+                rf"^\s*{re.escape(first)}\s*[®™]",
                 str(raw or ""),
                 flags=re.I,
             )
@@ -163,14 +163,14 @@ def _presentation_title_score(raw_name: str, title: str) -> int:
         return 0
 
     rules = [
-        (r"\\binhaler\\b", (r"\\binhalant\\b", r"\\binhaler\\b")),
-        (r"\\bns\\b", (r"\\bspray\\b", r"\\bmetered\\b", r"\\bnasal\\b")),
-        (r"\\bnebulizer\\b", (r"\\bnebul",)),
-        (r"\\bcr\\b", (r"\\bextended release\\b", r"\\bcr\\b")),
-        (r"\\biv\\b", (r"\\binjection\\b", r"\\bintravenous\\b")),
-        (r"\\binjection\\b", (r"\\binjection\\b",)),
-        (r"\\btablets?\\b", (r"\\btablets?\\b",)),
-        (r"\\bcapsules?\\b", (r"\\bcapsules?\\b",)),
+        (r"\binhaler\b", (r"\binhalant\b", r"\binhaler\b")),
+        (r"\bns\b", (r"\bspray\b", r"\bmetered\b", r"\bnasal\b")),
+        (r"\bnebulizer\b", (r"\bnebul",)),
+        (r"\bcr\b", (r"\bextended release\b", r"\bcr\b")),
+        (r"\biv\b", (r"\binjection\b", r"\bintravenous\b")),
+        (r"\binjection\b", (r"\binjection\b",)),
+        (r"\btablets?\b", (r"\btablets?\b",)),
+        (r"\bcapsules?\b", (r"\bcapsules?\b",)),
     ]
 
     score = 0

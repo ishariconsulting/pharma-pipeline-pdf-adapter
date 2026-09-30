@@ -43,7 +43,7 @@ from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 import httpx
 
 
-VERSION = "GENERIC_PIPELINE_INTERPRETER_V1.1_LAYOUT_FALLBACK_READ_ONLY"
+VERSION = "GENERIC_PIPELINE_INTERPRETER_V1.2_SECTIONED_CARD_FALLBACK_READ_ONLY"
 
 SOURCES = [
     {
@@ -1239,6 +1239,257 @@ def interpret_pipeline_layout(
     return selected, diagnostics
 
 
+
+SECTIONED_CARD_ASSET_LABELS = {
+    "molecule name",
+    "compound name",
+    "asset",
+    "asset name",
+    "program",
+    "program name",
+    "programme",
+    "programme name",
+    "candidate",
+    "candidate name",
+}
+SECTIONED_CARD_INDICATION_LABELS = {
+    "indication",
+    "indications",
+    "potential indication",
+    "potential indications",
+    "disease",
+    "disease indication",
+}
+SECTIONED_CARD_PHASE_LABELS = {
+    "clinical phase",
+    "development phase",
+    "phase status",
+    "phase/status",
+    "development stage",
+}
+SECTIONED_CARD_OTHER_LABELS = {
+    "therapeutic area",
+    "therapeutic areas",
+    "therapeutic area(s)",
+    "therapy area",
+    "modality",
+    "target",
+    "targets",
+    "study",
+    "clinical study",
+    "partner",
+    "partners",
+    "collaboration",
+    "development details",
+}
+
+
+def _sectioned_label(value: Any) -> str:
+    raw = clean(value).strip().rstrip(":")
+    return norm(raw)
+
+
+def _section_phase(value: Any) -> str:
+    s = clean(value).strip()
+    n = norm(s)
+    if len(s) > 48:
+        return ""
+    if re.fullmatch(r"phase\s*[1-4]", n):
+        return phase_canonical(s)
+    if n in {
+        "filed",
+        "filing",
+        "registration",
+        "regulatory review",
+        "filed registration",
+    }:
+        return "Filed / Registration"
+    if n in {"preclinical", "pre clinical"}:
+        return "Preclinical"
+    return ""
+
+
+def _known_sectioned_label(value: Any) -> bool:
+    n = _sectioned_label(value)
+    return (
+        n in SECTIONED_CARD_ASSET_LABELS
+        or n in SECTIONED_CARD_INDICATION_LABELS
+        or n in SECTIONED_CARD_PHASE_LABELS
+        or n in {norm(x) for x in SECTIONED_CARD_OTHER_LABELS}
+    )
+
+
+def _next_sectioned_value(
+    lines: Sequence[str],
+    start: int,
+    max_lines: int = 2,
+) -> Tuple[str, int]:
+    values: List[str] = []
+    i = start
+    while i < len(lines) and len(values) < max_lines:
+        value = clean(lines[i])
+        if not value:
+            i += 1
+            continue
+        if _section_phase(value) or _known_sectioned_label(value):
+            break
+        if len(value) > 260:
+            break
+        values.append(value)
+        i += 1
+        # Most source cards expose one value per label. A second line is only
+        # retained when it is clearly a short continuation rather than prose.
+        if values and (len(values) == 1 and len(value) > 120):
+            break
+    return clean(" ".join(values)), i
+
+
+def extract_rows_from_sectioned_cards(
+    company: str,
+    source_url: str,
+    lines: Sequence[str],
+) -> List[DiscoveryRow]:
+    """Parse generic pipeline cards grouped beneath source phase headings.
+
+    Common public pipeline pages expose repeated labels such as Molecule Name,
+    Therapeutic Area, Indication and Target, while phase is expressed once as a
+    section heading. This parser uses only those source labels and ordering.
+    """
+
+    clean_lines = [clean(x) for x in lines if clean(x)]
+    out: List[DiscoveryRow] = []
+    current_phase = ""
+    i = 0
+
+    while i < len(clean_lines):
+        line = clean_lines[i]
+        section_phase = _section_phase(line)
+        if section_phase:
+            current_phase = section_phase
+            i += 1
+            continue
+
+        label = _sectioned_label(line)
+        if label not in SECTIONED_CARD_ASSET_LABELS:
+            i += 1
+            continue
+
+        asset, after_asset = _next_sectioned_value(
+            clean_lines,
+            i + 1,
+            max_lines=1,
+        )
+        if not asset or not is_identity_candidate(asset):
+            i += 1
+            continue
+
+        indication = ""
+        explicit_phase = ""
+        study = ""
+        ta = ""
+        partner_values: List[str] = []
+
+        j = after_asset
+        while j < len(clean_lines):
+            next_line = clean_lines[j]
+
+            if _section_phase(next_line):
+                break
+
+            next_label = _sectioned_label(next_line)
+            if next_label in SECTIONED_CARD_ASSET_LABELS:
+                break
+
+            if next_label in SECTIONED_CARD_INDICATION_LABELS:
+                value, after = _next_sectioned_value(
+                    clean_lines,
+                    j + 1,
+                    max_lines=2,
+                )
+                if value:
+                    indication = value
+                j = max(j + 1, after)
+                continue
+
+            if next_label in SECTIONED_CARD_PHASE_LABELS:
+                value, after = _next_sectioned_value(
+                    clean_lines,
+                    j + 1,
+                    max_lines=1,
+                )
+                phase = phase_canonical(value)
+                if phase:
+                    explicit_phase = phase
+                j = max(j + 1, after)
+                continue
+
+            if next_label in {"therapeutic area", "therapeutic areas", "therapeutic area s", "therapy area"}:
+                value, after = _next_sectioned_value(
+                    clean_lines,
+                    j + 1,
+                    max_lines=1,
+                )
+                if value:
+                    ta = value
+                j = max(j + 1, after)
+                continue
+
+            if next_label in {"study", "clinical study"}:
+                value, after = _next_sectioned_value(
+                    clean_lines,
+                    j + 1,
+                    max_lines=1,
+                )
+                if value and len(value) <= 120:
+                    study = value
+                j = max(j + 1, after)
+                continue
+
+            if next_label in {"partner", "partners", "collaboration"}:
+                value, after = _next_sectioned_value(
+                    clean_lines,
+                    j + 1,
+                    max_lines=1,
+                )
+                if value:
+                    partner_values.append(value)
+                j = max(j + 1, after)
+                continue
+
+            j += 1
+
+        phase = explicit_phase or current_phase
+        if asset and indication and phase:
+            out.append(
+                DiscoveryRow(
+                    company=company,
+                    sourceFamily="Company Pipeline",
+                    sourceRecordId=f"sectioned:{len(out)+1}",
+                    sourceUrl=source_url,
+                    asset=asset,
+                    molecule=asset,
+                    indication=indication,
+                    phase=phase,
+                    phaseEvidence=(
+                        "SOURCE_TEXT"
+                        if explicit_phase
+                        else "SOURCE_SECTION_HEADING"
+                    ),
+                    sponsorOwner=company,
+                    partners=uniq(partner_values),
+                    study=study,
+                    trialIds=trial_ids(study),
+                    therapeuticArea=ta,
+                    sourceOrdinal=len(out) + 1,
+                    parserMethod="SECTIONED_LABELLED_CARD",
+                )
+            )
+
+        i = max(i + 1, j)
+
+    return dedupe_rows(out)
+
+
 def interpret_pipeline_structure(
     company: str,
     source_url: str,
@@ -1266,11 +1517,18 @@ def interpret_pipeline_structure(
         clean_lines,
     )
 
+    sectioned_rows = extract_rows_from_sectioned_cards(
+        company,
+        source_url,
+        clean_lines,
+    )
+
     # Reusable strategy selection: choose the structurally stronger extraction.
     # No company name or Portfolio state is used to choose a parser.
     candidates = [
         ("SEMANTIC_TABLE", table_rows),
         ("LABELLED_FLOW", labelled_rows),
+        ("SECTIONED_LABELLED_CARD", sectioned_rows),
     ]
     method, selected = max(
         candidates,
@@ -1287,6 +1545,7 @@ def interpret_pipeline_structure(
         "tableCount": len(tables),
         "semanticTableRows": len(table_rows),
         "labelledFlowRows": len(labelled_rows),
+        "sectionedCardRows": len(sectioned_rows),
         "selectedMethod": method,
         "selectedRows": len(selected),
         "coreCompleteRows": sum(

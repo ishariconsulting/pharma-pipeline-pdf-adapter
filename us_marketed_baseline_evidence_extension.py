@@ -46,7 +46,7 @@ from main import _auth, app
 from routed_html_extension import _browser_payload
 
 
-VERSION = "US_MARKETED_BASELINE_EVIDENCE_V1.13_SCOPE_CORROBORATED_DAILYMED_TITLE_FALLBACK"
+VERSION = "US_MARKETED_BASELINE_EVIDENCE_V1.14_NO_APPLICATION_SCOPE_BRIDGE"
 OPENFDA_LABEL_URL = "https://api.fda.gov/drug/label.json"
 OPENFDA_DRUGSFDA_URL = "https://api.fda.gov/drug/drugsfda.json"
 DAILYMED_SPLS_URL = "https://dailymed.nlm.nih.gov/dailymed/services/v2/spls.json"
@@ -755,24 +755,29 @@ async def _resolve_dailymed_product(
         # scope-corroborated and the current DailyMed search returns the exact
         # same title. This remains read-only label evidence retrieval; it does
         # not infer company ownership or broaden the product family.
-        if (
-            not candidates_by_setid
-            and product.dailyMedScopeCorroborated
-            and product.dailyMedTitles
-        ):
-            hinted_titles = {
-                _norm(x)
-                for x in product.dailyMedTitles
-                if _norm(x)
-            }
+        if not candidates_by_setid and brand_rows and not daily_apps:
+            if product.dailyMedScopeCorroborated and product.dailyMedTitles:
+                hinted_titles = {
+                    _norm(x)
+                    for x in product.dailyMedTitles
+                    if _norm(x)
+                }
 
-            for setid, row in brand_rows.items():
-                title = str(row.get("title") or "").strip()
-                if _norm(title) in hinted_titles:
-                    candidates_by_setid[setid] = row
+                for setid, row in brand_rows.items():
+                    title = str(row.get("title") or "").strip()
+                    if _norm(title) in hinted_titles:
+                        candidates_by_setid[setid] = row
 
-            if candidates_by_setid:
-                matched_route = "DAILYMED_SCOPE_CORROBORATED_EXACT_TITLE"
+                if candidates_by_setid:
+                    matched_route = "DAILYMED_SCOPE_CORROBORATED_EXACT_TITLE"
+            else:
+                # The authenticated Airtable caller only submits application-
+                # free products through its upstream exact DailyMed family /
+                # presentation scope gate. Re-evaluate the current official
+                # DailyMed brand family here and fail closed downstream if
+                # multiple indication statements disagree.
+                candidates_by_setid.update(brand_rows)
+                matched_route = "DAILYMED_NO_APPLICATION_BRAND_FAMILY"
 
     if not candidates_by_setid:
         print(

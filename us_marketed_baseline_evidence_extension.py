@@ -46,7 +46,7 @@ from main import _auth, app
 from routed_html_extension import _browser_payload
 
 
-VERSION = "US_MARKETED_BASELINE_EVIDENCE_V1.12_FDA_APPLICATION_LABEL_FALLBACK"
+VERSION = "US_MARKETED_BASELINE_EVIDENCE_V1.13_SCOPE_CORROBORATED_DAILYMED_TITLE_FALLBACK"
 OPENFDA_LABEL_URL = "https://api.fda.gov/drug/label.json"
 OPENFDA_DRUGSFDA_URL = "https://api.fda.gov/drug/drugsfda.json"
 DAILYMED_SPLS_URL = "https://dailymed.nlm.nih.gov/dailymed/services/v2/spls.json"
@@ -74,6 +74,8 @@ class BaselineProductInput(BaseModel):
     applicationNumbers: List[str] = Field(default_factory=list, max_length=20)
     sponsorNames: List[str] = Field(default_factory=list, max_length=30)
     activeIngredients: List[str] = Field(default_factory=list, max_length=30)
+    dailyMedTitles: List[str] = Field(default_factory=list, max_length=30)
+    dailyMedScopeCorroborated: bool = False
 
 
 class BaselineEvidenceRequest(BaseModel):
@@ -658,6 +660,8 @@ async def _resolve_dailymed_product(
     Route A: DailyMed current SPLs filtered by application number + brand title.
     Route B: DailyMed current SPLs filtered by brand, then application-number
              overlap is re-verified through /applicationnumbers?setid=...
+    Route C: for upstream scope-corroborated products only, accept an exact
+             current DailyMed title already observed by the identity layer.
     """
     daily_apps = _dailymed_application_candidates(product.applicationNumbers)
     candidates_by_setid: Dict[str, Dict[str, Any]] = {}
@@ -744,6 +748,32 @@ async def _resolve_dailymed_product(
         if candidates_by_setid:
             matched_route = "DAILYMED_BRAND_PLUS_SPL_XML_APPLICATION_VERIFY"
 
+        # Route C: the upstream identity + scope layers may already have
+        # observed an exact DailyMed family/presentation title even when the
+        # SPL exposes no usable Drugs@FDA application number. Reuse that
+        # evidence only when the request explicitly marks the product as
+        # scope-corroborated and the current DailyMed search returns the exact
+        # same title. This remains read-only label evidence retrieval; it does
+        # not infer company ownership or broaden the product family.
+        if (
+            not candidates_by_setid
+            and product.dailyMedScopeCorroborated
+            and product.dailyMedTitles
+        ):
+            hinted_titles = {
+                _norm(x)
+                for x in product.dailyMedTitles
+                if _norm(x)
+            }
+
+            for setid, row in brand_rows.items():
+                title = str(row.get("title") or "").strip()
+                if _norm(title) in hinted_titles:
+                    candidates_by_setid[setid] = row
+
+            if candidates_by_setid:
+                matched_route = "DAILYMED_SCOPE_CORROBORATED_EXACT_TITLE"
+
     if not candidates_by_setid:
         print(
             "US_BASELINE_DAILYMED_FALLBACK_NONE "
@@ -775,6 +805,8 @@ async def _resolve_dailymed_product(
                 "candidateBrands": brand_candidates,
                 "applicationCandidates": daily_apps,
                 "candidateSplCount": 0,
+                "dailyMedScopeCorroborated": product.dailyMedScopeCorroborated,
+                "dailyMedTitleHintCount": len(product.dailyMedTitles),
             },
         }
 

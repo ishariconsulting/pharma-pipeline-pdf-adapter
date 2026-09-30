@@ -43,7 +43,7 @@ from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 import httpx
 
 
-VERSION = "GENERIC_PIPELINE_INTERPRETER_CANARY_V1.0_READ_ONLY"
+VERSION = "GENERIC_PIPELINE_INTERPRETER_V1.1_LAYOUT_FALLBACK_READ_ONLY"
 
 SOURCES = [
     {
@@ -828,6 +828,415 @@ def dedupe_rows(rows: Sequence[DiscoveryRow]) -> List[DiscoveryRow]:
         row.sourceRecordId = f"{row.parserMethod.lower()}:{idx}"
 
     return out
+
+
+
+LAYOUT_STOP_TERMS = {
+    "pipeline",
+    "clinical pipeline",
+    "development pipeline",
+    "research pipeline",
+    "program",
+    "programme",
+    "programs",
+    "programmes",
+    "asset",
+    "assets",
+    "indication",
+    "indications",
+    "phase",
+    "stage",
+    "stages",
+    "learn more",
+    "read more",
+    "reset",
+    "filters",
+}
+
+
+def _layout_number(value: Any) -> float:
+    try:
+        return float(value)
+    except Exception:
+        return 0.0
+
+
+def _layout_structural(node: Dict[str, Any]) -> bool:
+    blob = " ".join(
+        clean(node.get(key))
+        for key in (
+            "className",
+            "parentClassName",
+            "id",
+            "style",
+            "role",
+            "ariaLabel",
+        )
+    )
+    return bool(
+        re.search(
+            r"\b(pipeline|programme|program|phase|stage|progress|bar|track|clinical|row|card|grid)\b",
+            blob,
+            flags=re.I,
+        )
+    )
+
+
+def _layout_text_ok(value: Any) -> bool:
+    s = clean(value)
+    n = norm(s)
+    if not s or not n:
+        return False
+    if n in LAYOUT_STOP_TERMS or phase_canonical(s):
+        return False
+    if len(s) > 220:
+        return False
+    if s.count(" ") > 24:
+        return False
+    if re.fullmatch(r"[\W_]+", s):
+        return False
+    return True
+
+
+def _dedupe_layout_nodes(nodes: Sequence[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    out: List[Dict[str, Any]] = []
+    seen = set()
+    for raw in nodes:
+        if not isinstance(raw, dict):
+            continue
+        text = clean(raw.get("text"))
+        x = _layout_number(raw.get("x"))
+        y = _layout_number(raw.get("y"))
+        width = _layout_number(raw.get("width"))
+        height = _layout_number(raw.get("height"))
+        if width <= 0 or height <= 0:
+            continue
+        key = (norm(text), round(x / 4.0), round(y / 4.0), round(width / 6.0))
+        if key in seen:
+            continue
+        seen.add(key)
+        node = dict(raw)
+        node["_text"] = text
+        node["_x"] = x
+        node["_y"] = y
+        node["_width"] = width
+        node["_height"] = height
+        node["_cx"] = x + width / 2.0
+        node["_cy"] = y + height / 2.0
+        out.append(node)
+    return out
+
+
+def _layout_row_bands(nodes: Sequence[Dict[str, Any]]) -> List[Tuple[float, float]]:
+    candidates: List[Tuple[float, float, float]] = []
+    for node in nodes:
+        width = float(node["_width"])
+        height = float(node["_height"])
+        if width < 240 or height < 24 or height > 320:
+            continue
+        blob = " ".join(
+            clean(node.get(key))
+            for key in ("className", "parentClassName", "id", "role")
+        )
+        if not (
+            bool(node.get("inPipelineRow"))
+            or re.search(r"\b(pipeline[-_ ]?row|programme[-_ ]?row|program[-_ ]?row|asset[-_ ]?row|pipeline[-_ ]?card|programme[-_ ]?card|program[-_ ]?card)\b", blob, re.I)
+        ):
+            continue
+        candidates.append(
+            (
+                float(node["_y"]),
+                float(node["_y"]) + height,
+                width,
+            )
+        )
+
+    # Keep the widest container for strongly overlapping vertical bands.
+    bands: List[Tuple[float, float, float]] = []
+    for top, bottom, width in sorted(candidates, key=lambda x: (x[0], -x[2])):
+        replaced = False
+        for idx, (et, eb, ew) in enumerate(bands):
+            overlap = max(0.0, min(bottom, eb) - max(top, et))
+            smaller = max(1.0, min(bottom - top, eb - et))
+            if overlap / smaller >= 0.72:
+                if width > ew:
+                    bands[idx] = (top, bottom, width)
+                replaced = True
+                break
+        if not replaced:
+            bands.append((top, bottom, width))
+
+    return [(top, bottom) for top, bottom, _ in sorted(bands)]
+
+
+def _layout_fallback_bands(text_nodes: Sequence[Dict[str, Any]]) -> List[Tuple[float, float]]:
+    if not text_nodes:
+        return []
+    ordered = sorted(text_nodes, key=lambda n: float(n["_cy"]))
+    groups: List[List[Dict[str, Any]]] = []
+    for node in ordered:
+        cy = float(node["_cy"])
+        if not groups:
+            groups.append([node])
+            continue
+        current_y = sum(float(x["_cy"]) for x in groups[-1]) / len(groups[-1])
+        if abs(cy - current_y) <= 15.0:
+            groups[-1].append(node)
+        else:
+            groups.append([node])
+
+    bands: List[Tuple[float, float]] = []
+    for group in groups:
+        if len(group) < 2:
+            continue
+        top = min(float(n["_y"]) for n in group) - 6.0
+        bottom = max(float(n["_y"]) + float(n["_height"]) for n in group) + 6.0
+        bands.append((top, bottom))
+    return bands
+
+
+def interpret_pipeline_layout(
+    company: str,
+    source_url: str,
+    layout_nodes: Sequence[Dict[str, Any]],
+) -> Tuple[List[DiscoveryRow], Dict[str, Any]]:
+    """Conservative spatial fallback for visual/CSS pipeline grids.
+
+    It uses only rendered DOM geometry and source text. No company names,
+    Portfolio records, disease dictionaries, or hard-coded source coordinates
+    are used. Rows are emitted only when asset, indication and phase can all be
+    resolved from one visual row band.
+    """
+
+    nodes = _dedupe_layout_nodes(layout_nodes)
+    text_nodes = [n for n in nodes if clean(n.get("_text"))]
+
+    phase_headers: List[Dict[str, Any]] = []
+    for node in text_nodes:
+        phase = phase_canonical(node.get("_text"))
+        if not phase or len(clean(node.get("_text"))) > 60:
+            continue
+        phase_headers.append({**node, "_phase": phase})
+
+    # Collapse duplicate header labels at almost the same rendered position.
+    compact_headers: List[Dict[str, Any]] = []
+    for node in sorted(phase_headers, key=lambda n: (float(n["_cy"]), float(n["_cx"]))):
+        duplicate = False
+        for existing in compact_headers:
+            if (
+                existing["_phase"] == node["_phase"]
+                and abs(float(existing["_cx"]) - float(node["_cx"])) <= 24.0
+                and abs(float(existing["_cy"]) - float(node["_cy"])) <= 55.0
+            ):
+                duplicate = True
+                break
+        if not duplicate:
+            compact_headers.append(node)
+    phase_headers = compact_headers
+
+    # Prefer a header row containing at least two distinct canonical phases.
+    header_groups: List[List[Dict[str, Any]]] = []
+    for node in sorted(phase_headers, key=lambda n: float(n["_cy"])):
+        if not header_groups:
+            header_groups.append([node])
+            continue
+        gy = sum(float(x["_cy"]) for x in header_groups[-1]) / len(header_groups[-1])
+        if abs(float(node["_cy"]) - gy) <= 26.0:
+            header_groups[-1].append(node)
+        else:
+            header_groups.append([node])
+
+    global_headers: List[Dict[str, Any]] = []
+    for group in header_groups:
+        phases = {x["_phase"] for x in group}
+        if len(phases) >= 2 and len(group) > len(global_headers):
+            global_headers = sorted(group, key=lambda n: float(n["_cx"]))
+
+    bands = _layout_row_bands(nodes)
+    if not bands:
+        candidate_text = [
+            n for n in text_nodes
+            if _layout_text_ok(n.get("_text"))
+        ]
+        bands = _layout_fallback_bands(candidate_text)
+
+    rows: List[DiscoveryRow] = []
+    rejected: List[Dict[str, Any]] = []
+
+    first_phase_x = (
+        min(float(h["_cx"]) for h in global_headers)
+        if global_headers
+        else None
+    )
+
+    for band_no, (top, bottom) in enumerate(bands, start=1):
+        in_band = [
+            n for n in nodes
+            if top <= float(n["_cy"]) <= bottom
+        ]
+        band_text = [
+            n for n in in_band
+            if clean(n.get("_text"))
+        ]
+        if not band_text:
+            continue
+
+        explicit_phase_nodes = [
+            n for n in band_text
+            if phase_canonical(n.get("_text"))
+        ]
+        phase = ""
+        phase_evidence = ""
+
+        if explicit_phase_nodes:
+            # Prefer the highest explicit source phase when a band contains a
+            # range such as "Phase 1 / Phase 2".
+            ranked = []
+            for n in explicit_phase_nodes:
+                p = phase_canonical(n.get("_text"))
+                rank = {
+                    "Preclinical": 0,
+                    "Phase 1": 1,
+                    "Phase 2": 2,
+                    "Phase 3": 3,
+                    "Phase 4": 4,
+                    "Filed / Registration": 5,
+                }.get(p, -1)
+                ranked.append((rank, p))
+            ranked.sort()
+            if ranked and ranked[-1][0] >= 0:
+                phase = ranked[-1][1]
+                phase_evidence = "SOURCE_LAYOUT_TEXT"
+
+        if not phase and global_headers:
+            structural = [
+                n for n in in_band
+                if _layout_structural(n)
+                and float(n["_width"]) >= 18.0
+            ]
+            if structural:
+                right_edge = max(
+                    float(n["_x"]) + float(n["_width"])
+                    for n in structural
+                )
+                nearest = min(
+                    global_headers,
+                    key=lambda h: abs(float(h["_cx"]) - right_edge),
+                )
+                if abs(float(nearest["_cx"]) - right_edge) <= 180.0:
+                    phase = str(nearest["_phase"])
+                    phase_evidence = "SOURCE_LAYOUT_GEOMETRY"
+
+        content = [
+            n for n in band_text
+            if _layout_text_ok(n.get("_text"))
+            and (
+                first_phase_x is None
+                or float(n["_cx"]) < first_phase_x - 8.0
+            )
+        ]
+
+        # Remove nested duplicates where the same text appears repeatedly in
+        # parent and child elements.
+        compact_content: List[Dict[str, Any]] = []
+        seen_text = set()
+        for node in sorted(content, key=lambda n: (float(n["_x"]), float(n["_y"]))):
+            key = norm(node.get("_text"))
+            if not key or key in seen_text:
+                continue
+            seen_text.add(key)
+            compact_content.append(node)
+
+        asset_node: Optional[Dict[str, Any]] = None
+        for node in compact_content:
+            text = clean(node.get("_text"))
+            if is_identity_candidate(text) and len(text) <= 110:
+                asset_node = node
+                break
+
+        indication_node: Optional[Dict[str, Any]] = None
+        if asset_node is not None:
+            ax = float(asset_node["_cx"])
+            candidates = [
+                n for n in compact_content
+                if n is not asset_node
+                and float(n["_cx"]) >= ax + 28.0
+                and len(clean(n.get("_text"))) <= 180
+            ]
+            if candidates:
+                # Prefer the closest distinct text column; ties prefer the more
+                # descriptive disease/indication phrase.
+                candidates.sort(
+                    key=lambda n: (
+                        float(n["_cx"]) - ax,
+                        -len(clean(n.get("_text"))),
+                    )
+                )
+                indication_node = candidates[0]
+
+        asset = clean(asset_node.get("_text")) if asset_node else ""
+        indication = clean(indication_node.get("_text")) if indication_node else ""
+
+        if not (asset and indication and phase):
+            if asset or indication or phase:
+                rejected.append(
+                    {
+                        "band": band_no,
+                        "asset": asset,
+                        "indication": indication,
+                        "phase": phase,
+                        "text": [clean(n.get("_text")) for n in compact_content[:8]],
+                    }
+                )
+            continue
+
+        rows.append(
+            DiscoveryRow(
+                company=company,
+                sourceFamily="Company Pipeline",
+                sourceRecordId=f"layout:{band_no}",
+                sourceUrl=source_url,
+                asset=asset,
+                molecule="",
+                developmentCode="",
+                brand="",
+                indication=indication,
+                phase=phase,
+                phaseEvidence=phase_evidence,
+                sponsorOwner=company,
+                partners=[],
+                study="",
+                trialIds=[],
+                therapeuticArea="",
+                sourceOrdinal=len(rows) + 1,
+                parserMethod="VISUAL_LAYOUT_GRID",
+            )
+        )
+
+    selected = dedupe_rows(rows)
+    diagnostics = {
+        "version": VERSION,
+        "company": company,
+        "sourceUrl": source_url,
+        "layoutNodeCount": len(nodes),
+        "layoutTextNodeCount": len(text_nodes),
+        "phaseHeaderCount": len(phase_headers),
+        "globalPhaseHeaderCount": len(global_headers),
+        "rowBandCount": len(bands),
+        "visualLayoutRows": len(selected),
+        "visualLayoutRejectedBands": len(rejected),
+        "visualLayoutRejectedSamples": rejected[:10],
+        "selectedMethod": "VISUAL_LAYOUT_GRID",
+        "selectedRows": len(selected),
+        "coreCompleteRows": sum(
+            1 for row in selected
+            if row.asset and row.indication and row.phase
+        ),
+        "companySpecificParserBranch": False,
+        "portfolioDependentValidation": False,
+        "writes": 0,
+    }
+    return selected, diagnostics
 
 
 def interpret_pipeline_structure(

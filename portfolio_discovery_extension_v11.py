@@ -1,9 +1,13 @@
+import asyncio
+import logging
 import re
+import time
 import unicodedata
 from collections import Counter
 from typing import Any, Dict, List, Optional, Set, Tuple
 
-from fastapi import Header
+from fastapi import Header, HTTPException
+from fastapi.concurrency import run_in_threadpool
 from pydantic import BaseModel, Field
 
 from main import _auth, app
@@ -12,6 +16,14 @@ from main import _auth, app
 DISCOVERY_VERSION = "V1.1.0 PORTFOLIO DISCOVERY READ ONLY"
 DISCOVERY_CONTRACT = "PORTFOLIO_DISCOVERY_V1"
 COMMERCIAL_POLICY = "COMMERCIAL_PORTFOLIO_V1"
+
+# Protect the shared async adapter event loop from CPU-bound portfolio matching.
+# One comparator at a time on this service instance; a bounded wait stops
+# staging clients from accumulating a long queue behind a large company.
+_COMPARE_SLOT = asyncio.Semaphore(1)
+COMPARE_WAIT_TIMEOUT_SECONDS = 2.0
+COMPARE_RETRY_AFTER_SECONDS = 30
+_LOG = logging.getLogger(__name__)
 
 CLASSIFICATIONS = {
     "MATCHED",
@@ -780,4 +792,38 @@ async def portfolio_discovery_compare(
     x_adapter_key: Optional[str] = Header(default=None),
 ) -> DiscoveryCompareResponse:
     _auth(x_adapter_key)
-    return compare_discovery(request)
+
+    try:
+        await asyncio.wait_for(
+            _COMPARE_SLOT.acquire(),
+            timeout=COMPARE_WAIT_TIMEOUT_SECONDS,
+        )
+    except asyncio.TimeoutError as exc:
+        _LOG.warning(
+            "PORTFOLIO_COMPARE_BUSY company=%s sourceRows=%d portfolioRows=%d",
+            request.company,
+            len(request.sourceRows),
+            len(request.portfolioRows),
+        )
+        # Transient, read-only failure: source binding stays retry-eligible.
+        # Airtable must retry on a *later* controlled source run, not spin.
+        raise HTTPException(
+            status_code=503,
+            detail="Portfolio comparator busy; defer this source to the next controlled staging run.",
+            headers={"Retry-After": str(COMPARE_RETRY_AFTER_SECONDS)},
+        ) from exc
+
+    started_at = time.monotonic()
+    try:
+        # The V1.2-V1.6 deterministic comparison patches replace this callable
+        # during application startup. Resolve it at invocation time.
+        return await run_in_threadpool(compare_discovery, request)
+    finally:
+        _COMPARE_SLOT.release()
+        _LOG.info(
+            "PORTFOLIO_COMPARE_FINISHED company=%s sourceRows=%d portfolioRows=%d elapsedMs=%d",
+            request.company,
+            len(request.sourceRows),
+            len(request.portfolioRows),
+            int((time.monotonic() - started_at) * 1000),
+        )

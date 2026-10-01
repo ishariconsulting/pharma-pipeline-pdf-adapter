@@ -1,0 +1,27 @@
+name: Portfolio comparator concurrency canary
+
+on:
+  pull_request:
+    paths:
+      - "portfolio_discovery_extension_v11.py"
+      - "portfolio_compare_concurrency_canary.py"
+      - ".github/workflows/portfolio-comparator-concurrency-canary.yml"
+  workflow_dispatch:
+
+jobs:
+  concurrency-canary:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install adapter dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+      - name: Check route syntax and endpoint concurrency
+        run: |
+          python -m py_compile portfolio_discovery_extension_v11.py portfolio_compare_concurrency_canary.py
+          python portfolio_compare_concurrency_canary.py

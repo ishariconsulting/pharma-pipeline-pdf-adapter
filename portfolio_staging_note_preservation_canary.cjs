@@ -148,25 +148,34 @@ const requestEnd = full.indexOf("\nconst swf = {", requestStart);
 assert.ok(requestStart >= 0 && requestEnd > requestStart);
 const asyncRequestCode = full.slice(requestStart, requestEnd) +
     "\nglobalThis.__jsonRequest = jsonRequest;";
-for (const code of [429, 503]) {
-    let called = 0;
-    const ctx = {
-        Set, Promise, Error, JSON,
-        fetch: async () => {
-            called++;
-            return { status: code, headers: { get: () => "30" }, text: async () => "{}" };
-        },
-    };
-    vm.runInNewContext(asyncRequestCode, ctx, { timeout: 2000 });
-    // eslint-disable-next-line no-loop-func
-    (async () => {
-        try { await ctx.__jsonRequest("https://example.org/", {}, 2); }
-        catch (error) {
+async function transientHttpTests() {
+    for (const code of [429, 503]) {
+        let called = 0;
+        const ctx = {
+            Set, Promise, Error, JSON,
+            fetch: async () => {
+                called++;
+                return { status: code, headers: { get: () => "30" }, text: async () => "{}" };
+            },
+        };
+        vm.runInNewContext(asyncRequestCode, ctx, { timeout: 2000 });
+        let rejected = false;
+        try {
+            await ctx.__jsonRequest("https://example.org/", {}, 2);
+        } catch (error) {
+            rejected = true;
             assert.match(error.message, /DEFERRED_TRANSIENT_HTTP_/);
             assert.equal(called, 1, "429/503 must not immediately retry");
-            return;
         }
-        throw new Error(code + " was not deferred");
-    })().catch(err => { throw err; });
+        assert.ok(rejected, code + " was not deferred");
+    }
 }
-console.log("PASS: four pre-existing note/evidence/gate/scope fixtures protected, one new candidate, reviewed exclusions retained");
+
+transientHttpTests()
+    .then(() => console.log(
+        "PASS: existing notes/evidence/gates/scopes preserved, new candidate correctly prepared, transient HTTP deferred"
+    ))
+    .catch(err => {
+        console.error(err);
+        process.exitCode = 1;
+    });

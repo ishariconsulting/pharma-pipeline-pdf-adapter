@@ -9,7 +9,7 @@ const path = require("node:path");
 const vm = require("node:vm");
 
 const full = fs.readFileSync(
-    path.join(__dirname, "airtable_scripts/portfolio_discovery_staging_v4_4_4_draft.txt"),
+    path.join(__dirname, "airtable_scripts/portfolio_discovery_staging_v4_4_5_draft.txt"),
     "utf8"
 );
 assert.ok(full.includes("DEFERRED_TRANSIENT_HTTP_503") === false); // dynamic HTTP code
@@ -42,6 +42,7 @@ function existing(key, status, classification, gate, scope, marker) {
             sourceScope: scope,
             reason: marker + " CURATED REVIEW. Do not replace.",
             evidence: marker + " CROSS-SOURCE EVIDENCE. Do not replace.",
+            decision: (gate === "Out of Programme Scope" || status === "Reviewed - Exclude") ? "Exclude" : "Include",
         },
     };
 }
@@ -54,6 +55,8 @@ const previous = [
         "Evidence Captured – Scope Unresolved", "Asset / phase umbrella", "ODRONEXTAMAB"),
     existing("reviewed-exclusion", "Reviewed - Exclude", "EXCLUDED BY RULE",
         "Out of Programme Scope", "Uncertain", "ASTRAZENECA PARSER ARTEFACT"),
+    existing("resolved-exclusion", "Resolved", "EXCLUDED BY RULE",
+        "Out of Programme Scope", "Uncertain", "CLOSED REVIEW"),
 ];
 const snapshot = new Map(previous.map(r => [r.values.id, JSON.stringify(r.values)]));
 const byId = new Map(previous.map(r => [r.values.id, r]));
@@ -78,6 +81,7 @@ const inputs = [
     candidate("regn-cenv", "CENVACIBART", "card-30", "NEW INDICATION", "Thrombosis"),
     candidate("regn-odro", "ODRONEXTAMAB", "card-55", "NEW INDICATION", "Lymphoma multiple lines and settings"),
     candidate("reviewed-exclusion", "PARSER-ARTEFACT", "card-77", "NEW ASSET", "Synthetic title"),
+    candidate("resolved-exclusion", "CLOSED-ARTEFACT", "card-78", "NEW ASSET", "Synthetic title 2"),
     candidate("new-record", "FUTURE-ASSET", "card-99", "NEW ASSET", "Distinct condition"),
 ];
 
@@ -102,7 +106,7 @@ const context = {
 vm.runInNewContext(candidateBlock, context, { timeout: 2000 });
 
 const { creates, updates } = context.__canary;
-assert.equal(updates.length, 4, "four existing rows must update, never create duplicates");
+assert.equal(updates.length, 5, "five existing rows must update, never create duplicates");
 assert.equal(creates.length, 1, "one novel fixture gets a fresh candidate");
 const upd = new Map(updates.map(u => [u.id, u.fields]));
 
@@ -137,6 +141,12 @@ assert.equal(excluded[cf.classification.id].name, "EXCLUDED BY RULE",
     "parser artefact cannot become a new asset");
 assert.notEqual(excluded[cf.decision.id].name, "Include",
     "reviewed out-of-programme source must not be marked commercially Include");
+assert.equal(excluded[cf.decision.id].name, "Exclude");
+const resolved = upd.get("existing-resolved-exclusion");
+assert.equal(resolved[cf.reviewStatus.id].name, "Resolved");
+assert.equal(resolved[cf.classification.id].name, "EXCLUDED BY RULE");
+assert.equal(resolved[cf.decision.id].name, "Exclude",
+    "a previously closed out-of-programme candidate must remain excluded");
 const fresh = creates[0].fields;
 assert.ok(fresh[cf.reason.id] && fresh[cf.evidence.id]);
 assert.ok(fresh[cf.latestStagingEvidence.id]);

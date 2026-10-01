@@ -1,0 +1,21 @@
+name: Airtable staging note preservation canary
+
+on:
+  pull_request:
+    paths:
+      - "airtable_scripts/portfolio_discovery_staging_v4_4_4_draft.txt"
+      - "portfolio_staging_note_preservation_canary.cjs"
+      - ".github/workflows/staging-note-preservation-canary.yml"
+  workflow_dispatch:
+
+jobs:
+  staging-snapshot:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+      - name: Test real Airtable candidate-upsert block against isolated fixtures
+        run: node portfolio_staging_note_preservation_canary.cjs

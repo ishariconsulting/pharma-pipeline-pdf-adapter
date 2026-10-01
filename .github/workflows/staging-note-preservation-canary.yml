@@ -3,7 +3,7 @@ name: Airtable staging note preservation canary
 on:
   pull_request:
     paths:
-      - "airtable_scripts/portfolio_discovery_staging_v4_4_4_draft.txt"
+      - "airtable_scripts/portfolio_discovery_staging_v4_4_5_draft.txt"
       - "portfolio_staging_note_preservation_canary.cjs"
       - ".github/workflows/staging-note-preservation-canary.yml"
   workflow_dispatch:

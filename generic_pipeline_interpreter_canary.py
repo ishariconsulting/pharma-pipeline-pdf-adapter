@@ -537,6 +537,7 @@ def extract_rows_from_tables(
             continue
 
         current_ta = ""
+        previous_asset = ""
         for raw_row in table[header_idx + 1 :]:
             if not any(clean(x) for x in raw_row):
                 continue
@@ -552,6 +553,23 @@ def extract_rows_from_tables(
             asset = value_at(raw_row, header_map, "asset")
             indication = value_at(raw_row, header_map, "indication")
             phase_raw = value_at(raw_row, header_map, "phase")
+
+            # Generic row-group repair for semantic tables that visually carry
+            # the programme/asset cell across multiple indication rows (e.g.
+            # HTML rowspan or an omitted repeated first cell). If column shift
+            # makes the mapped indication itself a phase label, inherit only
+            # the immediately preceding source asset and shift the current
+            # first cell back to indication. This is source-structure based,
+            # never company-specific.
+            if (
+                previous_asset
+                and asset
+                and phase_canonical(indication)
+            ):
+                shifted_phase = indication
+                indication = asset
+                asset = previous_asset
+                phase_raw = shifted_phase
 
             # Some matrix-style tables encode phase in one of several cells.
             if not phase_raw:
@@ -573,6 +591,9 @@ def extract_rows_from_tables(
                     phase = ctgov_phase(ids[0])
                     if phase:
                         phase_evidence = "CLINICALTRIALS_GOV_FALLBACK"
+
+            if asset:
+                previous_asset = asset
 
             if not asset or not indication or not phase:
                 continue

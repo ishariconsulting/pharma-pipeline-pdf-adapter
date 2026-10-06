@@ -167,6 +167,9 @@ async def main():
             "issueCount": len(pdf_result.issues or []),
             "outOfScopeApprovedRows": pdf_result.diagnostics.get("outOfScopeApprovedRows", 0),
             "outOfScopeApprovedAssets": pdf_result.diagnostics.get("outOfScopeApprovedAssets", []),
+            "embeddedPages": pdf_result.diagnostics.get("pages", []),
+            "failureSamples": pdf_result.diagnostics.get("failureSamples", []),
+            "approvalEvidenceLines": pdf_result.diagnostics.get("approvalEvidenceLines", []),
             "rowKeys": [
                 {
                     "asset": row.get("asset"),

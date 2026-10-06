@@ -22,7 +22,7 @@ from html_fetch_extension import _assert_public_http_url
 
 
 ADAPTER_PROFILE = "PIPELINE_GENERIC_PDF_TABLE_V1"
-ROUTE_VERSION = "GENERIC_PDF_PIPELINE_TABLE_V1.2.1_EMBEDDED_PHASE_CANARY_READ_ONLY"
+ROUTE_VERSION = "GENERIC_PDF_PIPELINE_TABLE_V1.2.2_VISUAL_LINE_CANARY_READ_ONLY"
 MAX_BYTES = 15_000_000
 MIN_ROWS = 4
 
@@ -1791,12 +1791,21 @@ def parse_embedded_phase_lines_pdf(
 
     for page_idx in range(len(doc)):
         page = doc[page_idx]
-        page_text = page.get_text("text", sort=True)
+        words = page.get_text("words")
+        visual_lines = _group_word_lines(words, y_tol=3.5)
+        line_texts = [
+            {
+                "y": float(line["y"]),
+                "text": _join_words(line["words"]),
+            }
+            for line in visual_lines
+            if _join_words(line["words"])
+        ]
         parsed_here = 0
         markers_here = 0
 
-        for raw_line in page_text.splitlines():
-            line = clean(raw_line)
+        for line_no, line_obj in enumerate(line_texts):
+            line = clean(line_obj["text"])
             if not line:
                 continue
 
@@ -1817,6 +1826,24 @@ def parse_embedded_phase_lines_pdf(
                 body = clean(line[match.end():segment_end])
                 body = re.sub(r"^[|•;,:\-–—]+\s*", "", body)
                 body = re.sub(r"\s*[|•;]+\s*$", "", body)
+
+                # Some bar labels wrap immediately below the phase marker,
+                # e.g. "Ph 1/2:" on one visual line and
+                # "ASSET for indication" on the next. Join only a tight
+                # following line with no competing phase marker.
+                if (
+                    " for " not in body.lower()
+                    and line_no + 1 < len(line_texts)
+                ):
+                    nxt = line_texts[line_no + 1]
+                    gap = float(nxt["y"]) - float(line_obj["y"])
+                    nxt_text = clean(nxt["text"])
+                    if (
+                        0.0 < gap <= 24.0
+                        and not phase_marker.search(nxt_text)
+                        and " for " in nxt_text.lower()
+                    ):
+                        body = clean(f"{body} {nxt_text}")
 
                 phase_numbers = [int(match.group(1))]
                 if match.group(2):
@@ -1862,8 +1889,8 @@ def parse_embedded_phase_lines_pdf(
                     "company": company,
                     "sourceFamily": "Company Pipeline",
                     "sourceRecordId": (
-                        f"pdfembedded:p{page_idx+1}:m{idx+1}:"
-                        f"r{len(candidate_rows)+1}"
+                        f"pdfembedded:p{page_idx+1}:l{line_no+1}:"
+                        f"m{idx+1}:r{len(candidate_rows)+1}"
                     ),
                     "sourceUrl": source_url,
                     "asset": asset,

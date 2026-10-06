@@ -22,7 +22,7 @@ from html_fetch_extension import _assert_public_http_url
 
 
 ADAPTER_PROFILE = "PIPELINE_GENERIC_PDF_TABLE_V1"
-ROUTE_VERSION = "GENERIC_PDF_PIPELINE_TABLE_V1.2_EMBEDDED_PHASE_CANARY_READ_ONLY"
+ROUTE_VERSION = "GENERIC_PDF_PIPELINE_TABLE_V1.2.1_EMBEDDED_PHASE_CANARY_READ_ONLY"
 MAX_BYTES = 15_000_000
 MIN_ROWS = 4
 
@@ -1763,14 +1763,16 @@ def parse_embedded_phase_lines_pdf(
     source_url: str,
     data: bytes,
 ) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
-    """Parse programme labels where phase is embedded in the source text.
+    """Parse programme labels where phase is embedded in source text.
 
-    Reusable pattern examples:
+    Reusable source pattern examples:
       Ph 3: ASSET for indication
       Phase 1/2: ASSET for indication
 
-    The parser uses source text only, has no company-specific identities, and
-    excludes rows when the same document explicitly marks that asset approved.
+    Multiple programme labels may be coalesced onto one extracted PDF text
+    line. Each phase marker therefore starts a new deterministic segment.
+    Approval exclusion is conservative: the asset must occur on the same
+    compact source line as the word "approved", within a tight distance.
     """
     try:
         doc = fitz.open(stream=data, filetype="pdf")
@@ -1779,92 +1781,149 @@ def parse_embedded_phase_lines_pdf(
 
     candidate_rows: List[Dict[str, Any]] = []
     page_diags: List[Dict[str, Any]] = []
-    full_text_parts: List[str] = []
+    approval_lines: List[str] = []
+    rejected_segments: List[Dict[str, Any]] = []
 
-    pattern = re.compile(
-        r"\b(?:Ph|Phase)\s*([1-4])(?:\s*/\s*([1-4]))?\s*:\s*(.{2,180})$",
+    phase_marker = re.compile(
+        r"\b(?:Ph|Phase)\s*([1-4])(?:\s*/\s*([1-4]))?\s*:",
         re.I,
     )
 
     for page_idx in range(len(doc)):
         page = doc[page_idx]
         page_text = page.get_text("text", sort=True)
-        full_text_parts.append(page_text)
         parsed_here = 0
+        markers_here = 0
 
         for raw_line in page_text.splitlines():
             line = clean(raw_line)
-            match = pattern.search(line)
-            if not match:
+            if not line:
                 continue
 
-            phase_numbers = [int(match.group(1))]
-            if match.group(2):
-                phase_numbers.append(int(match.group(2)))
-            phase = f"Phase {max(phase_numbers)}"
+            if re.search(r"\bapproved\b", line, re.I) and len(line) <= 320:
+                approval_lines.append(line)
 
-            body = clean(match.group(3))
-            parts = re.split(r"\s+for\s+", body, maxsplit=1, flags=re.I)
-            if len(parts) != 2:
+            matches = list(phase_marker.finditer(line))
+            if not matches:
                 continue
+            markers_here += len(matches)
 
-            asset = clean(parts[0])
-            indication = clean(parts[1])
-            if not asset or not indication:
-                continue
-            if len(asset) > 100 or len(indication) > 160:
-                continue
+            for idx, match in enumerate(matches):
+                segment_end = (
+                    matches[idx + 1].start()
+                    if idx + 1 < len(matches)
+                    else len(line)
+                )
+                body = clean(line[match.end():segment_end])
+                body = re.sub(r"^[|•;,:\-–—]+\s*", "", body)
+                body = re.sub(r"\s*[|•;]+\s*$", "", body)
 
-            candidate_rows.append({
-                "company": company,
-                "sourceFamily": "Company Pipeline",
-                "sourceRecordId": f"pdfembedded:p{page_idx+1}:{parsed_here+1}",
-                "sourceUrl": source_url,
-                "asset": asset,
-                "molecule": asset,
-                "developmentCode": asset if re.search(r"\d", asset) else "",
-                "brand": "",
-                "indication": indication,
-                "phase": phase,
-                "phaseEvidence": "SOURCE_PDF_EMBEDDED_PHASE_TEXT",
-                "programStatus": "",
-                "sponsorOwner": company,
-                "partners": [],
-                "study": "",
-                "trialIds": [],
-                "therapeuticArea": "",
-                "marketRegion": "",
-                "sourceStageText": clean(match.group(0)),
-                "sourcePage": page_idx + 1,
-                "sourceOrdinal": len(candidate_rows) + 1,
-                "parserMethod": "SEMANTIC_PDF_EMBEDDED_PHASE_LINE",
-                "sourceAdapter": ADAPTER_PROFILE,
-            })
-            parsed_here += 1
+                phase_numbers = [int(match.group(1))]
+                if match.group(2):
+                    phase_numbers.append(int(match.group(2)))
+                phase = f"Phase {max(phase_numbers)}"
 
-        if parsed_here:
+                parts = re.split(r"\s+for\s+", body, maxsplit=1, flags=re.I)
+                if len(parts) != 2:
+                    rejected_segments.append({
+                        "page": page_idx + 1,
+                        "segment": body[:180],
+                        "reason": "NO_FOR_SEPARATOR",
+                    })
+                    continue
+
+                asset = clean(parts[0])
+                indication = clean(parts[1])
+
+                # A nested phase marker means segment boundaries were not
+                # resolved cleanly; fail closed rather than joining programmes.
+                if phase_marker.search(indication):
+                    rejected_segments.append({
+                        "page": page_idx + 1,
+                        "segment": body[:180],
+                        "reason": "NESTED_PHASE_MARKER",
+                    })
+                    continue
+
+                if (
+                    not asset
+                    or not indication
+                    or len(asset) > 100
+                    or len(indication) > 160
+                ):
+                    rejected_segments.append({
+                        "page": page_idx + 1,
+                        "segment": body[:180],
+                        "reason": "CORE_FIELD_SHAPE",
+                    })
+                    continue
+
+                candidate_rows.append({
+                    "company": company,
+                    "sourceFamily": "Company Pipeline",
+                    "sourceRecordId": (
+                        f"pdfembedded:p{page_idx+1}:m{idx+1}:"
+                        f"r{len(candidate_rows)+1}"
+                    ),
+                    "sourceUrl": source_url,
+                    "asset": asset,
+                    "molecule": asset,
+                    "developmentCode": asset if re.search(r"\d", asset) else "",
+                    "brand": "",
+                    "indication": indication,
+                    "phase": phase,
+                    "phaseEvidence": "SOURCE_PDF_EMBEDDED_PHASE_TEXT",
+                    "programStatus": "",
+                    "sponsorOwner": company,
+                    "partners": [],
+                    "study": "",
+                    "trialIds": [],
+                    "therapeuticArea": "",
+                    "marketRegion": "",
+                    "sourceStageText": clean(match.group(0) + " " + body),
+                    "sourcePage": page_idx + 1,
+                    "sourceOrdinal": len(candidate_rows) + 1,
+                    "parserMethod": "SEMANTIC_PDF_EMBEDDED_PHASE_LINE",
+                    "sourceAdapter": ADAPTER_PROFILE,
+                })
+                parsed_here += 1
+
+        if parsed_here or markers_here:
             page_diags.append({
                 "page": page_idx + 1,
+                "phaseMarkers": markers_here,
                 "parsedRows": parsed_here,
             })
 
-    full_text = clean(" ".join(full_text_parts))
+    def explicitly_approved(asset: str) -> bool:
+        target = clean(asset)
+        if not target:
+            return False
+        escaped = re.escape(target)
+        for line in approval_lines:
+            for match in re.finditer(escaped, line, re.I):
+                approvals = list(re.finditer(r"\bapproved\b", line, re.I))
+                if not approvals:
+                    continue
+                distance = min(
+                    min(
+                        abs(match.start() - a.end()),
+                        abs(a.start() - match.end()),
+                    )
+                    for a in approvals
+                )
+                if distance <= 55:
+                    return True
+        return False
+
     active_rows: List[Dict[str, Any]] = []
     approved_rows: List[Dict[str, Any]] = []
-
     for row in candidate_rows:
-        asset = clean(row.get("asset"))
-        escaped = re.escape(asset)
-        approved = bool(re.search(
-            rf"(?:{escaped}.{{0,120}}\bapproved\b|\bapproved\b.{{0,120}}{escaped})",
-            full_text,
-            re.I,
-        ))
-        if approved:
+        if explicitly_approved(clean(row.get("asset"))):
             row["programStatus"] = "Approved"
             approved_rows.append(row)
-            continue
-        active_rows.append(row)
+        else:
+            active_rows.append(row)
 
     deduped: List[Dict[str, Any]] = []
     seen = set()
@@ -1884,8 +1943,10 @@ def parse_embedded_phase_lines_pdf(
         "dedupedRows": len(deduped),
         "outOfScopeApprovedRows": len(approved_rows),
         "outOfScopeApprovedAssets": [r.get("asset") for r in approved_rows[:20]],
+        "approvalEvidenceLines": approval_lines[:12],
         "exactDuplicatesRemoved": len(active_rows) - len(deduped),
-        "rowFailures": 0,
+        "rowFailures": len(rejected_segments),
+        "failureSamples": rejected_segments[:12],
         "boundaryWarnings": 0,
         "companySpecificParserBranch": False,
         "portfolioDependentValidation": False,

@@ -33,6 +33,11 @@ TARGETS = [
         "must_pass": False,
     },
     {
+        "name": "Ultragenyx SEC 10-Q",
+        "url": "https://www.sec.gov/Archives/edgar/data/1515673/000119312526333233/rare-20260630.htm",
+        "must_pass": False,
+    },
+    {
         "name": "Ultragenyx Pharmaceutical",
         "url": "https://www.ultragenyx.com/our-research/pipeline/",
         "must_pass": False,

@@ -39,7 +39,7 @@ from generic_pipeline_interpreter_canary import (
 
 
 ADAPTER_PROFILE = "PIPELINE_GENERIC_HTML_V1"
-ROUTE_VERSION = "GENERIC_PIPELINE_EXTRACTION_V1.3_VISUAL_LAYOUT_FALLBACK_READ_ONLY"
+ROUTE_VERSION = "GENERIC_PIPELINE_EXTRACTION_V1.3.1_DIRECT_STRUCTURE_GATE_CANARY_READ_ONLY"
 
 
 class GenericPipelineExtractionResponse(BaseModel):
@@ -381,24 +381,24 @@ async def _extract_generic_pipeline(
 
         # A successful HTTP response with substantial source text is a parser
         # problem, not a transport problem. Keep it DIRECT and fail closed so
-        # we do not hide unsupported page structures behind browser rendering.
+        # unsupported structures are visible to adapter QA instead of being
+        # masked by a browser transport failure.
         #
         # Browser escalation is allowed only for a genuinely sparse server
         # response (typical JS shell) or the bounded transport failures handled
-        # in the HTTPException path below.
+        # in the HTTPException path below. Visual-layout parsing is still
+        # available after a legitimate browser escalation.
         direct_visible_lines = int(diagnostics.get("visibleLineCount") or 0)
         direct_visible_text_length = _visible_text_length(raw_html)
-        if not validation.get("pass"):
+        direct_is_sparse = (
+            direct_visible_lines < 20
+            or direct_visible_text_length < 800
+        )
+
+        if not validation.get("pass") and direct_is_sparse:
             base, key = _browser_config()
             if base and key:
-                routing_reason = (
-                    "SPARSE_SERVER_HTML"
-                    if (
-                        direct_visible_lines < 20
-                        or direct_visible_text_length < 800
-                    )
-                    else "DIRECT_STRUCTURE_BROWSER_RETRY"
-                )
+                routing_reason = "SPARSE_SERVER_HTML"
                 browser = await _fetch_browser_structure(
                     source_url,
                     timeout_seconds,
@@ -429,7 +429,9 @@ async def _extract_generic_pipeline(
                     validation=validation,
                 )
             else:
-                routing_reason = "DIRECT_STRUCTURE_UNSUPPORTED_BROWSER_NOT_CONFIGURED"
+                routing_reason = "SPARSE_SERVER_HTML_BROWSER_NOT_CONFIGURED"
+        elif not validation.get("pass"):
+            routing_reason = "DIRECT_STRUCTURE_UNSUPPORTED"
 
     except HTTPException as exc:
         if not _browser_fallback_allowed(exc):

@@ -22,7 +22,7 @@ from html_fetch_extension import _assert_public_http_url
 
 
 ADAPTER_PROFILE = "PIPELINE_GENERIC_PDF_TABLE_V1"
-ROUTE_VERSION = "GENERIC_PDF_PIPELINE_TABLE_V1.1_MULTI_STRUCTURE_READ_ONLY"
+ROUTE_VERSION = "GENERIC_PDF_PIPELINE_TABLE_V1.2_EMBEDDED_PHASE_CANARY_READ_ONLY"
 MAX_BYTES = 15_000_000
 MIN_ROWS = 4
 
@@ -1757,6 +1757,144 @@ def parse_phase_column_pdf(
     return deduped, diagnostics
 
 
+
+def parse_embedded_phase_lines_pdf(
+    company: str,
+    source_url: str,
+    data: bytes,
+) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
+    """Parse programme labels where phase is embedded in the source text.
+
+    Reusable pattern examples:
+      Ph 3: ASSET for indication
+      Phase 1/2: ASSET for indication
+
+    The parser uses source text only, has no company-specific identities, and
+    excludes rows when the same document explicitly marks that asset approved.
+    """
+    try:
+        doc = fitz.open(stream=data, filetype="pdf")
+    except Exception as exc:
+        raise HTTPException(status_code=422, detail=f"Invalid PDF: {exc}") from exc
+
+    candidate_rows: List[Dict[str, Any]] = []
+    page_diags: List[Dict[str, Any]] = []
+    full_text_parts: List[str] = []
+
+    pattern = re.compile(
+        r"\b(?:Ph|Phase)\s*([1-4])(?:\s*/\s*([1-4]))?\s*:\s*(.{2,180})$",
+        re.I,
+    )
+
+    for page_idx in range(len(doc)):
+        page = doc[page_idx]
+        page_text = page.get_text("text", sort=True)
+        full_text_parts.append(page_text)
+        parsed_here = 0
+
+        for raw_line in page_text.splitlines():
+            line = clean(raw_line)
+            match = pattern.search(line)
+            if not match:
+                continue
+
+            phase_numbers = [int(match.group(1))]
+            if match.group(2):
+                phase_numbers.append(int(match.group(2)))
+            phase = f"Phase {max(phase_numbers)}"
+
+            body = clean(match.group(3))
+            parts = re.split(r"\s+for\s+", body, maxsplit=1, flags=re.I)
+            if len(parts) != 2:
+                continue
+
+            asset = clean(parts[0])
+            indication = clean(parts[1])
+            if not asset or not indication:
+                continue
+            if len(asset) > 100 or len(indication) > 160:
+                continue
+
+            candidate_rows.append({
+                "company": company,
+                "sourceFamily": "Company Pipeline",
+                "sourceRecordId": f"pdfembedded:p{page_idx+1}:{parsed_here+1}",
+                "sourceUrl": source_url,
+                "asset": asset,
+                "molecule": asset,
+                "developmentCode": asset if re.search(r"\d", asset) else "",
+                "brand": "",
+                "indication": indication,
+                "phase": phase,
+                "phaseEvidence": "SOURCE_PDF_EMBEDDED_PHASE_TEXT",
+                "programStatus": "",
+                "sponsorOwner": company,
+                "partners": [],
+                "study": "",
+                "trialIds": [],
+                "therapeuticArea": "",
+                "marketRegion": "",
+                "sourceStageText": clean(match.group(0)),
+                "sourcePage": page_idx + 1,
+                "sourceOrdinal": len(candidate_rows) + 1,
+                "parserMethod": "SEMANTIC_PDF_EMBEDDED_PHASE_LINE",
+                "sourceAdapter": ADAPTER_PROFILE,
+            })
+            parsed_here += 1
+
+        if parsed_here:
+            page_diags.append({
+                "page": page_idx + 1,
+                "parsedRows": parsed_here,
+            })
+
+    full_text = clean(" ".join(full_text_parts))
+    active_rows: List[Dict[str, Any]] = []
+    approved_rows: List[Dict[str, Any]] = []
+
+    for row in candidate_rows:
+        asset = clean(row.get("asset"))
+        escaped = re.escape(asset)
+        approved = bool(re.search(
+            rf"(?:{escaped}.{{0,120}}\bapproved\b|\bapproved\b.{{0,120}}{escaped})",
+            full_text,
+            re.I,
+        ))
+        if approved:
+            row["programStatus"] = "Approved"
+            approved_rows.append(row)
+            continue
+        active_rows.append(row)
+
+    deduped: List[Dict[str, Any]] = []
+    seen = set()
+    for row in active_rows:
+        key = (norm(row["asset"]), norm(row["indication"]), norm(row["phase"]))
+        if key in seen:
+            continue
+        seen.add(key)
+        row["sourceOrdinal"] = len(deduped) + 1
+        deduped.append(row)
+
+    diagnostics = {
+        "pageCount": len(doc),
+        "semanticEmbeddedPhasePages": len(page_diags),
+        "pages": page_diags,
+        "candidateRows": len(candidate_rows),
+        "dedupedRows": len(deduped),
+        "outOfScopeApprovedRows": len(approved_rows),
+        "outOfScopeApprovedAssets": [r.get("asset") for r in approved_rows[:20]],
+        "exactDuplicatesRemoved": len(active_rows) - len(deduped),
+        "rowFailures": 0,
+        "boundaryWarnings": 0,
+        "companySpecificParserBranch": False,
+        "portfolioDependentValidation": False,
+        "writes": 0,
+        "selectedMethod": "SEMANTIC_PDF_EMBEDDED_PHASE_LINE",
+    }
+    return deduped, diagnostics
+
+
 async def download_pdf(url: str, timeout_seconds: float) -> Tuple[bytes, str]:
     await _assert_public_http_url(url)
     parsed = urlparse(url)
@@ -1808,6 +1946,13 @@ async def extract_generic_pdf(
             selected_method = "SEMANTIC_PDF_STAGE_BAR"
 
     if not rows:
+        embedded_rows, embedded_diagnostics = parse_embedded_phase_lines_pdf(company, final_url, data)
+        if len(embedded_rows) > len(rows):
+            rows = embedded_rows
+            diagnostics = embedded_diagnostics
+            selected_method = "SEMANTIC_PDF_EMBEDDED_PHASE_LINE"
+
+    if not rows:
         phase_rows, phase_diagnostics = parse_phase_column_pdf(company, final_url, data)
         if len(phase_rows) > len(rows):
             rows = phase_rows
@@ -1845,6 +1990,7 @@ async def extract_generic_pdf(
         "semanticTableFound": (
             int(diagnostics.get("semanticTablePages", 0)) > 0
             or int(diagnostics.get("semanticStageBarPages", 0)) > 0
+            or int(diagnostics.get("semanticEmbeddedPhasePages", 0)) > 0
             or int(diagnostics.get("semanticPhaseColumnPages", 0)) > 0
         ),
     }

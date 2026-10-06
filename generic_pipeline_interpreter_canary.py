@@ -136,6 +136,8 @@ HEADER_ALIASES = {
         "product",
         "medicine",
         "drug",
+        "active principle",
+        "active ingredient",
     ),
     "molecule": (
         "molecule",
@@ -223,11 +225,17 @@ def phase_canonical(value: Any) -> str:
     if "registration" in n or "regulatory" in n or "filed" in n:
         return "Filed / Registration"
 
-    # Prefer the highest explicit clinical phase if a cell includes a range.
-    phase_hits = [
-        int(x)
-        for x in re.findall(r"\bphase\s*([1-4])\b", n, flags=re.I)
-    ]
+    # Prefer the highest explicit clinical phase if a cell includes a range
+    # or subphase, e.g. Phase 1/2, Phase 2/3, Phase 2b.
+    phase_hits: List[int] = []
+    for match in re.finditer(
+        r"\bphase\s*([1-4])(?:\s*[/\-]\s*([1-4]))?\s*[a-d]?\b",
+        text,
+        flags=re.I,
+    ):
+        phase_hits.append(int(match.group(1)))
+        if match.group(2):
+            phase_hits.append(int(match.group(2)))
     if phase_hits:
         return f"Phase {max(phase_hits)}"
 

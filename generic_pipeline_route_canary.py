@@ -9,6 +9,7 @@ import asyncio
 import json
 
 from generic_pipeline_extension import _extract_generic_pipeline, _fetch_raw_public_html
+from generic_pdf_pipeline_extension import extract_generic_pdf
 
 
 TARGETS = [
@@ -149,6 +150,42 @@ async def main():
     results = []
     for target in TARGETS:
         results.append(await check(target))
+
+    try:
+        pdf_result = await extract_generic_pdf(
+            company="Ultragenyx Pharmaceutical",
+            source_url="https://ir.ultragenyx.com/static-files/ebde99f9-1891-4798-b0b2-f088bdb72131",
+            timeout_seconds=35.0,
+        )
+        results.append({
+            "company": "Ultragenyx Corporate Presentation",
+            "status": "RESPONSE",
+            "routeVersion": pdf_result.routeVersion,
+            "readyForDiscovery": pdf_result.readyForDiscovery,
+            "rowCount": pdf_result.rowCount,
+            "selectedMethod": pdf_result.summary.get("selectedMethod"),
+            "issueCount": len(pdf_result.issues or []),
+            "outOfScopeApprovedRows": pdf_result.diagnostics.get("outOfScopeApprovedRows", 0),
+            "outOfScopeApprovedAssets": pdf_result.diagnostics.get("outOfScopeApprovedAssets", []),
+            "rowKeys": [
+                {
+                    "asset": row.get("asset"),
+                    "indication": row.get("indication"),
+                    "phase": row.get("phase"),
+                    "programStatus": row.get("programStatus"),
+                }
+                for row in (pdf_result.rows or [])[:30]
+            ],
+            "masterWrites": 0,
+        })
+    except Exception as exc:
+        results.append({
+            "company": "Ultragenyx Corporate Presentation",
+            "status": "SOURCE_OR_TRANSPORT_ERROR",
+            "errorType": type(exc).__name__,
+            "error": str(exc)[:500],
+            "masterWrites": 0,
+        })
 
     print(
         "GENERIC_ROUTE_GATE_CANARY "

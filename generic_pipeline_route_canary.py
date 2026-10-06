@@ -8,7 +8,7 @@ while browser escalation is reserved for sparse HTML or transport failure.
 import asyncio
 import json
 
-from generic_pipeline_extension import _extract_generic_pipeline
+from generic_pipeline_extension import _extract_generic_pipeline, _fetch_raw_public_html
 
 
 TARGETS = [
@@ -112,11 +112,30 @@ async def check(target):
     except Exception as exc:
         if target["must_pass"]:
             raise
+        direct_probe = None
+        if name == "Ultragenyx Pharmaceutical":
+            try:
+                raw_html, final_url = await _fetch_raw_public_html(
+                    target["url"],
+                    timeout_seconds=25.0,
+                )
+                direct_probe = {
+                    "status": "OK",
+                    "htmlChars": len(raw_html),
+                    "finalUrl": final_url,
+                }
+            except Exception as direct_exc:
+                direct_probe = {
+                    "status": "ERROR",
+                    "errorType": type(direct_exc).__name__,
+                    "error": str(direct_exc)[:300],
+                }
         return {
             "company": name,
             "status": "SOURCE_OR_TRANSPORT_ERROR",
             "errorType": type(exc).__name__,
             "error": str(exc)[:500],
+            "directProbe": direct_probe,
             "masterWrites": 0,
         }
 

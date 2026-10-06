@@ -10,6 +10,7 @@ import json
 
 from generic_pipeline_extension import _extract_generic_pipeline, _fetch_raw_public_html
 from generic_pdf_pipeline_extension import extract_generic_pdf
+from ctgov_portfolio_seed_extension import extract_ctgov_portfolio_seed
 
 
 TARGETS = [
@@ -189,6 +190,41 @@ async def main():
     except Exception as exc:
         results.append({
             "company": "Ultragenyx Corporate Presentation",
+            "status": "SOURCE_OR_TRANSPORT_ERROR",
+            "errorType": type(exc).__name__,
+            "error": str(exc)[:500],
+            "masterWrites": 0,
+        })
+
+    try:
+        ct_result = await extract_ctgov_portfolio_seed(
+            company="Ultragenyx Pharmaceutical",
+            source_url="https://clinicaltrials.gov/api/v2/studies?query.spons=Ultragenyx&pageSize=100",
+            timeout_seconds=30.0,
+        )
+        results.append({
+            "company": "Ultragenyx CT.gov Fallback",
+            "status": "RESPONSE",
+            "version": ct_result.version,
+            "readyForDiscovery": ct_result.readyForDiscovery,
+            "rowCount": ct_result.rowCount,
+            "issueCount": len(ct_result.issues or []),
+            "diagnostics": ct_result.diagnostics,
+            "rowKeys": [
+                {
+                    "asset": row.get("asset"),
+                    "indication": row.get("indication"),
+                    "phase": row.get("phase"),
+                    "programStatus": row.get("programStatus"),
+                    "trialIds": row.get("trialIds"),
+                }
+                for row in (ct_result.rows or [])[:40]
+            ],
+            "masterWrites": 0,
+        })
+    except Exception as exc:
+        results.append({
+            "company": "Ultragenyx CT.gov Fallback",
             "status": "SOURCE_OR_TRANSPORT_ERROR",
             "errorType": type(exc).__name__,
             "error": str(exc)[:500],

@@ -33,7 +33,7 @@ from pydantic import BaseModel
 from main import _auth, app
 
 
-VERSION = "CTGOV_PORTFOLIO_SEED_V1.0_READ_ONLY"
+VERSION = "CTGOV_PORTFOLIO_SEED_V1.1_ACTIVE_PROGRAMMES_READ_ONLY"
 MAX_PAGES = 5
 PAGE_SIZE_LIMIT = 100
 
@@ -48,6 +48,22 @@ CONTROL_TERMS = re.compile(
     r"\b(placebo|sham|control|standard of care|standard-of-care|soc only|vehicle)\b",
     re.I,
 )
+
+GENERIC_SUPPORTIVE_TERMS = re.compile(
+    r"\b("
+    r"adjuvant therapy|prophylactic therapy|supportive therapy|"
+    r"im therapy|blocker|antipyretic|premedication|"
+    r"cornstarch|dietary therapy|saline|vehicle"
+    r")\b",
+    re.I,
+)
+
+ACTIVE_STATUSES = {
+    "RECRUITING",
+    "NOT_YET_RECRUITING",
+    "ACTIVE_NOT_RECRUITING",
+    "ENROLLING_BY_INVITATION",
+}
 
 CORPORATE_SUFFIXES = {
     "inc", "incorporated", "corp", "corporation", "company", "co",
@@ -189,6 +205,8 @@ def intervention_is_experimental(
 
     name = clean(intervention.get("name"))
     if not name or CONTROL_TERMS.search(name):
+        return False
+    if GENERIC_SUPPORTIVE_TERMS.search(name):
         return False
 
     variants = [name, *(intervention.get("otherNames") or [])]
@@ -342,7 +360,15 @@ def normalize_studies(
             no_experimental_asset += 1
             continue
 
-        study_status = friendly_status(status.get("overallStatus"))
+        raw_status = clean(status.get("overallStatus")).upper()
+        if raw_status not in ACTIVE_STATUSES:
+            continue
+        study_status = friendly_status(raw_status)
+
+        # Registry condition arrays frequently contain disease synonyms.
+        # Use the first registry condition as the conservative seed identity
+        # and preserve the remaining terms as source evidence.
+        primary_condition = conditions[0]
 
         for intervention in interventions:
             asset = clean(intervention.get("name"))
@@ -350,7 +376,7 @@ def normalize_studies(
                 clean(x) for x in (intervention.get("otherNames") or [])
                 if clean(x)
             ]
-            for indication in conditions:
+            for indication in [primary_condition]:
                 study_rows += 1
                 key = norm(asset) + "|" + norm(indication)
                 existing = grouped.get(key)
@@ -374,7 +400,16 @@ def normalize_studies(
                     "therapeuticArea": "",
                     "modality": clean(intervention.get("type")).title(),
                     "description": clean(intervention.get("description")),
-                    "additionalInformation": "; ".join(other_names),
+                    "additionalInformation": "; ".join(
+                        [
+                            *other_names,
+                            (
+                                "Registry condition aliases: " + " | ".join(conditions[1:])
+                                if len(conditions) > 1
+                                else ""
+                            ),
+                        ]
+                    ).strip("; "),
                     "strategicPhase1": False,
                     "importantLabelExpansion": False,
                     "marketedStrategicRx": False,
@@ -414,6 +449,8 @@ def normalize_studies(
         "sponsorRejectedStudies": sponsor_rejected,
         "studiesWithoutPhase": no_phase,
         "studiesWithoutExperimentalAsset": no_experimental_asset,
+        "activeStatusesOnly": True,
+        "primaryConditionSeed": True,
     }
 
 

@@ -18,6 +18,16 @@ TARGETS = [
         "must_pass": True,
     },
     {
+        "name": "Ipsen",
+        "url": "https://www.ipsen.com/science/pipeline/",
+        "must_pass": True,
+    },
+    {
+        "name": "Jazz Pharmaceuticals",
+        "url": "https://www.jazzpharma.com/science/pipeline",
+        "must_pass": True,
+    },
+    {
         "name": "Chiesi",
         "url": "https://www.chiesi.com/en/science-and-innovation/pipeline",
         "must_pass": False,

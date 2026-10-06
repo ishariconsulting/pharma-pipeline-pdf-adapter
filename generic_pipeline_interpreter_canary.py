@@ -179,6 +179,16 @@ HEADER_ALIASES = {
         "partners",
         "collaboration",
     ),
+    "sourceFormulation": (
+        "formulation",
+        "dosage form",
+    ),
+    "sourceRegion": (
+        "region",
+        "geography",
+        "market",
+        "markets",
+    ),
 }
 
 
@@ -333,6 +343,8 @@ class DiscoveryRow:
     study: str = ""
     trialIds: List[str] = None
     therapeuticArea: str = ""
+    sourceFormulation: str = ""
+    sourceRegion: str = ""
     sourceOrdinal: int = 0
     parserMethod: str = ""
 
@@ -572,6 +584,8 @@ def extract_rows_from_tables(
             brand = value_at(raw_row, header_map, "brand")
             ta = value_at(raw_row, header_map, "therapeuticArea") or current_ta
             partner_text = value_at(raw_row, header_map, "partners")
+            source_formulation = value_at(raw_row, header_map, "sourceFormulation")
+            source_region = value_at(raw_row, header_map, "sourceRegion")
 
             out.append(
                 DiscoveryRow(
@@ -591,6 +605,8 @@ def extract_rows_from_tables(
                     study=study,
                     trialIds=trial_ids(study),
                     therapeuticArea=ta,
+                    sourceFormulation=source_formulation,
+                    sourceRegion=source_region,
                     sourceOrdinal=ordinal,
                     parserMethod="SEMANTIC_TABLE",
                 )
@@ -823,6 +839,8 @@ def dedupe_rows(rows: Sequence[DiscoveryRow]) -> List[DiscoveryRow]:
             norm(row.indication),
             norm(row.phase),
             norm(row.study),
+            norm(row.sourceFormulation),
+            norm(row.sourceRegion),
         )
         if not key[0] or not key[2] or not key[3]:
             continue

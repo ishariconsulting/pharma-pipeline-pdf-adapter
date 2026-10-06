@@ -23,6 +23,7 @@ import ionis_json_pipeline_extension  # noqa: E402,F401
 import amgen_json_pipeline_extension  # noqa: E402,F401
 import abbvie_pdf_pipeline_extension  # noqa: E402,F401
 import generic_json_pipeline_extension  # noqa: E402,F401
+import ctgov_portfolio_seed_extension  # noqa: E402,F401
 import menarini_graphql_pipeline_extension  # noqa: E402,F401
 import drupal_views_pipeline_extension  # noqa: E402,F401
 

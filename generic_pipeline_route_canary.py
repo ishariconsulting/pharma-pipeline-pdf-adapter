@@ -90,6 +90,8 @@ async def check(target):
                     "asset": row.get("asset"),
                     "indication": row.get("indication"),
                     "phase": row.get("phase"),
+                    "sourceFormulation": row.get("sourceFormulation"),
+                    "sourceRegion": row.get("sourceRegion"),
                 }
                 for row in (result.rows or [])[:30]
             ],

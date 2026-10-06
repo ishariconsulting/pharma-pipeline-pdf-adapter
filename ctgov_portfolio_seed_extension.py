@@ -33,7 +33,7 @@ from pydantic import BaseModel
 from main import _auth, app
 
 
-VERSION = "CTGOV_PORTFOLIO_SEED_V1.1_ACTIVE_PROGRAMMES_READ_ONLY"
+VERSION = "CTGOV_PORTFOLIO_SEED_V1.2_PRIMARY_INTERVENTION_READ_ONLY"
 MAX_PAGES = 5
 PAGE_SIZE_LIMIT = 100
 
@@ -360,6 +360,46 @@ def normalize_studies(
             no_experimental_asset += 1
             continue
 
+        # A trial may list adjunctive medications inside an experimental arm.
+        # Prefer interventions whose name or verified alternate name appears
+        # in the study title. If there is no title hit, prefer development-code
+        # identities. Only fall back to a single remaining intervention when
+        # the source itself is unambiguous.
+        title_norm = norm(title)
+        title_hits = []
+        for intervention in interventions:
+            variants = [
+                clean(intervention.get("name")),
+                *(clean(x) for x in (intervention.get("otherNames") or [])),
+            ]
+            variant_norms = [norm(v) for v in variants if norm(v)]
+            if any(v and v in title_norm for v in variant_norms):
+                title_hits.append(intervention)
+
+        if title_hits:
+            interventions = title_hits
+        else:
+            coded = [
+                intervention
+                for intervention in interventions
+                if re.search(
+                    r"\b[A-Z]{2,}[A-Z0-9-]*\d+[A-Z0-9-]*\b",
+                    clean(intervention.get("name")),
+                )
+                or any(
+                    re.search(
+                        r"\b[A-Z]{2,}[A-Z0-9-]*\d+[A-Z0-9-]*\b",
+                        clean(alias),
+                    )
+                    for alias in (intervention.get("otherNames") or [])
+                )
+            ]
+            if coded:
+                interventions = coded
+            elif len(interventions) != 1:
+                no_experimental_asset += 1
+                continue
+
         raw_status = clean(status.get("overallStatus")).upper()
         if raw_status not in ACTIVE_STATUSES:
             continue
@@ -451,6 +491,7 @@ def normalize_studies(
         "studiesWithoutExperimentalAsset": no_experimental_asset,
         "activeStatusesOnly": True,
         "primaryConditionSeed": True,
+        "primaryInterventionSeed": True,
     }
 
 

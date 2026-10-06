@@ -85,6 +85,14 @@ async def check(target):
             "visibleLineCount": diagnostics.get("visibleLineCount"),
             "selectedMethod": diagnostics.get("selectedMethod"),
             "issueCount": len(result.issues or []),
+            "rowKeys": [
+                {
+                    "asset": row.get("asset"),
+                    "indication": row.get("indication"),
+                    "phase": row.get("phase"),
+                }
+                for row in (result.rows or [])[:30]
+            ],
             "masterWrites": 0,
         }
     except RuntimeError:

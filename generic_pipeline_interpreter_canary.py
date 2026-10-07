@@ -31,6 +31,7 @@ The output contract is deliberately aligned to PORTFOLIO_DISCOVERY_V1.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 import sys
@@ -43,7 +44,7 @@ from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 import httpx
 
 
-VERSION = "GENERIC_PIPELINE_INTERPRETER_V1.2_SECTIONED_CARD_FALLBACK_READ_ONLY"
+VERSION = "GENERIC_PIPELINE_INTERPRETER_V1.3_DURABLE_SOURCE_KEYS_READ_ONLY"
 
 SOURCES = [
     {
@@ -804,6 +805,122 @@ def extract_rows_from_labelled_flow(
     return out
 
 
+def _compact_study_identifier(value: Any) -> str:
+    """Return only compact source-backed study/program identifiers.
+
+    Arbitrary prose is not promoted into identity. NCT IDs are handled
+    separately because they are stronger source-native identifiers.
+    """
+    raw = clean(value)
+    if not raw or len(raw) > 120 or len(raw.split()) > 12:
+        return ""
+    normalized = norm(raw)
+    if not normalized:
+        return ""
+    if re.fullmatch(r"nct\s*\d{8}", normalized):
+        return ""
+    if not re.search(r"\d", raw):
+        return ""
+    return normalized
+
+
+_GENERIC_SCOPE_ONLY_IDENTITIES = {
+    "liver",
+    "muscle",
+    "oncology",
+    "immunology",
+    "hematology",
+    "haematology",
+    "neuroscience",
+    "rare disease",
+    "rare diseases",
+    "pipeline",
+    "program",
+    "programme",
+    "asset",
+}
+
+
+def _canonical_asset_identity(row: DiscoveryRow) -> str:
+    """Build a conservative asset identity that ignores decorative suffixes."""
+    development = norm(row.developmentCode)
+    if development:
+        return development
+
+    raw = clean(row.molecule) or clean(row.asset) or clean(row.brand)
+    if not raw:
+        return ""
+
+    parenthetical = re.match(r"^(.+?)\s*\(([^()]*)\)\s*$", raw)
+    if parenthetical:
+        outer = clean(parenthetical.group(1))
+        inner = clean(parenthetical.group(2))
+        inner_norm = norm(inner)
+        if (
+            "formerly" in inner_norm
+            or re.search(r"\banti\b", inner_norm)
+            or re.search(r"[a-z].*\d|\d.*[a-z]", inner_norm)
+        ):
+            raw = outer
+
+    return norm(raw)
+
+
+def durable_source_record_id(row: DiscoveryRow) -> str:
+    """Return a durable, order-independent source row identifier.
+
+    Precedence:
+    1. exactly one NCT ID;
+    2. compact named study/program identifier + semantic programme identity;
+    3. semantic asset + indication identity.
+
+    Phase, parser method and row ordinal are intentionally excluded.
+    Ambiguous or structurally generic identities fail closed.
+    """
+    ids = uniq(
+        clean(x).upper()
+        for x in (row.trialIds or [])
+        if re.fullmatch(r"NCT\d{8}", clean(x).upper())
+    )
+    if len(ids) == 1:
+        return f"nct:{ids[0]}"
+    if len(ids) > 1:
+        raise ValueError(
+            "DURABLE_SOURCE_KEY_CONTRACT_FAILED multiple NCT IDs "
+            + ",".join(ids)
+        )
+
+    asset_identity = _canonical_asset_identity(row)
+    indication_identity = norm(row.indication)
+    if (
+        not asset_identity
+        or asset_identity in _GENERIC_SCOPE_ONLY_IDENTITIES
+        or not indication_identity
+    ):
+        raise ValueError(
+            "DURABLE_SOURCE_KEY_CONTRACT_FAILED insufficient programme identity "
+            f"asset={clean(row.asset)!r} indication={clean(row.indication)!r}"
+        )
+
+    study_identity = _compact_study_identifier(row.study)
+    if study_identity:
+        payload = (
+            "study|"
+            + study_identity
+            + "|"
+            + asset_identity
+            + "|"
+            + indication_identity
+        )
+        prefix = "study"
+    else:
+        payload = "semantic|" + asset_identity + "|" + indication_identity
+        prefix = "semantic"
+
+    digest = hashlib.sha256(payload.encode("utf-8")).hexdigest()[:20]
+    return f"{prefix}:v1:{digest}"
+
+
 def dedupe_rows(rows: Sequence[DiscoveryRow]) -> List[DiscoveryRow]:
     out: List[DiscoveryRow] = []
     seen = set()
@@ -823,12 +940,143 @@ def dedupe_rows(rows: Sequence[DiscoveryRow]) -> List[DiscoveryRow]:
         seen.add(key)
         out.append(row)
 
+    by_durable_key: Dict[str, List[DiscoveryRow]] = {}
     for idx, row in enumerate(out, start=1):
         row.sourceOrdinal = idx
-        row.sourceRecordId = f"{row.parserMethod.lower()}:{idx}"
+        row.sourceRecordId = durable_source_record_id(row)
+        by_durable_key.setdefault(row.sourceRecordId, []).append(row)
+
+    collisions = {
+        key: values
+        for key, values in by_durable_key.items()
+        if len(values) > 1
+    }
+    if collisions:
+        summary = []
+        for key, values in sorted(collisions.items()):
+            summary.append(
+                {
+                    "sourceRecordId": key,
+                    "rows": [
+                        {
+                            "asset": clean(x.asset),
+                            "indication": clean(x.indication),
+                            "phase": clean(x.phase),
+                            "study": clean(x.study),
+                        }
+                        for x in values
+                    ],
+                }
+            )
+        raise ValueError(
+            "DURABLE_SOURCE_KEY_CONTRACT_FAILED semantic collision "
+            + json.dumps(summary, ensure_ascii=False)[:4000]
+        )
 
     return out
 
+
+def _self_test_durable_source_keys() -> Dict[str, Any]:
+    def row(
+        asset: str,
+        indication: str,
+        phase: str = "Phase 2",
+        study: str = "",
+        trial_ids_value: Optional[List[str]] = None,
+        molecule: str = "",
+        development_code: str = "",
+    ) -> DiscoveryRow:
+        return DiscoveryRow(
+            company="Example Pharma",
+            sourceFamily="Company Pipeline",
+            sourceRecordId="legacy:1",
+            sourceUrl="https://example.test/pipeline",
+            asset=asset,
+            molecule=molecule,
+            developmentCode=development_code,
+            indication=indication,
+            phase=phase,
+            study=study,
+            trialIds=trial_ids_value or [],
+            parserMethod="TEST",
+        )
+
+    base = row("TREVOGRUMAB", "Obesity", "Phase 2")
+    decorated = row("TREVOGRUMAB (REGN1033)", "Obesity", "Phase 3")
+    different_indication = row("TREVOGRUMAB", "Other disease", "Phase 2")
+    nct = row(
+        "Example asset",
+        "Example disease",
+        "Phase 1",
+        trial_ids_value=["NCT12345678"],
+    )
+    study = row(
+        "Example asset",
+        "Example disease",
+        "Phase 1",
+        study="ASCENT-04",
+    )
+
+    reorder_a = dedupe_rows(
+        [
+            row("ALPHA", "Disease A", "Phase 2"),
+            row("BETA", "Disease B", "Phase 3"),
+        ]
+    )
+    reorder_b = dedupe_rows(
+        [
+            row("BETA", "Disease B", "Phase 3"),
+            row("ALPHA", "Disease A", "Phase 2"),
+        ]
+    )
+
+    generic_scope_rejected = False
+    try:
+        durable_source_record_id(
+            row("Liver", "Hepatitis B", "Phase 2")
+        )
+    except ValueError:
+        generic_scope_rejected = True
+
+    checks = {
+        "phase_change_key_stable": (
+            durable_source_record_id(base)
+            == durable_source_record_id(
+                row("TREVOGRUMAB", "Obesity", "Phase 3")
+            )
+        ),
+        "parenthetical_code_key_stable": (
+            durable_source_record_id(base)
+            == durable_source_record_id(decorated)
+        ),
+        "different_indication_separates_key": (
+            durable_source_record_id(base)
+            != durable_source_record_id(different_indication)
+        ),
+        "single_nct_precedence": (
+            durable_source_record_id(nct) == "nct:NCT12345678"
+        ),
+        "study_identifier_strategy": (
+            durable_source_record_id(study).startswith("study:v1:")
+        ),
+        "row_reorder_key_stable": (
+            {x.sourceRecordId for x in reorder_a}
+            == {x.sourceRecordId for x in reorder_b}
+        ),
+        "generic_scope_identity_rejected": generic_scope_rejected,
+    }
+    return {
+        "ok": all(checks.values()),
+        "checks": checks,
+    }
+
+
+DURABLE_SOURCE_KEY_SELF_TEST = _self_test_durable_source_keys()
+if not DURABLE_SOURCE_KEY_SELF_TEST["ok"]:
+    raise RuntimeError(
+        "Durable source key self-test failed: "
+        + json.dumps(DURABLE_SOURCE_KEY_SELF_TEST, sort_keys=True)
+    )
 
 
 LAYOUT_STOP_TERMS = {
@@ -1693,6 +1941,7 @@ def run() -> Dict[str, Any]:
         "airtableWrites": 0,
         "renderConfigWrites": 0,
         "masterDataWrites": 0,
+        "durableSourceKeySelfTest": DURABLE_SOURCE_KEY_SELF_TEST,
         "sources": source_results,
     }
 

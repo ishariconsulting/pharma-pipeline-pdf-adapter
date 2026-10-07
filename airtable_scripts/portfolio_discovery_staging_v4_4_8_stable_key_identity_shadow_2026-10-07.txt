@@ -235,9 +235,14 @@ if (norm(selectName(sw, swf.bindingStatus)) !== "validated") {
     throw new Error("Adapter Binding Status is not Validated.");
 }
 const baselineStatusBefore = norm(selectName(sw, swf.baselineStatus));
-if (!["", "not established", "needs review"].includes(baselineStatusBefore)) {
+const allowedBaselineStatuses = APPLY_STAGING_WRITES
+    ? ["", "not established", "needs review"]
+    : ["", "not established", "needs review", "established"];
+if (!allowedBaselineStatuses.includes(baselineStatusBefore)) {
     throw new Error(
-        "Pipeline Baseline Status must be blank, Not Established, or Needs Review."
+        APPLY_STAGING_WRITES
+            ? "Pipeline Baseline Status must be blank, Not Established, or Needs Review."
+            : "Read-only canary requires Pipeline Baseline Status to be blank, Not Established, Needs Review, or Established."
     );
 }
 

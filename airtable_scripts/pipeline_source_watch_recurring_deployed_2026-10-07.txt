@@ -26,7 +26,7 @@ Important
 - Absence from one pipeline refresh is never an automatic discontinuation.
 - Phase matching is not allowed to override asset/programme identity.
 */
-const VERSION = "V2.61.2 REGISTRY-CONTRACT RECURRING PIPELINE DELTA ENGINE - IDENTITY-OVERLAP REVIEW + CONTROLLED QUEUE WRITES";
+const VERSION = "V2.61.3 REGISTRY-CONTRACT RECURRING PIPELINE DELTA ENGINE - ROW-LEVEL RECONCILIATION HOLDS + CONTROLLED QUEUE WRITES";
 const cfg = input.config();
 const sourceWatchRecordId = String(cfg.sourceWatchRecordId || "").trim();
 try {
@@ -550,8 +550,11 @@ const adapterProfileField = adaptersTable.getField("Adapter Profile");
 const adapterStatusField = adaptersTable.getField("Adapter Status");
 const adapterHandlerField = adaptersTable.getField("Endpoint / Handler");
 const adapterRetrievalModesField = adaptersTable.getField("Supported Retrieval Modes");
+const adapterRowGranularityField = adaptersTable.getField("Row Granularity Contract");
 const adapterProfile = clean(adapterRecord.getCellValueAsString(adapterProfileField));
 const adapterStatus = norm(adapterRecord.getCellValueAsString(adapterStatusField));
+const rowGranularityContract =
+    clean(adapterRecord.getCellValueAsString(adapterRowGranularityField)) || "UNKNOWN";
 const adapterHandlerRaw = clean(adapterRecord.getCellValueAsString(adapterHandlerField));
 const adapterHandlerPath = adapterHandlerRaw.replace(/^pharma-pipeline-pdf-adapter:/i, "");
 if (adapterStatus !== "validated") {
@@ -890,6 +893,8 @@ const portfolioSplitRequired = [];
    ------------------------------------------------------------ */
 const assignedSource = new Set();
 const assignedExisting = new Set();
+const heldSourceIndexes = new Set();
+const heldExistingIds = new Set();
 const confirmed = [];
 const stageConflictReview = [];
 const eligiblePairs = allPairs
@@ -1062,12 +1067,20 @@ for (let i = 0; i < sourceRows.length; i++) {
             !bestIdentity.qual.lineConflict &&
             !bestIdentity.qual.keyConflict &&
             (!bestIdentity.variant.required || bestIdentity.variant.exact);
+        const implicatedExistingRecordIds = unique([
+            bestIdentity.record.id,
+            ...identityCandidates
+                .filter(p => hasStrongIdentity(p))
+                .map(p => p.record.id)
+        ]);
         const overlap = {
+            sourceIndex: i,
             asset: row.asset,
             developmentCode: row.developmentCode || "",
             programmeIndication: row.indication,
             phase: row.phase || row.sourceStage || "",
             existingRecordId: bestIdentity.record.id,
+            implicatedExistingRecordIds,
             existingAsset: cellText(bestIdentity.record, f.brand),
             existingIndication: cellText(bestIdentity.record, f.indication),
             existingPhase: selectText(bestIdentity.record, f.phase),
@@ -1083,6 +1096,10 @@ for (let i = 0; i < sourceRows.length; i++) {
                 ...overlap
             });
         } else {
+            heldSourceIndexes.add(i);
+            for (const recordId of implicatedExistingRecordIds) {
+                heldExistingIds.add(recordId);
+            }
             sourceRowGrainReviews.push({
                 reviewType: "EXISTING ASSET / PROGRAMME GRAIN REVIEW",
                 ...overlap,
@@ -1098,6 +1115,7 @@ for (let i = 0; i < sourceRows.length; i++) {
     }
     const diagnostic = bestIdentity || bestGeneric;
     distinctProgrammeCandidates.push({
+        sourceIndex: i,
         classification,
         reason,
         external: {
@@ -1172,6 +1190,10 @@ for (const existing of existingDevelopment) {
         })
         .slice(0,5);
     if (!candidatesForExisting.length) continue;
+    heldExistingIds.add(existing.id);
+    for (const p of candidatesForExisting) {
+        heldSourceIndexes.add(p.sourceIndex);
+    }
     aliasReviewCandidates.push({
         existing: {
             recordId: existing.id,
@@ -1187,6 +1209,7 @@ for (const existing of existingDevelopment) {
         reviewReason:
             "Similar indication/stage without direct drug identity is NOT evidence of an alias or rename. Confirm molecule and development codes from authoritative sources; never merge or add aliases based on clinical similarity alone.",
         possibleOfficialRows: candidatesForExisting.map(p => ({
+            sourceIndex: p.sourceIndex,
             asset: p.sourceRow.asset,
             developmentCode: p.sourceRow.developmentCode,
             indication: p.sourceRow.indication,
@@ -1202,7 +1225,11 @@ for (const existing of existingDevelopment) {
    8) Existing current-development rows not represented
    ------------------------------------------------------------ */
 const unmatchedExisting = existingDevelopment
-    .filter(r => !assignedExisting.has(r.id) && !splitExistingIds.has(r.id))
+    .filter(r =>
+        !assignedExisting.has(r.id) &&
+        !heldExistingIds.has(r.id) &&
+        !splitExistingIds.has(r.id)
+    )
     .map(r => ({
         recordId: r.id,
         brandAsset: cellText(r, f.brand),
@@ -1309,7 +1336,8 @@ const laterStagePreserved = stageConflictReview.map(x => ({
     airtablePhase: x.existing.phase,
     decision: x.decision
 }));
-const newProgrammes = distinctProgrammeCandidates.map(x => ({
+const newProgrammeCandidates = distinctProgrammeCandidates.map(x => ({
+    sourceIndex: x.sourceIndex,
     classification: "NEW PROGRAMME",
     subtype: x.classification,
     asset: x.external.asset,
@@ -1322,6 +1350,12 @@ const newProgrammes = distinctProgrammeCandidates.map(x => ({
     identityContext: x.bestIdentityCandidate || null,
     reason: x.reason
 }));
+const newProgrammes = newProgrammeCandidates.filter(
+    x => !heldSourceIndexes.has(x.sourceIndex)
+);
+const heldNewProgrammeCandidates = newProgrammeCandidates.filter(
+    x => heldSourceIndexes.has(x.sourceIndex)
+);
 const sourceDisappearances = unmatchedExisting.map(x => ({
     classification: "SOURCE DISAPPEARANCE",
     ...x,
@@ -1347,18 +1381,42 @@ const materialDeltaCount =
 const matchedCoverage =
     confirmed.length +
     stageConflictReview.length;
-const queueWriteReady =
+const existingDevelopmentIds = new Set(existingDevelopment.map(r => r.id));
+const accountedSourceIndexes = new Set([
+    ...assignedSource,
+    ...approvedSourceMatches.map(x => x.sourceIndex),
+    ...heldSourceIndexes,
+    ...newProgrammes.map(x => x.sourceIndex)
+]);
+const accountedExistingIds = new Set([
+    ...[...assignedExisting].filter(id => existingDevelopmentIds.has(id)),
+    ...[...heldExistingIds].filter(id => existingDevelopmentIds.has(id)),
+    ...sourceDisappearances
+        .map(x => x.recordId)
+        .filter(id => existingDevelopmentIds.has(id)),
+    ...[...splitExistingIds].filter(id => existingDevelopmentIds.has(id))
+]);
+const sourceCoverageBalanced =
+    accountedSourceIndexes.size === sourceRows.length;
+const existingCoverageBalanced =
+    accountedExistingIds.size === existingDevelopment.length;
+const sourceIntegrityReady =
     guardrail &&
-    matchReview.length === 0 &&
-    matchedCoverage + approvedSourceMatches.length +
-        sourceRowGrainReviews.length + newProgrammes.length === sourceRows.length &&
-    matchedCoverage + sourceDisappearances.length === existingDevelopment.length;
+    sourceCoverageBalanced &&
+    existingCoverageBalanced;
+const reconciliationStatus =
+    !sourceIntegrityReady
+        ? "BLOCK"
+        : matchReview.length > 0
+            ? "PASS WITH ROW HOLDS"
+            : "PASS";
+const queueWriteReady = sourceIntegrityReady;
 const sourceVariantCollisions =
     Array.isArray(externalDiagnostics.variantCollisions)
         ? externalDiagnostics.variantCollisions
         : [];
 const cleanSnapshot =
-    queueWriteReady &&
+    reconciliationStatus === "PASS" &&
     materialDeltaCount === 0;
 output.set("genericDeltaSummary", JSON.stringify({
     version: VERSION,
@@ -1368,6 +1426,7 @@ output.set("genericDeltaSummary", JSON.stringify({
     adapterProfile,
     adapterHandlerPath,
     retrievalMode,
+    rowGranularityContract,
     sourceGuardrailPass: guardrail,
     adapterVersion: external.version || "",
     adapterProductionStatus: externalSummary.productionStatus || "",
@@ -1386,20 +1445,32 @@ output.set("genericDeltaSummary", JSON.stringify({
     noChange: noChange.length,
     phaseChanges: phaseChanges.length,
     programmeChanges: programmeChanges.length,
+    newProgrammeCandidates: newProgrammeCandidates.length,
     newProgrammes: newProgrammes.length,
+    heldNewProgrammeCandidates: heldNewProgrammeCandidates.length,
     sourceDisappearances: sourceDisappearances.length,
     matchReviewRequired: matchReview.length,
+    heldSourceRows: heldSourceIndexes.size,
+    heldExistingProgrammes:
+        [...heldExistingIds].filter(id => existingDevelopmentIds.has(id)).length,
+    sourceCoverageBalanced,
+    existingCoverageBalanced,
+    reconciliationStatus,
     sourceVariantCollisionCount: sourceVariantCollisions.length,
     materialDeltaCount,
     queueWriteReady,
     cleanSnapshot,
     writesApplied: false,
     status:
-        !queueWriteReady
-            ? "HOLD - identity/coverage review required"
-            : materialDeltaCount > 0
-                ? "DELTA DETECTED - ready for generic queue router"
-                : `CLEAN SNAPSHOT - no material ${companyName} pipeline delta detected`,
+        reconciliationStatus === "BLOCK"
+            ? "BLOCK - source/reconciliation integrity not established"
+            : reconciliationStatus === "PASS WITH ROW HOLDS"
+                ? materialDeltaCount > 0
+                    ? "PASS WITH ROW HOLDS - safe deltas ready for generic queue router"
+                    : "PASS WITH ROW HOLDS - held rows require review; no safe material deltas"
+                : materialDeltaCount > 0
+                    ? "DELTA DETECTED - ready for generic queue router"
+                    : `CLEAN SNAPSHOT - no material ${companyName} pipeline delta detected`,
     safeguards: [
         "The reconciliation layer makes no Portfolio master-data writes; only controlled queue routing and Source Watch metadata refresh are allowed.",
         "Historical source counts are informational only; structural adapter validation is the production guardrail.",
@@ -1429,8 +1500,7 @@ output.set("sourceVariantCollisions", JSON.stringify(sourceVariantCollisions, nu
    - Refresh Source Watch only after a structurally valid, reconciliation-ready run.
    - Deduplicate repeat detections by stable Update ID.
    ------------------------------------------------------------ */
-const ROUTER_VERSION =
-    "V2.61.0 SOURCE-WATCH-DRIVEN REGISTRY-CONTRACT PIPELINE MONITOR + DYNAMIC ADAPTER ROUTING + QUEUE ROUTER";
+const ROUTER_VERSION = VERSION;
 function tableField(table, name) {
     try { return table.getField(name); } catch (_) { return null; }
 }
@@ -1666,17 +1736,26 @@ const allMaterialDeltas = [
 ];
 if (!queueWriteReady) {
     const diagnostic = {
-        version: ROUTER_VERSION,
+        version: VERSION,
         company: companyName,
         guardrail,
+        rowGranularityContract,
         sourceRows: sourceRows.length,
         existingDevelopmentRows: existingDevelopment.length,
         matchedCoverage,
         matchedApprovedSourceRows: approvedSourceMatches.length,
         sourceRowGrainReviewCount: sourceRowGrainReviews.length,
-        newProgrammes: newProgrammes.length,
+        newProgrammeCandidates: newProgrammeCandidates.length,
+        safeNewProgrammes: newProgrammes.length,
+        heldNewProgrammeCandidates: heldNewProgrammeCandidates.length,
         sourceDisappearances: sourceDisappearances.length,
         matchReviewCount: matchReview.length,
+        heldSourceRows: heldSourceIndexes.size,
+        heldExistingProgrammes:
+            [...heldExistingIds].filter(id => existingDevelopmentIds.has(id)).length,
+        sourceCoverageBalanced,
+        existingCoverageBalanced,
+        reconciliationStatus,
         matchReview: matchReview.slice(0, 5),
         queueWriteReady: false
     };
@@ -1687,7 +1766,7 @@ if (!queueWriteReady) {
     );
 
     throw new Error(
-        "V2.61.1 reconciliation hold: " +
+        `${VERSION} reconciliation block: ` +
         JSON.stringify(diagnostic)
     );
 }
@@ -1764,9 +1843,12 @@ const sourceWatchFields = {
     [swf.confidence.id]: {name: "High"},
     [swf.stateNotes.id]:
         `${ROUTER_VERSION}: ${sourceRows.length} official ${companyName} programmes parsed via ${adapterProfile}; ` +
-        `${noChange.length} unchanged, ${laterStagePreserved.length} later-stage preserved, ` +
-        `${phaseChanges.length} phase changes, ${programmeChanges.length} programme changes, ` +
-        `${newProgrammes.length} new programmes, ${sourceDisappearances.length} source disappearances. ` +
+        `reconciliation=${reconciliationStatus}; rowGranularity=${rowGranularityContract}; ` +
+        `${matchReview.length} row hold(s); ${noChange.length} unchanged, ` +
+        `${laterStagePreserved.length} later-stage preserved, ${phaseChanges.length} phase changes, ` +
+        `${programmeChanges.length} programme changes, ${newProgrammes.length} safe new programmes, ` +
+        `${heldNewProgrammeCandidates.length} held new-programme candidate(s), ` +
+        `${sourceDisappearances.length} source disappearances. ` +
         `${createdQueueIds.length} new queue item(s) created; ` +
         `${dedupedExisting.length} already queued delta(s) suppressed.`
 };
@@ -1785,15 +1867,25 @@ output.set("genericQueueRouterSummary", JSON.stringify({
     adapterProfile,
     adapterHandlerPath,
     retrievalMode,
+    rowGranularityContract,
     sourceWatchRecordId: sourceWatchRecord.id,
     sourceWatchName,
+    reconciliationStatus,
+    sourceCoverageBalanced,
+    existingCoverageBalanced,
+    rowHoldCount: matchReview.length,
+    heldSourceRows: heldSourceIndexes.size,
+    heldExistingProgrammes:
+        [...heldExistingIds].filter(id => existingDevelopmentIds.has(id)).length,
     queueWriteReady: true,
     writesApplied: true,
     sourceWatchRecordId: sourceWatchRecord.id,
     sourceWatchLastChecked: detectedDate,
     sourceWatchNextCheck: nextCheck,
     materialDeltasDetected: allMaterialDeltas.length,
+    newProgrammeCandidatesDetected: newProgrammeCandidates.length,
     newProgrammesDetected: newProgrammes.length,
+    heldNewProgrammeCandidates: heldNewProgrammeCandidates.length,
     phaseChangesDetected: phaseChanges.length,
     programmeChangesDetected: programmeChanges.length,
     sourceDisappearancesDetected: sourceDisappearances.length,
@@ -1801,11 +1893,17 @@ output.set("genericQueueRouterSummary", JSON.stringify({
     duplicateQueueItemsSuppressed: dedupedExisting.length,
     createdQueueRecordIds: createdQueueIds,
     status:
-        allMaterialDeltas.length === 0
-            ? `CLEAN RUN - ${companyName} Source Watch refreshed; no queue items required`
-            : createdQueueIds.length > 0
-                ? "MATERIAL DELTAS ROUTED TO INTELLIGENCE UPDATE QUEUE"
-                : "MATERIAL DELTAS ALREADY QUEUED - no duplicate queue records created",
+        reconciliationStatus === "PASS WITH ROW HOLDS"
+            ? allMaterialDeltas.length === 0
+                ? `PASS WITH ROW HOLDS - ${companyName} Source Watch refreshed; held rows require review`
+                : createdQueueIds.length > 0
+                    ? "PASS WITH ROW HOLDS - SAFE DELTAS ROUTED TO INTELLIGENCE UPDATE QUEUE"
+                    : "PASS WITH ROW HOLDS - SAFE DELTAS ALREADY QUEUED; held rows require review"
+            : allMaterialDeltas.length === 0
+                ? `CLEAN RUN - ${companyName} Source Watch refreshed; no queue items required`
+                : createdQueueIds.length > 0
+                    ? "MATERIAL DELTAS ROUTED TO INTELLIGENCE UPDATE QUEUE"
+                    : "MATERIAL DELTAS ALREADY QUEUED - no duplicate queue records created",
     masterDataWrites: 0,
     principle:
         "Pipeline deltas are detected automatically; Portfolio master changes remain controlled through Intelligence Update Queue review."

@@ -2115,6 +2115,7 @@ const holdLedgerAddressabilityReady =
     holdLedgerCompanyScopeConflicts.length === 0 &&
     holdLedgerCandidateIdConflicts.length === 0 &&
     holdLedgerStateConflicts.length === 0 &&
+    holdLedgerUpdatePlan.length === 0 &&
     holdLedgerMappings.length === heldSourceIndexes.size;
 
 const holdLedgerUpsertPlanReady =

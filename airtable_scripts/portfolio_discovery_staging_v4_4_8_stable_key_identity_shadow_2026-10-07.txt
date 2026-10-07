@@ -2386,3 +2386,15 @@ output.set(
         )
     );
 }
+
+
+output.set(
+    "canonicalPreview",
+    JSON.stringify({
+        version: VERSION,
+        mode: "READ_ONLY_STABLE_KEY_IDENTITY_SHADOW",
+        stagingWritesEnabled: APPLY_STAGING_WRITES,
+        actualRecordWrites: 0,
+        productionInstalled: false
+    }, null, 2)
+);

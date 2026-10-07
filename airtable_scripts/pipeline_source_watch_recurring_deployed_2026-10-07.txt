@@ -30,6 +30,11 @@ const VERSION = "V2.61.3 REGISTRY-CONTRACT RECURRING PIPELINE DELTA ENGINE - ROW
 const cfg = input.config();
 const sourceWatchRecordId = String(cfg.sourceWatchRecordId || "").trim();
 const CANARY_READ_ONLY = true;
+// Candidate-ledger execution is deliberately disabled by default.
+// Turning this true is the ONLY switch required for the controlled Candidate-only write.
+// Portfolio, Intelligence Update Queue and Source Watch writes remain separately disabled.
+const APPLY_CANDIDATE_HOLD_LEDGER_WRITES = false;
+const ALLOW_NON_CANDIDATE_AIRTABLE_WRITES = false;
 try {
     const ADAPTER_BASE_URL = "https://pharma-pipeline-pdf-adapter.onrender.com";
 if (!sourceWatchRecordId) {
@@ -1518,7 +1523,14 @@ function proposedHoldNextAction(holdTypes) {
     }
     return "V2.61.3_HOLD_ALIAS_IDENTITY | Confirm molecule/development-code/brand identity from authoritative evidence. Do not infer an alias from indication/phase similarity, and do not send this held row to Intelligence Update Queue or Portfolio promotion until identity is resolved.";
 }
-function holdEvidenceString(stableKey, action, mapping, holdTypes) {
+function holdEvidenceString(
+    stableKey,
+    action,
+    mapping,
+    holdTypes,
+    candidateLedgerWriteMode = "PREVIEW_ONLY",
+    executionId = ""
+) {
     const parts = [
         "V2.61.3_HOLD_LEDGER",
         "sourceKey=" + stableKey,
@@ -1530,7 +1542,12 @@ function holdEvidenceString(stableKey, action, mapping, holdTypes) {
         parts.push("secondaryHold=" + holdTypes.slice(1).join("+"));
     }
     parts.push(
-        "canaryReadOnly=true",
+        "candidateLedgerWriteMode=" + candidateLedgerWriteMode
+    );
+    if (executionId) {
+        parts.push("candidateLedgerExecutionId=" + executionId);
+    }
+    parts.push(
         "queueEligible=false",
         "portfolioWriteEligible=false"
     );
@@ -2188,9 +2205,10 @@ const candidateWritePreflight = {
     companyRecordId: targetCompany.id,
     sourceWatchRecordId: sourceWatchRecord.id,
     sourceWatchName,
-    executionApproved: false,
-    executableWriteCallsPresent: false,
+    executionApproved: APPLY_CANDIDATE_HOLD_LEDGER_WRITES,
+    executableWriteCallsPresent: true,
     canaryReadOnly: CANARY_READ_ONLY,
+    nonCandidateWritesAllowed: ALLOW_NON_CANDIDATE_AIRTABLE_WRITES,
     preflightReady: candidateWritePreflightReady,
     counts: {
         heldSourceRows: heldSourceIndexes.size,
@@ -2210,12 +2228,13 @@ const candidateWritePreflight = {
         creates: candidateCreateWritePreflight
     },
     executionContract: [
-        "No Candidate mutation is performed by this script.",
+        "Candidate mutation code exists but APPLY_CANDIDATE_HOLD_LEDGER_WRITES is false by default.",
         "UPDATE payloads touch reconciliation-state fields only; discovery identity/history fields are not rewritten.",
         "CREATE payloads use the shared comparator-derived Discovery Candidate ID and Discovery Classification.",
         "CREATE Existing Portfolio Match remains blank while the row is held.",
-        "Any future writer must re-run the same duplicate, scope, closed-status, comparator and overlap checks immediately before writes.",
-        "Portfolio, Intelligence Update Queue and Source Watch freshness writes remain out of scope."
+        "The writer re-reads Candidate state and re-runs duplicate, scope, closed-status, comparator and overlap checks immediately before writes.",
+        "Execution evidence uses candidateLedgerWriteMode=CONTROLLED_APPLY; preview evidence uses PREVIEW_ONLY.",
+        "Portfolio, Intelligence Update Queue and Source Watch writes are separately hard-disabled by ALLOW_NON_CANDIDATE_AIRTABLE_WRITES=false."
     ]
 };
 output.set(
@@ -2347,6 +2366,671 @@ output.set("holdLedgerMappings", JSON.stringify({
 }, null, 2));
 output.set("noChangeSample", JSON.stringify([...noChange, ...approvedSourceMatches].slice(0, 20), null, 2));
 output.set("sourceVariantCollisions", JSON.stringify(sourceVariantCollisions, null, 2));
+
+/* ------------------------------------------------------------
+   9d) Controlled Candidate hold-ledger writer
+   ------------------------------------------------------------
+   Execution remains disabled unless APPLY_CANDIDATE_HOLD_LEDGER_WRITES
+   is explicitly changed to true. Even when enabled, this block writes ONLY
+   Portfolio Discovery Candidates. It then returns before any queue/source-
+   watch router can run. Non-Candidate writes have a separate hard-off gate.
+   ------------------------------------------------------------ */
+function sortedUniqueIds(values) {
+    return [...new Set((values || []).filter(Boolean))].sort();
+}
+function sameIdSet(a, b) {
+    return JSON.stringify(sortedUniqueIds(a)) ===
+        JSON.stringify(sortedUniqueIds(b));
+}
+function descriptorForStableKey(stableKey) {
+    return heldDescriptors.find(
+        x => x.stableSourceRecordKey === stableKey
+    ) || null;
+}
+function mappingForStableKey(stableKey) {
+    return holdLedgerMappings.find(
+        x => x.stableSourceRecordKey === stableKey
+    ) || null;
+}
+function executionEvidenceForOperation(operation, executionId) {
+    const descriptor = descriptorForStableKey(
+        operation.stableSourceRecordKey
+    );
+    if (!descriptor) {
+        throw new Error(
+            "CANDIDATE_WRITE_DESCRIPTOR_MISSING stableKey=" +
+            operation.stableSourceRecordKey
+        );
+    }
+    return holdEvidenceString(
+        operation.stableSourceRecordKey,
+        operation.action,
+        operation.action === "UPDATE"
+            ? "EXACT_ONE"
+            : "EXACT_ZERO_CREATE",
+        descriptor.holdTypes,
+        "CONTROLLED_APPLY",
+        executionId
+    );
+}
+async function rerunCreateComparatorForExecution() {
+    if (holdLedgerCreatePlan.length === 0) return [];
+    const plannedByKey = new Map(
+        holdLedgerCreatePlan.map(x => [
+            x.stableSourceRecordKey,
+            x
+        ])
+    );
+    const descriptors = holdLedgerCreatePlan.map(plan => {
+        const descriptor = descriptorForStableKey(
+            plan.stableSourceRecordKey
+        );
+        if (!descriptor) {
+            throw new Error(
+                "CANDIDATE_WRITE_CREATE_DESCRIPTOR_MISSING stableKey=" +
+                plan.stableSourceRecordKey
+            );
+        }
+        return descriptor;
+    });
+    const rows = descriptors.map(comparatorSourceRowForHold);
+    const conflicts = [];
+    for (let offset = 0; offset < rows.length; offset += 24) {
+        const part = rows.slice(offset, offset + 24);
+        const response = await postJson(
+            "/compare/portfolio-discovery",
+            {
+                company: companyName,
+                sourceRows: part,
+                portfolioRows: comparatorPortfolioRows,
+                companyAliases,
+                batchRunId:
+                    "HOLD_LEDGER_EXECUTION_RECHECK|" +
+                    sourceWatchRecordId +
+                    "|" +
+                    new Date().toISOString()
+            }
+        );
+        if (
+            !response ||
+            response.readOnly !== true ||
+            !Array.isArray(response.candidates) ||
+            response.candidates.length !== part.length ||
+            Number(response.sourceRowCount) !== part.length ||
+            !response.version
+        ) {
+            conflicts.push({
+                reason: "COMPARATOR_EXECUTION_CONTRACT_FAILED",
+                offset
+            });
+            continue;
+        }
+        for (let i = 0; i < response.candidates.length; i++) {
+            const candidate = response.candidates[i] || {};
+            const stableKey = clean(candidate.sourceRecordId);
+            const plan = plannedByKey.get(stableKey);
+            if (!plan) {
+                conflicts.push({
+                    stableSourceRecordKey: stableKey,
+                    reason:
+                        "COMPARATOR_EXECUTION_RETURNED_UNKNOWN_SOURCE_KEY"
+                });
+                continue;
+            }
+            const suggestedIds = Array.isArray(
+                candidate.existingPortfolioRecordIds
+            )
+                ? candidate.existingPortfolioRecordIds.filter(
+                    id => /^rec[A-Za-z0-9]{14}$/.test(id)
+                )
+                : [];
+            if (
+                response.version !== plan.comparatorVersion ||
+                clean(candidate.discoveryCandidateId) !==
+                    clean(
+                        plan.proposedFields[
+                            "Discovery Candidate ID"
+                        ]
+                    ) ||
+                clean(candidate.classification) !==
+                    clean(
+                        plan.proposedFields[
+                            "Discovery Classification"
+                        ]
+                    ) ||
+                !sameIdSet(
+                    suggestedIds,
+                    plan.comparatorSuggestedExistingPortfolioRecordIds
+                )
+            ) {
+                conflicts.push({
+                    stableSourceRecordKey: stableKey,
+                    reason: "COMPARATOR_EXECUTION_DRIFT",
+                    plannedComparatorVersion: plan.comparatorVersion,
+                    currentComparatorVersion: response.version,
+                    plannedDiscoveryCandidateId:
+                        plan.proposedFields[
+                            "Discovery Candidate ID"
+                        ],
+                    currentDiscoveryCandidateId:
+                        clean(candidate.discoveryCandidateId),
+                    plannedClassification:
+                        plan.proposedFields[
+                            "Discovery Classification"
+                        ],
+                    currentClassification:
+                        clean(candidate.classification),
+                    plannedSuggestedExistingPortfolioRecordIds:
+                        sortedUniqueIds(
+                            plan
+                                .comparatorSuggestedExistingPortfolioRecordIds
+                        ),
+                    currentSuggestedExistingPortfolioRecordIds:
+                        sortedUniqueIds(suggestedIds)
+                });
+            }
+        }
+    }
+    return conflicts;
+}
+async function executeCandidateHoldLedgerWrites() {
+    if (!APPLY_CANDIDATE_HOLD_LEDGER_WRITES) {
+        return {
+            mode: "DISABLED",
+            candidateWritesExecuted: 0
+        };
+    }
+    if (!CANARY_READ_ONLY) {
+        throw new Error(
+            "CANDIDATE_WRITE_REQUIRES_CANARY_READ_ONLY_TRUE"
+        );
+    }
+    if (ALLOW_NON_CANDIDATE_AIRTABLE_WRITES) {
+        throw new Error(
+            "CANDIDATE_WRITE_REQUIRES_NON_CANDIDATE_WRITES_DISABLED"
+        );
+    }
+    if (
+        !candidateWritePreflightReady ||
+        !holdLedgerUpsertPlanReady ||
+        holdAssignmentOverlap.length !== 0 ||
+        heldExistingDisappearanceOverlap.length !== 0
+    ) {
+        throw new Error(
+            "CANDIDATE_WRITE_PREFLIGHT_NOT_READY"
+        );
+    }
+
+    // Immediate race-condition check against live Candidate state.
+    const freshQuery = await candidateTable.selectRecordsAsync({
+        fields: Object.values(hcf)
+    });
+    const freshByRecordId = new Map(
+        freshQuery.records.map(record => [record.id, record])
+    );
+    const freshByDiscoveryId = new Map();
+    const freshSourceByStableKey = new Map();
+    for (const record of freshQuery.records) {
+        const discoveryId = clean(
+            record.getCellValueAsString(hcf.id)
+        );
+        if (discoveryId) {
+            if (!freshByDiscoveryId.has(discoveryId)) {
+                freshByDiscoveryId.set(discoveryId, []);
+            }
+            freshByDiscoveryId.get(discoveryId).push(record);
+        }
+        const watchIds = linkedIds(record, hcf.sourceWatch);
+        if (!watchIds.includes(sourceWatchRecordId)) continue;
+        const stableKey = clean(
+            record.getCellValueAsString(hcf.sourceRecord)
+        );
+        if (!stableKey) continue;
+        if (!freshSourceByStableKey.has(stableKey)) {
+            freshSourceByStableKey.set(stableKey, []);
+        }
+        freshSourceByStableKey.get(stableKey).push(record);
+    }
+
+    const liveConflicts = [];
+    for (const plan of holdLedgerUpdatePlan) {
+        const record = freshByRecordId.get(
+            plan.candidateRecordId
+        );
+        const mapping = mappingForStableKey(
+            plan.stableSourceRecordKey
+        );
+        if (!record || !mapping) {
+            liveConflicts.push({
+                action: "UPDATE",
+                stableSourceRecordKey:
+                    plan.stableSourceRecordKey,
+                candidateRecordId: plan.candidateRecordId,
+                reason: !record
+                    ? "UPDATE_TARGET_MISSING"
+                    : "UPDATE_MAPPING_MISSING"
+            });
+            continue;
+        }
+        const stableMatches =
+            freshSourceByStableKey.get(
+                plan.stableSourceRecordKey
+            ) || [];
+        const discoveryId = clean(
+            record.getCellValueAsString(hcf.id)
+        );
+        const discoveryMatches =
+            freshByDiscoveryId.get(discoveryId) || [];
+        const currentReviewStatus = clean(
+            record.getCellValueAsString(hcf.reviewStatus)
+        );
+        const currentException = clean(
+            record.getCellValueAsString(hcf.exception)
+        );
+        const currentProgrammeGate = clean(
+            record.getCellValueAsString(hcf.programmeGate)
+        );
+        const currentClassification = clean(
+            record.getCellValueAsString(hcf.classification)
+        );
+        const currentExistingMatchIds =
+            linkedIds(record, hcf.existingMatch);
+        const retainedExistingMatchIds =
+            (plan.retainedFields[
+                "Existing Portfolio Match"
+            ] || []).map(x => x && x.id).filter(Boolean);
+        const identityDrift =
+            clean(
+                record.getCellValueAsString(hcf.sourceRecord)
+            ) !== plan.stableSourceRecordKey ||
+            clean(
+                record.getCellValueAsString(hcf.asset)
+            ) !==
+                clean(
+                    plan.retainedFields["Source Asset Name"]
+                ) ||
+            clean(
+                record.getCellValueAsString(hcf.indication)
+            ) !==
+                clean(
+                    plan.retainedFields[
+                        "Source Indication"
+                    ]
+                ) ||
+            clean(
+                record.getCellValueAsString(hcf.phase)
+            ) !==
+                clean(
+                    plan.retainedFields["Source Phase"]
+                ) ||
+            discoveryId !==
+                clean(
+                    plan.retainedFields[
+                        "Discovery Candidate ID"
+                    ]
+                ) ||
+            currentClassification !==
+                clean(
+                    plan.retainedFields[
+                        "Discovery Classification"
+                    ]
+                );
+        if (
+            stableMatches.length !== 1 ||
+            stableMatches[0].id !== record.id ||
+            discoveryMatches.length !== 1 ||
+            linkedIds(record, hcf.company).length !== 1 ||
+            linkedIds(record, hcf.company)[0] !==
+                targetCompany.id ||
+            linkedIds(record, hcf.sourceWatch).length !== 1 ||
+            linkedIds(record, hcf.sourceWatch)[0] !==
+                sourceWatchRecordId ||
+            CLOSED_CANDIDATE_STATUSES.has(
+                currentReviewStatus
+            ) ||
+            currentReviewStatus !==
+                mapping.currentReviewStatus ||
+            currentException !== mapping.currentException ||
+            currentProgrammeGate !==
+                mapping.currentProgrammeGate ||
+            !sameIdSet(
+                currentExistingMatchIds,
+                retainedExistingMatchIds
+            ) ||
+            identityDrift
+        ) {
+            liveConflicts.push({
+                action: "UPDATE",
+                stableSourceRecordKey:
+                    plan.stableSourceRecordKey,
+                candidateRecordId: plan.candidateRecordId,
+                reason: "UPDATE_LIVE_STATE_DRIFT",
+                currentReviewStatus,
+                expectedReviewStatus:
+                    mapping.currentReviewStatus,
+                currentException,
+                expectedException: mapping.currentException,
+                currentProgrammeGate,
+                expectedProgrammeGate:
+                    mapping.currentProgrammeGate,
+                currentExistingMatchIds:
+                    sortedUniqueIds(
+                        currentExistingMatchIds
+                    ),
+                expectedExistingMatchIds:
+                    sortedUniqueIds(
+                        retainedExistingMatchIds
+                    ),
+                identityDrift
+            });
+        }
+    }
+
+    for (const plan of holdLedgerCreatePlan) {
+        const stableMatches =
+            freshSourceByStableKey.get(
+                plan.stableSourceRecordKey
+            ) || [];
+        const discoveryId = clean(
+            plan.proposedFields[
+                "Discovery Candidate ID"
+            ]
+        );
+        const discoveryMatches =
+            freshByDiscoveryId.get(discoveryId) || [];
+        if (
+            stableMatches.length !== 0 ||
+            discoveryMatches.length !== 0
+        ) {
+            liveConflicts.push({
+                action: "CREATE",
+                stableSourceRecordKey:
+                    plan.stableSourceRecordKey,
+                discoveryCandidateId: discoveryId,
+                stableKeyRecordIds:
+                    stableMatches.map(x => x.id),
+                discoveryCandidateIdRecordIds:
+                    discoveryMatches.map(x => x.id),
+                reason: "CREATE_TARGET_NO_LONGER_EMPTY"
+            });
+        }
+    }
+
+    const comparatorExecutionConflicts =
+        await rerunCreateComparatorForExecution();
+    if (
+        liveConflicts.length > 0 ||
+        comparatorExecutionConflicts.length > 0
+    ) {
+        output.set(
+            "candidateWriteExecution",
+            JSON.stringify({
+                mode:
+                    "BLOCKED - LIVE PREWRITE RECHECK FAILED",
+                version: VERSION,
+                company: companyName,
+                sourceWatchRecordId,
+                liveConflicts,
+                comparatorExecutionConflicts,
+                candidateWritesExecuted: 0,
+                queueWritesExecuted: 0,
+                sourceWatchWritesExecuted: 0,
+                portfolioWritesExecuted: 0,
+                masterDataWritesExecuted: 0
+            }, null, 2)
+        );
+        throw new Error(
+            "CANDIDATE_WRITE_LIVE_RECHECK_FAILED"
+        );
+    }
+
+    const executionId =
+        "CANDIDATE_HOLD_LEDGER|" +
+        sourceWatchRecordId +
+        "|" +
+        new Date().toISOString();
+
+    const updatePayloads =
+        candidateUpdateWritePreflight.map(operation => ({
+            id: operation.candidateRecordId,
+            fields: {
+                ...operation.fields,
+                "Latest Staging Evidence":
+                    executionEvidenceForOperation(
+                        operation,
+                        executionId
+                    )
+            }
+        }));
+    const createPayloads =
+        candidateCreateWritePreflight.map(operation => ({
+            fields: {
+                ...operation.fields,
+                "Latest Staging Evidence":
+                    executionEvidenceForOperation(
+                        operation,
+                        executionId
+                    )
+            }
+        }));
+
+    let updatedCount = 0;
+    for (
+        let offset = 0;
+        offset < updatePayloads.length;
+        offset += 50
+    ) {
+        const batch = updatePayloads.slice(
+            offset,
+            offset + 50
+        );
+        if (batch.length > 0) {
+            await candidateTable.updateRecordsAsync(batch);
+            updatedCount += batch.length;
+        }
+    }
+
+    const createdRecordIds = [];
+    for (
+        let offset = 0;
+        offset < createPayloads.length;
+        offset += 50
+    ) {
+        const batch = createPayloads.slice(
+            offset,
+            offset + 50
+        );
+        if (batch.length > 0) {
+            const ids =
+                await candidateTable.createRecordsAsync(
+                    batch
+                );
+            if (Array.isArray(ids)) {
+                createdRecordIds.push(...ids);
+            }
+        }
+    }
+
+    // Verify the Candidate ledger only. No other table is written.
+    const verifyQuery =
+        await candidateTable.selectRecordsAsync({
+            fields: Object.values(hcf)
+        });
+    const verifyById = new Map(
+        verifyQuery.records.map(record => [
+            record.id,
+            record
+        ])
+    );
+    const verifyBySourceKey = new Map();
+    for (const record of verifyQuery.records) {
+        const watchIds = linkedIds(
+            record,
+            hcf.sourceWatch
+        );
+        if (!watchIds.includes(sourceWatchRecordId)) {
+            continue;
+        }
+        const stableKey = clean(
+            record.getCellValueAsString(hcf.sourceRecord)
+        );
+        if (!stableKey) continue;
+        if (!verifyBySourceKey.has(stableKey)) {
+            verifyBySourceKey.set(stableKey, []);
+        }
+        verifyBySourceKey.get(stableKey).push(record);
+    }
+    const verificationFailures = [];
+    for (const operation of candidateUpdateWritePreflight) {
+        const record = verifyById.get(
+            operation.candidateRecordId
+        );
+        const evidence = record
+            ? clean(
+                record.getCellValueAsString(
+                    hcf.latestStagingEvidence
+                )
+            )
+            : "";
+        if (
+            !record ||
+            clean(
+                record.getCellValueAsString(
+                    hcf.reviewStatus
+                )
+            ) !== "Needs Review" ||
+            clean(
+                record.getCellValueAsString(
+                    hcf.programmeGate
+                )
+            ) !==
+                "Evidence Captured – Scope Unresolved" ||
+            !evidence.includes(
+                "candidateLedgerWriteMode=CONTROLLED_APPLY"
+            ) ||
+            !evidence.includes(
+                "candidateLedgerExecutionId=" +
+                executionId
+            )
+        ) {
+            verificationFailures.push({
+                action: "UPDATE",
+                stableSourceRecordKey:
+                    operation.stableSourceRecordKey,
+                candidateRecordId:
+                    operation.candidateRecordId
+            });
+        }
+    }
+    for (const operation of candidateCreateWritePreflight) {
+        const matches =
+            verifyBySourceKey.get(
+                operation.stableSourceRecordKey
+            ) || [];
+        if (matches.length !== 1) {
+            verificationFailures.push({
+                action: "CREATE",
+                stableSourceRecordKey:
+                    operation.stableSourceRecordKey,
+                recordIds: matches.map(x => x.id)
+            });
+            continue;
+        }
+        const record = matches[0];
+        const evidence = clean(
+            record.getCellValueAsString(
+                hcf.latestStagingEvidence
+            )
+        );
+        if (
+            clean(
+                record.getCellValueAsString(hcf.id)
+            ) !==
+                clean(
+                    operation.fields[
+                        "Discovery Candidate ID"
+                    ]
+                ) ||
+            linkedIds(
+                record,
+                hcf.existingMatch
+            ).length !== 0 ||
+            clean(
+                record.getCellValueAsString(
+                    hcf.programmeGate
+                )
+            ) !==
+                "Evidence Captured – Scope Unresolved" ||
+            !evidence.includes(
+                "candidateLedgerWriteMode=CONTROLLED_APPLY"
+            ) ||
+            !evidence.includes(
+                "candidateLedgerExecutionId=" +
+                executionId
+            )
+        ) {
+            verificationFailures.push({
+                action: "CREATE",
+                stableSourceRecordKey:
+                    operation.stableSourceRecordKey,
+                candidateRecordId: record.id
+            });
+        }
+    }
+    if (verificationFailures.length > 0) {
+        output.set(
+            "candidateWriteExecution",
+            JSON.stringify({
+                mode:
+                    "WRITE APPLIED - POSTWRITE VERIFICATION FAILED",
+                version: VERSION,
+                company: companyName,
+                sourceWatchRecordId,
+                executionId,
+                updatedCount,
+                createdRecordIds,
+                verificationFailures,
+                queueWritesExecuted: 0,
+                sourceWatchWritesExecuted: 0,
+                portfolioWritesExecuted: 0,
+                masterDataWritesExecuted: 0
+            }, null, 2)
+        );
+        throw new Error(
+            "CANDIDATE_WRITE_POSTWRITE_VERIFICATION_FAILED"
+        );
+    }
+
+    return {
+        mode:
+            "CONTROLLED CANDIDATE HOLD-LEDGER WRITE APPLIED",
+        version: VERSION,
+        company: companyName,
+        companyRecordId: targetCompany.id,
+        sourceWatchRecordId,
+        sourceWatchName,
+        executionId,
+        updatedCount,
+        createdCount: createdRecordIds.length,
+        createdRecordIds,
+        candidateWritesExecuted:
+            updatedCount + createdRecordIds.length,
+        queueWritesExecuted: 0,
+        sourceWatchWritesExecuted: 0,
+        portfolioWritesExecuted: 0,
+        masterDataWritesExecuted: 0,
+        postWriteVerification: "PASS"
+    };
+}
+
+if (APPLY_CANDIDATE_HOLD_LEDGER_WRITES) {
+    const candidateWriteExecution = await executeCandidateHoldLedgerWrites();
+    output.set(
+        "candidateWriteExecution",
+        JSON.stringify(candidateWriteExecution, null, 2)
+    );
+    return;
+}
 if (CANARY_READ_ONLY) {
     output.set("genericQueueRouterSummary", JSON.stringify({
         version: VERSION,
@@ -2388,6 +3072,21 @@ if (CANARY_READ_ONLY) {
                 : reconciliationStatus === "PASS WITH ROW HOLDS"
                     ? "READ ONLY CANARY - PASS WITH ROW HOLDS"
                     : "READ ONLY CANARY - PASS"
+    }, null, 2));
+    return;
+}
+if (!ALLOW_NON_CANDIDATE_AIRTABLE_WRITES) {
+    output.set("genericQueueRouterSummary", JSON.stringify({
+        version: VERSION,
+        mode: "NON-CANDIDATE AIRTABLE WRITES HARD-DISABLED",
+        company: companyName,
+        sourceWatchRecordId: sourceWatchRecord.id,
+        candidateWriteFlag: APPLY_CANDIDATE_HOLD_LEDGER_WRITES,
+        candidateWrites: 0,
+        queueWrites: 0,
+        sourceWatchWrites: 0,
+        portfolioWrites: 0,
+        masterDataWrites: 0
     }, null, 2));
     return;
 }
@@ -2843,7 +3542,11 @@ output.set("genericQueueRouterSummary", JSON.stringify({
     output.set("genericQueueRouterSummary", JSON.stringify(__summary, null, 2));
     // Operational note is the only failed-source write; preserve prior successful evidence.
     // Do not write Last Checked, Next Check, confidence, Portfolio or Update Queue on error.
-    if (__sourceId && !CANARY_READ_ONLY) {
+    if (
+        __sourceId &&
+        !CANARY_READ_ONLY &&
+        ALLOW_NON_CANDIDATE_AIRTABLE_WRITES
+    ) {
         try {
             const __swTable = base.getTable("Source Watch");
             const __record = await __swTable.selectRecordAsync(__sourceId);

@@ -29,6 +29,7 @@ Important
 const VERSION = "V2.61.3 REGISTRY-CONTRACT RECURRING PIPELINE DELTA ENGINE - ROW-LEVEL RECONCILIATION HOLDS + CONTROLLED QUEUE WRITES";
 const cfg = input.config();
 const sourceWatchRecordId = String(cfg.sourceWatchRecordId || "").trim();
+const CANARY_READ_ONLY = true;
 try {
     const ADAPTER_BASE_URL = "https://pharma-pipeline-pdf-adapter.onrender.com";
 if (!sourceWatchRecordId) {
@@ -1639,6 +1640,50 @@ output.set("holdLedgerMappings", JSON.stringify({
 }, null, 2));
 output.set("noChangeSample", JSON.stringify([...noChange, ...approvedSourceMatches].slice(0, 20), null, 2));
 output.set("sourceVariantCollisions", JSON.stringify(sourceVariantCollisions, null, 2));
+if (CANARY_READ_ONLY) {
+    output.set("genericQueueRouterSummary", JSON.stringify({
+        version: VERSION,
+        mode: "READ ONLY CANARY - ZERO AIRTABLE WRITES",
+        company: companyName,
+        companyRecordId: targetCompany.id,
+        companySlug,
+        adapterProfile,
+        adapterHandlerPath,
+        retrievalMode,
+        rowGranularityContract,
+        sourceWatchRecordId: sourceWatchRecord.id,
+        sourceWatchName,
+        reconciliationStatus,
+        sourceCoverageBalanced,
+        existingCoverageBalanced,
+        matchReviewCount: matchReview.length,
+        heldSourceRows: heldSourceIndexes.size,
+        heldExistingProgrammes:
+            [...heldExistingIds].filter(id => existingDevelopmentIds.has(id)).length,
+        holdLedgerAddressabilityReady,
+        holdLedgerMapped: holdLedgerMappings.length,
+        holdLedgerMissing: holdLedgerMissing.length,
+        holdLedgerAmbiguous: holdLedgerAmbiguous.length,
+        holdLedgerClosedStatusConflicts: holdLedgerClosedStatusConflicts.length,
+        materialDeltasDetected: materialDeltaCount,
+        newProgrammeCandidates: newProgrammeCandidates.length,
+        safeNewProgrammes: newProgrammes.length,
+        heldNewProgrammeCandidates: heldNewProgrammeCandidates.length,
+        sourceDisappearances: sourceDisappearances.length,
+        queueWrites: 0,
+        sourceWatchWrites: 0,
+        candidateWrites: 0,
+        portfolioWrites: 0,
+        masterDataWrites: 0,
+        status:
+            reconciliationStatus === "BLOCK"
+                ? "READ ONLY CANARY - BLOCK"
+                : reconciliationStatus === "PASS WITH ROW HOLDS"
+                    ? "READ ONLY CANARY - PASS WITH ROW HOLDS"
+                    : "READ ONLY CANARY - PASS"
+    }, null, 2));
+    return;
+}
 /* ------------------------------------------------------------
    10) Generic Intelligence Update Queue router + Source Watch
    ------------------------------------------------------------
@@ -2091,7 +2136,7 @@ output.set("genericQueueRouterSummary", JSON.stringify({
     output.set("genericQueueRouterSummary", JSON.stringify(__summary, null, 2));
     // Operational note is the only failed-source write; preserve prior successful evidence.
     // Do not write Last Checked, Next Check, confidence, Portfolio or Update Queue on error.
-    if (__sourceId) {
+    if (__sourceId && !CANARY_READ_ONLY) {
         try {
             const __swTable = base.getTable("Source Watch");
             const __record = await __swTable.selectRecordAsync(__sourceId);
@@ -2110,6 +2155,10 @@ output.set("genericQueueRouterSummary", JSON.stringify({
             __summary.operationalNoteWritten = false;
             __summary.noteError = String(__noteError?.message || __noteError).slice(0, 200);
         }
+        output.set("genericQueueRouterSummary", JSON.stringify(__summary, null, 2));
+    } else if (CANARY_READ_ONLY) {
+        __summary.readOnlyCanary = true;
+        __summary.operationalNoteWritten = false;
         output.set("genericQueueRouterSummary", JSON.stringify(__summary, null, 2));
     }
 }

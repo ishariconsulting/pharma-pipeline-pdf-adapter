@@ -21,6 +21,7 @@ adapterApiKey = existing Airtable secret
 */
 
 const VERSION = "PORTFOLIO_DISCOVERY_STAGING_V4.4.8_STABLE_KEY_IDENTITY_CONTRACT_SHADOW";
+const APPLY_STAGING_WRITES = false; // Step 2 shadow safety: no Candidate or Source Watch writes
 const ADAPTER_BASE_URL = "https://pharma-pipeline-pdf-adapter.onrender.com";
 
 const cfg = input.config();
@@ -2089,31 +2090,33 @@ for (const c of stageCandidates) {
 
 const createdIds = [];
 
-for (
-    let i = 0;
-    i < creates.length;
-    i += 50
-) {
-    const ids =
-        await candidateTable
-            .createRecordsAsync(
-                creates.slice(i, i + 50)
-            );
+if (APPLY_STAGING_WRITES) {
+    for (
+        let i = 0;
+        i < creates.length;
+        i += 50
+    ) {
+        const ids =
+            await candidateTable
+                .createRecordsAsync(
+                    creates.slice(i, i + 50)
+                );
 
-    if (Array.isArray(ids)) {
-        createdIds.push(...ids);
+        if (Array.isArray(ids)) {
+            createdIds.push(...ids);
+        }
     }
-}
 
-for (
-    let i = 0;
-    i < updates.length;
-    i += 50
-) {
-    await candidateTable
-        .updateRecordsAsync(
-            updates.slice(i, i + 50)
-        );
+    for (
+        let i = 0;
+        i < updates.length;
+        i += 50
+    ) {
+        await candidateTable
+            .updateRecordsAsync(
+                updates.slice(i, i + 50)
+            );
+    }
 }
 
 /*
@@ -2188,7 +2191,10 @@ if (stagingStateNotesField) {
         ).slice(-10000);
 }
 
-if (Object.keys(sourceWatchSuccessFields).length > 0) {
+if (
+    APPLY_STAGING_WRITES &&
+    Object.keys(sourceWatchSuccessFields).length > 0
+) {
     await sourceWatchTable.updateRecordAsync(
         sw.id,
         sourceWatchSuccessFields
@@ -2233,10 +2239,16 @@ output.set(
                 semanticReviewBySourceRecordId.size,
             programmeSemanticHoldCount,
             programmeSemanticHoldReasons,
-            created:
+            plannedCreates:
                 creates.length,
-            updated:
+            plannedUpdates:
                 updates.length,
+            created:
+                APPLY_STAGING_WRITES ? creates.length : 0,
+            updated:
+                APPLY_STAGING_WRITES ? updates.length : 0,
+            stagingWritesEnabled:
+                APPLY_STAGING_WRITES,
             createdRecordIds:
                 createdIds,
             masterWrites: 0,
@@ -2339,13 +2351,15 @@ output.set(
                     (retained ? retained + "\n" : "") +
                     diagnostic;
 
-                await sourceWatchTable.updateRecordAsync(
-                    failureSw.id,
-                    {
-                        [stagingStateNotesField.id]:
-                            nextNotes.slice(-10000)
-                    }
-                );
+                if (APPLY_STAGING_WRITES) {
+                    await sourceWatchTable.updateRecordAsync(
+                        failureSw.id,
+                        {
+                            [stagingStateNotesField.id]:
+                                nextNotes.slice(-10000)
+                        }
+                    );
+                }
             }
         } catch (_) {
             // Observability failure must never convert a safe source skip

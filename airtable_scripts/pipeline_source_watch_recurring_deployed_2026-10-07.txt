@@ -52,6 +52,7 @@ const sourceWatchTable = base.getTable("Source Watch");
 const adaptersTable = base.getTable("Adapter Registry");
 const portfolioTable = base.getTable("Portfolio");
 const updateQueueTable = base.getTable("Intelligence Update Queue");
+const candidateTable = base.getTable("Portfolio Discovery Candidates");
 function txt(v) {
     return v === null || v === undefined ? "" : String(v);
 }
@@ -638,6 +639,17 @@ if (specialisedNoQueryHandlers.has(adapterHandlerPath)) {
    ------------------------------------------------------------ */
 const external = await getJson(adapterRequestPath);
 const sourceRows = Array.isArray(external.rows) ? external.rows : [];
+function stableSourceRecordKey(row, index) {
+    return clean(
+        (row && (
+            row.sourceRecordId ||
+            row.sourceCardOrdinal ||
+            row.recordId ||
+            row.sourceRow
+        )) ||
+        String(index + 1)
+    );
+}
 const counts = {"Phase 1":0,"Phase 2":0,"Phase 3":0,"Filed / Registration":0,"Approved":0};
 for (const r of sourceRows) if (counts[r.phase] !== undefined) counts[r.phase]++;
 const externalSummary = external.summary || {};
@@ -1382,6 +1394,127 @@ const matchedCoverage =
     confirmed.length +
     stageConflictReview.length;
 const existingDevelopmentIds = new Set(existingDevelopment.map(r => r.id));
+
+/* ------------------------------------------------------------
+   9b) Durable row-hold ledger addressability (READ ONLY)
+   ------------------------------------------------------------
+   Portfolio Discovery Candidates is the existing programme-level review ledger.
+   This block does not create or update candidates. It only proves that every
+   held source row can be mapped to exactly one existing candidate using the
+   same stable source-record identity contract used by the shared discovery worker.
+   ------------------------------------------------------------ */
+const hcf = {
+    id: candidateTable.getField("Discovery Candidate ID"),
+    sourceWatch: candidateTable.getField("Source Watch"),
+    sourceRecord: candidateTable.getField("Source Record ID / Key"),
+    reviewStatus: candidateTable.getField("Review Status"),
+    existingMatch: candidateTable.getField("Existing Portfolio Match"),
+    exception: candidateTable.getField("Reconciliation Exception Type"),
+    programmeGate: candidateTable.getField("Programme Reconciliation Gate")
+};
+const holdCandidateQuery = await candidateTable.selectRecordsAsync({
+    fields: Object.values(hcf)
+});
+const currentSourceCandidatesByStableKey = new Map();
+for (const candidate of holdCandidateQuery.records) {
+    const watchLinks = candidate.getCellValue(hcf.sourceWatch) || [];
+    if (
+        !Array.isArray(watchLinks) ||
+        !watchLinks.some(x => x && x.id === sourceWatchRecordId)
+    ) continue;
+    const key = clean(candidate.getCellValueAsString(hcf.sourceRecord));
+    if (!key) continue;
+    if (!currentSourceCandidatesByStableKey.has(key)) {
+        currentSourceCandidatesByStableKey.set(key, []);
+    }
+    currentSourceCandidatesByStableKey.get(key).push(candidate);
+}
+const CLOSED_CANDIDATE_STATUSES = new Set([
+    "Resolved",
+    "Superseded",
+    "Reviewed - Exclude"
+]);
+const holdLedgerMappings = [];
+const holdLedgerMissing = [];
+const holdLedgerAmbiguous = [];
+const holdLedgerClosedStatusConflicts = [];
+for (const sourceIndex of heldSourceIndexes) {
+    const sourceRow = sourceRows[sourceIndex] || {};
+    const stableKey = stableSourceRecordKey(sourceRow, sourceIndex);
+    const candidates = currentSourceCandidatesByStableKey.get(stableKey) || [];
+    const holdTypes = [];
+    if (sourceRowGrainReviews.some(x => x.sourceIndex === sourceIndex)) {
+        holdTypes.push("PROGRAMME_GRAIN");
+    }
+    if (aliasReviewCandidates.some(x =>
+        (x.possibleOfficialRows || []).some(y => y.sourceIndex === sourceIndex)
+    )) {
+        holdTypes.push("ALIAS_IDENTITY");
+    }
+    const proposedException =
+        holdTypes.includes("PROGRAMME_GRAIN")
+            ? "Multi-Programme / Basket Ambiguity"
+            : "Insufficient Identity Evidence";
+    if (candidates.length === 0) {
+        holdLedgerMissing.push({
+            sourceIndex,
+            stableSourceRecordKey: stableKey,
+            asset: clean(sourceRow.asset),
+            indication: clean(sourceRow.indication),
+            holdTypes
+        });
+        continue;
+    }
+    if (candidates.length !== 1) {
+        holdLedgerAmbiguous.push({
+            sourceIndex,
+            stableSourceRecordKey: stableKey,
+            candidateRecordIds: candidates.map(x => x.id),
+            holdTypes
+        });
+        continue;
+    }
+    const candidate = candidates[0];
+    const currentReviewStatus = clean(
+        candidate.getCellValueAsString(hcf.reviewStatus)
+    );
+    const currentException = clean(
+        candidate.getCellValueAsString(hcf.exception)
+    );
+    const currentProgrammeGate = clean(
+        candidate.getCellValueAsString(hcf.programmeGate)
+    );
+    const existingPortfolioMatchIds = (
+        candidate.getCellValue(hcf.existingMatch) || []
+    ).map(x => x && x.id).filter(Boolean);
+    const mapped = {
+        sourceIndex,
+        stableSourceRecordKey: stableKey,
+        candidateRecordId: candidate.id,
+        discoveryCandidateId: clean(candidate.getCellValueAsString(hcf.id)),
+        asset: clean(sourceRow.asset),
+        indication: clean(sourceRow.indication),
+        holdTypes,
+        currentReviewStatus,
+        currentException,
+        currentProgrammeGate,
+        existingPortfolioMatchIds,
+        proposedReviewStatus: "Needs Review",
+        proposedException,
+        proposedProgrammeGate: "Evidence Captured – Scope Unresolved",
+        proposedWriteAction: "UPDATE EXISTING CANDIDATE ONLY - NOT APPLIED"
+    };
+    holdLedgerMappings.push(mapped);
+    if (CLOSED_CANDIDATE_STATUSES.has(currentReviewStatus)) {
+        holdLedgerClosedStatusConflicts.push(mapped);
+    }
+}
+const holdLedgerAddressabilityReady =
+    holdLedgerMissing.length === 0 &&
+    holdLedgerAmbiguous.length === 0 &&
+    holdLedgerClosedStatusConflicts.length === 0 &&
+    holdLedgerMappings.length === heldSourceIndexes.size;
+
 const accountedSourceIndexes = new Set([
     ...assignedSource,
     ...approvedSourceMatches.map(x => x.sourceIndex),
@@ -1403,7 +1536,11 @@ const existingCoverageBalanced =
 const sourceIntegrityReady =
     guardrail &&
     sourceCoverageBalanced &&
-    existingCoverageBalanced;
+    existingCoverageBalanced &&
+    (
+        heldSourceIndexes.size === 0 ||
+        holdLedgerAddressabilityReady
+    );
 const reconciliationStatus =
     !sourceIntegrityReady
         ? "BLOCK"
@@ -1453,6 +1590,11 @@ output.set("genericDeltaSummary", JSON.stringify({
     heldSourceRows: heldSourceIndexes.size,
     heldExistingProgrammes:
         [...heldExistingIds].filter(id => existingDevelopmentIds.has(id)).length,
+    holdLedgerAddressabilityReady,
+    holdLedgerMapped: holdLedgerMappings.length,
+    holdLedgerMissing: holdLedgerMissing.length,
+    holdLedgerAmbiguous: holdLedgerAmbiguous.length,
+    holdLedgerClosedStatusConflicts: holdLedgerClosedStatusConflicts.length,
     sourceCoverageBalanced,
     existingCoverageBalanced,
     reconciliationStatus,
@@ -1487,6 +1629,14 @@ output.set("programmeChanges", JSON.stringify(programmeChanges, null, 2));
 output.set("sourceDisappearances", JSON.stringify(sourceDisappearances, null, 2));
 output.set("laterStagePreserved", JSON.stringify(laterStagePreserved, null, 2));
 output.set("matchReview", JSON.stringify(matchReview, null, 2));
+output.set("holdLedgerMappings", JSON.stringify({
+    mode: "READ ONLY - ZERO CANDIDATE WRITES",
+    addressabilityReady: holdLedgerAddressabilityReady,
+    mapped: holdLedgerMappings,
+    missing: holdLedgerMissing,
+    ambiguous: holdLedgerAmbiguous,
+    closedStatusConflicts: holdLedgerClosedStatusConflicts
+}, null, 2));
 output.set("noChangeSample", JSON.stringify([...noChange, ...approvedSourceMatches].slice(0, 20), null, 2));
 output.set("sourceVariantCollisions", JSON.stringify(sourceVariantCollisions, null, 2));
 /* ------------------------------------------------------------
@@ -1753,6 +1903,11 @@ if (!queueWriteReady) {
         heldSourceRows: heldSourceIndexes.size,
         heldExistingProgrammes:
             [...heldExistingIds].filter(id => existingDevelopmentIds.has(id)).length,
+        holdLedgerAddressabilityReady,
+        holdLedgerMapped: holdLedgerMappings.length,
+        holdLedgerMissing: holdLedgerMissing.length,
+        holdLedgerAmbiguous: holdLedgerAmbiguous.length,
+        holdLedgerClosedStatusConflicts: holdLedgerClosedStatusConflicts.length,
         sourceCoverageBalanced,
         existingCoverageBalanced,
         reconciliationStatus,
@@ -1877,6 +2032,11 @@ output.set("genericQueueRouterSummary", JSON.stringify({
     heldSourceRows: heldSourceIndexes.size,
     heldExistingProgrammes:
         [...heldExistingIds].filter(id => existingDevelopmentIds.has(id)).length,
+    holdLedgerAddressabilityReady,
+    holdLedgerMapped: holdLedgerMappings.length,
+    holdLedgerMissing: holdLedgerMissing.length,
+    holdLedgerAmbiguous: holdLedgerAmbiguous.length,
+    holdLedgerClosedStatusConflicts: holdLedgerClosedStatusConflicts.length,
     queueWriteReady: true,
     writesApplied: true,
     sourceWatchRecordId: sourceWatchRecord.id,

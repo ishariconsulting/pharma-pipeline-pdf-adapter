@@ -1597,6 +1597,8 @@ const holdLedgerAmbiguous = [];
 const holdLedgerClosedStatusConflicts = [];
 const holdLedgerCompanyScopeConflicts = [];
 const holdLedgerCandidateIdConflicts = [];
+const holdLedgerStateConflicts = [];
+const holdLedgerNoOpMappings = [];
 const holdLedgerUpdatePlan = [];
 
 for (const descriptor of heldDescriptors) {
@@ -1658,11 +1660,20 @@ for (const descriptor of heldDescriptors) {
     const currentProgrammeGate = clean(
         candidate.getCellValueAsString(hcf.programmeGate)
     );
+    const currentNextAction = clean(
+        candidate.getCellValueAsString(hcf.nextAction)
+    );
+    const currentSourceScope = clean(
+        candidate.getCellValueAsString(hcf.sourceScope)
+    );
+    const currentLatestStagingEvidence = clean(
+        candidate.getCellValueAsString(hcf.latestStagingEvidence)
+    );
     const existingPortfolioMatchIds = linkedIds(candidate, hcf.existingMatch);
     const currentClassification = clean(
         candidate.getCellValueAsString(hcf.classification)
     );
-    const writeFields = proposedHoldFieldsBase(
+    const desiredFields = proposedHoldFieldsBase(
         descriptor,
         "UPDATE",
         "EXACT_ONE"
@@ -1678,18 +1689,100 @@ for (const descriptor of heldDescriptors) {
         currentReviewStatus,
         currentException,
         currentProgrammeGate,
+        currentNextAction,
+        currentSourceScope,
         existingPortfolioMatchIds,
         currentClassification,
-        proposedReviewStatus: writeFields["Review Status"],
-        proposedException: writeFields["Reconciliation Exception Type"],
-        proposedProgrammeGate: writeFields["Programme Reconciliation Gate"],
-        proposedWriteAction: "UPDATE EXISTING CANDIDATE ONLY - NOT APPLIED"
+        proposedReviewStatus: desiredFields["Review Status"],
+        proposedException: desiredFields["Reconciliation Exception Type"],
+        proposedProgrammeGate: desiredFields["Programme Reconciliation Gate"],
+        proposedWriteAction: "NO CANDIDATE WRITE REQUIRED - EXISTING HOLD RETAINED"
     };
     holdLedgerMappings.push(mapped);
     if (CLOSED_CANDIDATE_STATUSES.has(currentReviewStatus)) {
         holdLedgerClosedStatusConflicts.push(mapped);
         continue;
     }
+
+    /*
+    Production-idempotent hold persistence:
+    - Fill machine hold state only when missing.
+    - Allow a fail-closed downgrade from Unassessed / machine-ready to unresolved.
+    - Never overwrite populated reviewer narrative or a more specific source scope.
+    - Any incompatible populated reconciliation state fails closed instead of being
+      silently replaced on every recurring run.
+    */
+    const writeFields = {};
+    const stateConflicts = [];
+
+    if (!currentReviewStatus || currentReviewStatus === "New") {
+        writeFields["Review Status"] = desiredFields["Review Status"];
+    } else if (currentReviewStatus !== "Needs Review") {
+        stateConflicts.push(
+            "REVIEW_STATUS_INCOMPATIBLE=" + currentReviewStatus
+        );
+    }
+
+    if (!currentException) {
+        writeFields["Reconciliation Exception Type"] =
+            desiredFields["Reconciliation Exception Type"];
+    } else if (
+        currentException !== desiredFields["Reconciliation Exception Type"]
+    ) {
+        stateConflicts.push(
+            "RECONCILIATION_EXCEPTION_CONFLICT=" + currentException
+        );
+    }
+
+    if (
+        !currentProgrammeGate ||
+        currentProgrammeGate === "Unassessed" ||
+        currentProgrammeGate === "Ready for Controlled Master Review"
+    ) {
+        writeFields["Programme Reconciliation Gate"] =
+            desiredFields["Programme Reconciliation Gate"];
+    } else if (
+        currentProgrammeGate !== desiredFields["Programme Reconciliation Gate"]
+    ) {
+        stateConflicts.push(
+            "PROGRAMME_GATE_CONFLICT=" + currentProgrammeGate
+        );
+    }
+
+    if (!currentNextAction) {
+        writeFields["Programme Review Next Action"] =
+            desiredFields["Programme Review Next Action"];
+    }
+
+    if (!currentSourceScope) {
+        writeFields["Source Scope Granularity"] =
+            desiredFields["Source Scope Granularity"];
+    }
+
+    if (stateConflicts.length > 0) {
+        holdLedgerStateConflicts.push({
+            ...mapped,
+            stateConflicts
+        });
+        continue;
+    }
+
+    const machineFieldWriteCount = Object.keys(writeFields).length;
+    if (
+        machineFieldWriteCount > 0 ||
+        !currentLatestStagingEvidence
+    ) {
+        writeFields["Latest Staging Evidence"] =
+            desiredFields["Latest Staging Evidence"];
+    }
+
+    if (Object.keys(writeFields).length === 0) {
+        holdLedgerNoOpMappings.push(mapped);
+        continue;
+    }
+
+    mapped.proposedWriteAction =
+        "SAFE FILL / FAIL-CLOSED DOWNGRADE ONLY - NOT APPLIED";
     holdLedgerUpdatePlan.push({
         action: "UPDATE",
         candidateRecordId: candidate.id,
@@ -1716,13 +1809,19 @@ for (const descriptor of heldDescriptors) {
             "Source Indication": clean(candidate.getCellValueAsString(hcf.indication)),
             "Source Phase": clean(candidate.getCellValueAsString(hcf.phase)),
             "Existing Portfolio Match": linkedSnapshot(candidate, hcf.existingMatch),
-            "Review Status": writeFields["Review Status"],
+            "Review Status":
+                writeFields["Review Status"] || currentReviewStatus,
             "Discovery Classification": currentClassification,
-            "Reconciliation Exception Type": writeFields["Reconciliation Exception Type"],
-            "Programme Reconciliation Gate": writeFields["Programme Reconciliation Gate"],
-            "Programme Review Next Action": writeFields["Programme Review Next Action"],
-            "Source Scope Granularity": writeFields["Source Scope Granularity"],
-            "Latest Staging Evidence": writeFields["Latest Staging Evidence"]
+            "Reconciliation Exception Type":
+                writeFields["Reconciliation Exception Type"] || currentException,
+            "Programme Reconciliation Gate":
+                writeFields["Programme Reconciliation Gate"] || currentProgrammeGate,
+            "Programme Review Next Action":
+                writeFields["Programme Review Next Action"] || currentNextAction,
+            "Source Scope Granularity":
+                writeFields["Source Scope Granularity"] || currentSourceScope,
+            "Latest Staging Evidence":
+                writeFields["Latest Staging Evidence"] || currentLatestStagingEvidence
         }
     });
 }
@@ -2015,6 +2114,7 @@ const holdLedgerAddressabilityReady =
     holdLedgerClosedStatusConflicts.length === 0 &&
     holdLedgerCompanyScopeConflicts.length === 0 &&
     holdLedgerCandidateIdConflicts.length === 0 &&
+    holdLedgerStateConflicts.length === 0 &&
     holdLedgerMappings.length === heldSourceIndexes.size;
 
 const holdLedgerUpsertPlanReady =
@@ -2023,11 +2123,12 @@ const holdLedgerUpsertPlanReady =
     holdLedgerClosedStatusConflicts.length === 0 &&
     holdLedgerCompanyScopeConflicts.length === 0 &&
     holdLedgerCandidateIdConflicts.length === 0 &&
+    holdLedgerStateConflicts.length === 0 &&
     holdLedgerComparatorConflicts.length === 0 &&
     holdAssignmentOverlap.length === 0 &&
     heldExistingDisappearanceOverlap.length === 0 &&
     (
-        holdLedgerUpdatePlan.length +
+        holdLedgerMappings.length +
         holdLedgerCreatePlan.length
     ) === heldSourceIndexes.size;
 
@@ -2048,10 +2149,12 @@ const holdLedgerUpsertPlan = {
         heldSourceRows: heldSourceIndexes.size,
         updates: holdLedgerUpdatePlan.length,
         creates: holdLedgerCreatePlan.length,
+        noOpMappedHolds: holdLedgerNoOpMappings.length,
         ambiguousMappings: holdLedgerAmbiguous.length,
         closedStatusConflicts: holdLedgerClosedStatusConflicts.length,
         companyScopeConflicts: holdLedgerCompanyScopeConflicts.length,
         candidateIdConflicts: holdLedgerCandidateIdConflicts.length,
+        stateConflicts: holdLedgerStateConflicts.length,
         comparatorConflicts: holdLedgerComparatorConflicts.length,
         duplicateHeldStableKeys: duplicateHeldStableKeys.length,
         heldAssignmentOverlap: holdAssignmentOverlap.length,
@@ -2060,11 +2163,13 @@ const holdLedgerUpsertPlan = {
     },
     updates: holdLedgerUpdatePlan,
     creates: holdLedgerCreatePlan,
+    noOpMappedHolds: holdLedgerNoOpMappings,
     conflicts: {
         ambiguousMappings: holdLedgerAmbiguous,
         closedStatusConflicts: holdLedgerClosedStatusConflicts,
         companyScopeConflicts: holdLedgerCompanyScopeConflicts,
         candidateIdConflicts: holdLedgerCandidateIdConflicts,
+        stateConflicts: holdLedgerStateConflicts,
         comparatorConflicts: holdLedgerComparatorConflicts,
         duplicateHeldStableKeys,
         heldAssignmentOverlap: holdAssignmentOverlap,
@@ -2074,8 +2179,9 @@ const holdLedgerUpsertPlan = {
         "UPDATE preserves Discovery Candidate ID, source identity fields, Existing Portfolio Match and Discovery Classification.",
         "CREATE reuses the shared /compare/portfolio-discovery contract for Discovery Candidate ID and Discovery Classification.",
         "CREATE leaves Existing Portfolio Match blank while the recurring reconciliation row is held; comparator-suggested matches remain diagnostic only.",
+        "Existing populated reconciliation fields are preserved; recurring runs only fill missing machine hold state or apply a fail-closed downgrade from Unassessed / machine-ready to unresolved.",
         "Human-reviewed/closed candidate statuses fail closed rather than being reopened automatically.",
-        "Any duplicate stable key, duplicate candidate ID, ambiguous candidate mapping or held-row queue overlap fails the plan.",
+        "Any incompatible populated reconciliation state, duplicate stable key, duplicate candidate ID, ambiguous candidate mapping or held-row queue overlap fails the plan.",
         "This canary performs zero Portfolio Discovery Candidate, Intelligence Update Queue, Source Watch or Portfolio writes."
     ]
 };
@@ -2103,23 +2209,36 @@ function holdLinkWrite(items) {
 }
 function candidateUpdatePreflight(item) {
     const wf = item.writeFields || {};
+    const fields = {};
+    if (wf["Review Status"]) {
+        fields["Review Status"] =
+            holdSelectWrite(wf["Review Status"]);
+    }
+    if (wf["Reconciliation Exception Type"]) {
+        fields["Reconciliation Exception Type"] =
+            holdSelectWrite(wf["Reconciliation Exception Type"]);
+    }
+    if (wf["Programme Reconciliation Gate"]) {
+        fields["Programme Reconciliation Gate"] =
+            holdSelectWrite(wf["Programme Reconciliation Gate"]);
+    }
+    if (wf["Programme Review Next Action"]) {
+        fields["Programme Review Next Action"] =
+            clean(wf["Programme Review Next Action"]);
+    }
+    if (wf["Source Scope Granularity"]) {
+        fields["Source Scope Granularity"] =
+            holdSelectWrite(wf["Source Scope Granularity"]);
+    }
+    if (wf["Latest Staging Evidence"]) {
+        fields["Latest Staging Evidence"] =
+            clean(wf["Latest Staging Evidence"]);
+    }
     return {
         action: "UPDATE",
         candidateRecordId: item.candidateRecordId,
         stableSourceRecordKey: item.stableSourceRecordKey,
-        fields: {
-            "Review Status": holdSelectWrite(wf["Review Status"]),
-            "Reconciliation Exception Type":
-                holdSelectWrite(wf["Reconciliation Exception Type"]),
-            "Programme Reconciliation Gate":
-                holdSelectWrite(wf["Programme Reconciliation Gate"]),
-            "Programme Review Next Action":
-                clean(wf["Programme Review Next Action"]),
-            "Source Scope Granularity":
-                holdSelectWrite(wf["Source Scope Granularity"]),
-            "Latest Staging Evidence":
-                clean(wf["Latest Staging Evidence"])
-        }
+        fields
     };
 }
 function candidateCreatePreflight(item) {
@@ -2193,8 +2312,11 @@ const candidateWritePreflightReady =
     ) &&
     candidatePreflightStableKeySet.size ===
         candidatePreflightStableKeys.length &&
+    candidateUpdateWritePreflight.every(
+        x => Object.keys(x.fields || {}).length > 0
+    ) &&
     (
-        candidateUpdateWritePreflight.length +
+        holdLedgerMappings.length +
         candidateCreateWritePreflight.length
     ) === heldSourceIndexes.size;
 
@@ -2214,6 +2336,7 @@ const candidateWritePreflight = {
         heldSourceRows: heldSourceIndexes.size,
         updateOperations: candidateUpdateWritePreflight.length,
         createOperations: candidateCreateWritePreflight.length,
+        noOpMappedHolds: holdLedgerNoOpMappings.length,
         totalOperations:
             candidateUpdateWritePreflight.length +
             candidateCreateWritePreflight.length,
@@ -2229,7 +2352,7 @@ const candidateWritePreflight = {
     },
     executionContract: [
         "Candidate mutation code exists but APPLY_CANDIDATE_HOLD_LEDGER_WRITES is false by default.",
-        "UPDATE payloads touch reconciliation-state fields only; discovery identity/history fields are not rewritten.",
+        "UPDATE payloads are sparse and touch only missing machine reconciliation-state fields or an allowed fail-closed gate downgrade; discovery identity/history and populated reviewer state are not rewritten.",
         "CREATE payloads use the shared comparator-derived Discovery Candidate ID and Discovery Classification.",
         "CREATE Existing Portfolio Match remains blank while the row is held.",
         "The writer re-reads Candidate state and re-runs duplicate, scope, closed-status, comparator and overlap checks immediately before writes.",

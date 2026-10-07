@@ -2050,7 +2050,7 @@ const holdLedgerUpsertPlan = {
         candidateIdConflicts: holdLedgerCandidateIdConflicts,
         comparatorConflicts: holdLedgerComparatorConflicts,
         duplicateHeldStableKeys,
-        heldAssignmentOverlap,
+        heldAssignmentOverlap: holdAssignmentOverlap,
         heldExistingDisappearanceOverlap
     },
     safeguards: [
@@ -2065,6 +2065,162 @@ const holdLedgerUpsertPlan = {
 output.set(
     "holdLedgerUpsertPlan",
     JSON.stringify(holdLedgerUpsertPlan, null, 2)
+);
+
+/* ------------------------------------------------------------
+   9c) Candidate hold-ledger write preflight (READ ONLY)
+   ------------------------------------------------------------
+   Converts the proven hold-ledger UPDATE/CREATE plan into the exact
+   Airtable scripting payload shape that a future controlled Candidate-only
+   writer would use. This block does NOT call updateRecord(s)Async or
+   createRecord(s)Async. It exists solely so the exact writes can be reviewed
+   before any Candidate mutation is authorised.
+   ------------------------------------------------------------ */
+function holdSelectWrite(value) {
+    return value ? {name: value} : null;
+}
+function holdLinkWrite(items) {
+    return Array.isArray(items)
+        ? items.map(x => ({id: x && x.id})).filter(x => x.id)
+        : [];
+}
+function candidateUpdatePreflight(item) {
+    const wf = item.writeFields || {};
+    return {
+        action: "UPDATE",
+        candidateRecordId: item.candidateRecordId,
+        stableSourceRecordKey: item.stableSourceRecordKey,
+        fields: {
+            "Review Status": holdSelectWrite(wf["Review Status"]),
+            "Reconciliation Exception Type":
+                holdSelectWrite(wf["Reconciliation Exception Type"]),
+            "Programme Reconciliation Gate":
+                holdSelectWrite(wf["Programme Reconciliation Gate"]),
+            "Programme Review Next Action":
+                clean(wf["Programme Review Next Action"]),
+            "Source Scope Granularity":
+                holdSelectWrite(wf["Source Scope Granularity"]),
+            "Latest Staging Evidence":
+                clean(wf["Latest Staging Evidence"])
+        }
+    };
+}
+function candidateCreatePreflight(item) {
+    const pf = item.proposedFields || {};
+    const af = item.additionalCreateFields || {};
+    return {
+        action: "CREATE",
+        candidateRecordId: null,
+        stableSourceRecordKey: item.stableSourceRecordKey,
+        fields: {
+            "Discovery Candidate ID":
+                clean(pf["Discovery Candidate ID"]),
+            "Company":
+                holdLinkWrite(pf["Company"]),
+            "Source Watch":
+                holdLinkWrite(pf["Source Watch"]),
+            "Discovery Source Family":
+                holdSelectWrite(af["Discovery Source Family"]),
+            "Discovery Classification":
+                holdSelectWrite(pf["Discovery Classification"]),
+            "Review Status":
+                holdSelectWrite(pf["Review Status"]),
+            "Source Asset Name":
+                clean(pf["Source Asset Name"]),
+            "Source Indication":
+                clean(pf["Source Indication"]),
+            "Source Phase":
+                clean(pf["Source Phase"]),
+            "Source Record ID / Key":
+                clean(pf["Source Record ID / Key"]),
+            "Source URL":
+                clean(af["Source URL"]),
+            "Existing Portfolio Match":
+                holdLinkWrite(pf["Existing Portfolio Match"]),
+            "Reconciliation Exception Type":
+                holdSelectWrite(pf["Reconciliation Exception Type"]),
+            "Programme Reconciliation Gate":
+                holdSelectWrite(pf["Programme Reconciliation Gate"]),
+            "Programme Review Next Action":
+                clean(pf["Programme Review Next Action"]),
+            "Source Scope Granularity":
+                holdSelectWrite(pf["Source Scope Granularity"]),
+            "Latest Staging Evidence":
+                clean(pf["Latest Staging Evidence"])
+        }
+    };
+}
+const candidateUpdateWritePreflight =
+    holdLedgerUpdatePlan.map(candidateUpdatePreflight);
+const candidateCreateWritePreflight =
+    holdLedgerCreatePlan.map(candidateCreatePreflight);
+const candidatePreflightStableKeys = [
+    ...candidateUpdateWritePreflight.map(x => x.stableSourceRecordKey),
+    ...candidateCreateWritePreflight.map(x => x.stableSourceRecordKey)
+];
+const candidatePreflightStableKeySet =
+    new Set(candidatePreflightStableKeys);
+const candidateWritePreflightReady =
+    CANARY_READ_ONLY === true &&
+    holdLedgerUpsertPlanReady === true &&
+    candidateUpdateWritePreflight.every(
+        x => /^rec[A-Za-z0-9]{14}$/.test(x.candidateRecordId || "")
+    ) &&
+    candidateCreateWritePreflight.every(
+        x =>
+            !x.candidateRecordId &&
+            clean(x.fields["Discovery Candidate ID"]) &&
+            x.fields["Company"].length === 1 &&
+            x.fields["Source Watch"].length === 1 &&
+            x.fields["Existing Portfolio Match"].length === 0
+    ) &&
+    candidatePreflightStableKeySet.size ===
+        candidatePreflightStableKeys.length &&
+    (
+        candidateUpdateWritePreflight.length +
+        candidateCreateWritePreflight.length
+    ) === heldSourceIndexes.size;
+
+const candidateWritePreflight = {
+    mode: "READ ONLY - EXACT AIRTABLE CANDIDATE WRITE PAYLOAD PREVIEW",
+    version: VERSION,
+    company: companyName,
+    companyRecordId: targetCompany.id,
+    sourceWatchRecordId: sourceWatchRecord.id,
+    sourceWatchName,
+    executionApproved: false,
+    executableWriteCallsPresent: false,
+    canaryReadOnly: CANARY_READ_ONLY,
+    preflightReady: candidateWritePreflightReady,
+    counts: {
+        heldSourceRows: heldSourceIndexes.size,
+        updateOperations: candidateUpdateWritePreflight.length,
+        createOperations: candidateCreateWritePreflight.length,
+        totalOperations:
+            candidateUpdateWritePreflight.length +
+            candidateCreateWritePreflight.length,
+        candidateWritesExecuted: 0,
+        queueWritesExecuted: 0,
+        sourceWatchWritesExecuted: 0,
+        portfolioWritesExecuted: 0,
+        masterDataWritesExecuted: 0
+    },
+    operations: {
+        updates: candidateUpdateWritePreflight,
+        creates: candidateCreateWritePreflight
+    },
+    executionContract: [
+        "No Candidate mutation is performed by this script.",
+        "UPDATE payloads touch reconciliation-state fields only; discovery identity/history fields are not rewritten.",
+        "CREATE payloads use the shared comparator-derived Discovery Candidate ID and Discovery Classification.",
+        "CREATE Existing Portfolio Match remains blank while the row is held.",
+        "Any future writer must re-run the same duplicate, scope, closed-status, comparator and overlap checks immediately before writes.",
+        "Portfolio, Intelligence Update Queue and Source Watch freshness writes remain out of scope."
+    ]
+};
+output.set(
+    "candidateWritePreflight",
+    JSON.stringify(candidateWritePreflight, null, 2)
 );
 
 const accountedSourceIndexes = new Set([

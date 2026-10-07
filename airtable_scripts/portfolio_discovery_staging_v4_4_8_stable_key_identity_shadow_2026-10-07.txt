@@ -2280,7 +2280,7 @@ output.set(
         /Source adapter failed staging guardrail|Semantic staging guardrail failed/i
             .test(stagingError);
 
-    if (deterministicSourceFailure) {
+    if (deterministicSourceFailure && APPLY_STAGING_WRITES) {
         try {
             const failureSw =
                 await sourceWatchTable.selectRecordAsync(
@@ -2376,7 +2376,7 @@ output.set(
                 error: stagingError,
                 deterministicSourceFailure,
                 sourceBindingQuarantined:
-                    deterministicSourceFailure,
+                    deterministicSourceFailure && APPLY_STAGING_WRITES,
                 masterWrites: 0,
                 status:
                     "FAIL CLOSED - SOURCE SKIPPED; AUTOMATION CONTINUES"
@@ -2394,7 +2394,7 @@ output.set(
         version: VERSION,
         mode: "READ_ONLY_STABLE_KEY_IDENTITY_SHADOW",
         stagingWritesEnabled: APPLY_STAGING_WRITES,
-        actualRecordWrites: 0,
+        actualRecordWrites: APPLY_STAGING_WRITES ? "POSSIBLE" : 0,
         productionInstalled: false
     }, null, 2)
 );

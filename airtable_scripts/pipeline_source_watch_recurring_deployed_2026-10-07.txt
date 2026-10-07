@@ -1466,6 +1466,7 @@ assertCandidateSelect(hcf.programmeGate, "Evidence Captured – Scope Unresolved
 assertCandidateSelect(hcf.sourceScope, "Uncertain", "Source Scope Granularity");
 
 const currentSourceCandidatesByStableKey = new Map();
+const supersededSourceCandidatesByStableKey = new Map();
 const candidatesByDiscoveryId = new Map();
 for (const candidate of holdCandidateQuery.records) {
     const candidateId = clean(candidate.getCellValueAsString(hcf.id));
@@ -1482,10 +1483,19 @@ for (const candidate of holdCandidateQuery.records) {
     ) continue;
     const key = clean(candidate.getCellValueAsString(hcf.sourceRecord));
     if (!key) continue;
-    if (!currentSourceCandidatesByStableKey.has(key)) {
-        currentSourceCandidatesByStableKey.set(key, []);
+
+    const reviewStatus = clean(
+        candidate.getCellValueAsString(hcf.reviewStatus)
+    );
+    const isSuperseded = reviewStatus === "Superseded";
+    const targetMap = isSuperseded
+        ? supersededSourceCandidatesByStableKey
+        : currentSourceCandidatesByStableKey;
+
+    if (!targetMap.has(key)) {
+        targetMap.set(key, []);
     }
-    currentSourceCandidatesByStableKey.get(key).push(candidate);
+    targetMap.get(key).push(candidate);
 }
 
 const CLOSED_CANDIDATE_STATUSES = new Set([
@@ -1598,6 +1608,7 @@ const holdLedgerClosedStatusConflicts = [];
 const holdLedgerCompanyScopeConflicts = [];
 const holdLedgerCandidateIdConflicts = [];
 const holdLedgerStateConflicts = [];
+const holdLedgerSupersededOnlyConflicts = [];
 const holdLedgerNoOpMappings = [];
 const holdLedgerUpdatePlan = [];
 
@@ -1606,6 +1617,20 @@ for (const descriptor of heldDescriptors) {
         currentSourceCandidatesByStableKey.get(
             descriptor.stableSourceRecordKey
         ) || [];
+    const supersededCandidates =
+        supersededSourceCandidatesByStableKey.get(
+            descriptor.stableSourceRecordKey
+        ) || [];
+    if (candidates.length === 0 && supersededCandidates.length > 0) {
+        holdLedgerSupersededOnlyConflicts.push({
+            sourceIndex: descriptor.sourceIndex,
+            stableSourceRecordKey: descriptor.stableSourceRecordKey,
+            supersededCandidateRecordIds: supersededCandidates.map(x => x.id),
+            holdTypes: descriptor.holdTypes,
+            reason: "SUPERSEDED_HISTORY_WITHOUT_ACTIVE_CANDIDATE"
+        });
+        continue;
+    }
     if (candidates.length === 0) {
         holdLedgerMissing.push(descriptor);
         continue;
@@ -2115,6 +2140,7 @@ const holdLedgerAddressabilityReady =
     holdLedgerCompanyScopeConflicts.length === 0 &&
     holdLedgerCandidateIdConflicts.length === 0 &&
     holdLedgerStateConflicts.length === 0 &&
+    holdLedgerSupersededOnlyConflicts.length === 0 &&
     holdLedgerUpdatePlan.length === 0 &&
     holdLedgerMappings.length === heldSourceIndexes.size;
 
@@ -2125,6 +2151,7 @@ const holdLedgerUpsertPlanReady =
     holdLedgerCompanyScopeConflicts.length === 0 &&
     holdLedgerCandidateIdConflicts.length === 0 &&
     holdLedgerStateConflicts.length === 0 &&
+    holdLedgerSupersededOnlyConflicts.length === 0 &&
     holdLedgerComparatorConflicts.length === 0 &&
     holdAssignmentOverlap.length === 0 &&
     heldExistingDisappearanceOverlap.length === 0 &&
@@ -2156,6 +2183,7 @@ const holdLedgerUpsertPlan = {
         companyScopeConflicts: holdLedgerCompanyScopeConflicts.length,
         candidateIdConflicts: holdLedgerCandidateIdConflicts.length,
         stateConflicts: holdLedgerStateConflicts.length,
+        supersededOnlyConflicts: holdLedgerSupersededOnlyConflicts.length,
         comparatorConflicts: holdLedgerComparatorConflicts.length,
         duplicateHeldStableKeys: duplicateHeldStableKeys.length,
         heldAssignmentOverlap: holdAssignmentOverlap.length,
@@ -2171,6 +2199,7 @@ const holdLedgerUpsertPlan = {
         companyScopeConflicts: holdLedgerCompanyScopeConflicts,
         candidateIdConflicts: holdLedgerCandidateIdConflicts,
         stateConflicts: holdLedgerStateConflicts,
+        supersededOnlyConflicts: holdLedgerSupersededOnlyConflicts,
         comparatorConflicts: holdLedgerComparatorConflicts,
         duplicateHeldStableKeys,
         heldAssignmentOverlap: holdAssignmentOverlap,
@@ -2181,6 +2210,7 @@ const holdLedgerUpsertPlan = {
         "CREATE reuses the shared /compare/portfolio-discovery contract for Discovery Candidate ID and Discovery Classification.",
         "CREATE leaves Existing Portfolio Match blank while the recurring reconciliation row is held; comparator-suggested matches remain diagnostic only.",
         "Existing populated reconciliation fields are preserved; recurring runs only fill missing machine hold state or apply a fail-closed downgrade from Unassessed / machine-ready to unresolved.",
+        "Superseded Candidate rows are historical and do not count as active stable-key mappings; a stable key with superseded history but no active Candidate fails closed rather than auto-creating a replacement.",
         "Human-reviewed/closed candidate statuses fail closed rather than being reopened automatically.",
         "Any incompatible populated reconciliation state, duplicate stable key, duplicate candidate ID, ambiguous candidate mapping or held-row queue overlap fails the plan.",
         "This canary performs zero Portfolio Discovery Candidate, Intelligence Update Queue, Source Watch or Portfolio writes."

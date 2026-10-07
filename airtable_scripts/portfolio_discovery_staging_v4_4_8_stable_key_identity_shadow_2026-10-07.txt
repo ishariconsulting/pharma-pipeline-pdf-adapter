@@ -1,0 +1,2374 @@
+/*
+Portfolio Discovery Staging V4.3.7 – source scope enrichment
+SOURCE-WATCH-DRIVEN / STAGING-ONLY / FAIL-CLOSED
+
+Purpose
+-------
+- Process only pipeline sources whose adapter is validated but baseline is Needs Review.
+- Fetch the validated source adapter dynamically from Adapter Registry.
+- Compare official source rows against current Portfolio via the read-only
+  /compare/portfolio-discovery comparator.
+- Upsert unresolved/current-review candidates into Portfolio Discovery Candidates.
+- Never write Portfolio master data.
+
+Required Airtable input
+-----------------------
+sourceWatchRecordId = current Source Watch record from the repeating group
+
+Required secret
+---------------
+adapterApiKey = existing Airtable secret
+*/
+
+const VERSION = "PORTFOLIO_DISCOVERY_STAGING_V4.4.8_STABLE_KEY_IDENTITY_CONTRACT_SHADOW";
+const ADAPTER_BASE_URL = "https://pharma-pipeline-pdf-adapter.onrender.com";
+
+const cfg = input.config();
+const sourceWatchRecordId = String(cfg.sourceWatchRecordId || "").trim();
+if (!sourceWatchRecordId) {
+    throw new Error("sourceWatchRecordId is blank.");
+}
+
+const sourceWatchTable = base.getTable("Source Watch");
+let stagingStateNotesField = null;
+try {
+    stagingStateNotesField =
+        sourceWatchTable.getField("Last Known State / Notes");
+} catch (_) {}
+
+try {
+
+let adapterApiKey = "";
+try {
+    adapterApiKey = String(input.secret("adapterApiKey") || "");
+} catch (e) {
+    throw new Error("adapterApiKey secret unavailable: " + (e.message || e));
+}
+if (!adapterApiKey) {
+    throw new Error("adapterApiKey secret is blank.");
+}
+
+const adapterTable = base.getTable("Adapter Registry");
+const companiesTable = base.getTable("Companies");
+const portfolioTable = base.getTable("Portfolio");
+const indicationsTable = base.getTable("Indications");
+const candidateTable = base.getTable("Portfolio Discovery Candidates");
+
+function clean(v) {
+    return v === null || v === undefined
+        ? ""
+        : String(v).replace(/\s+/g, " ").trim();
+}
+
+function norm(v) {
+    return clean(v)
+        .toLowerCase()
+        .normalize("NFKD")
+        .replace(/[\u0300-\u036f]/g, "")
+        .replace(/[®™]/g, "")
+        .replace(/[–—‑−]/g, "-")
+        .replace(/[^a-z0-9]+/g, " ")
+        .replace(/\s+/g, " ")
+        .trim();
+}
+
+function splitTerms(v) {
+    return clean(v)
+        .split(/[\n;|,]+/)
+        .map(clean)
+        .filter(Boolean);
+}
+
+function field(table, name, required = true) {
+    let f = null;
+    try {
+        f = table.getField(name);
+    } catch (_) {}
+
+    if (!f && required) {
+        throw new Error("Required field missing: " + table.name + "." + name);
+    }
+    return f;
+}
+
+function text(record, f) {
+    if (!f) return "";
+    try {
+        return clean(record.getCellValueAsString(f));
+    } catch (_) {
+        return "";
+    }
+}
+
+function linkIds(record, f) {
+    if (!f) return [];
+    const v = record.getCellValue(f);
+    return Array.isArray(v)
+        ? v.map(x => x && x.id).filter(Boolean)
+        : [];
+}
+
+function linkNames(record, f) {
+    if (!f) return [];
+    const v = record.getCellValue(f);
+    return Array.isArray(v)
+        ? v.map(x => clean(x && x.name)).filter(Boolean)
+        : [];
+}
+
+function selectName(record, f) {
+    if (!f) return "";
+    const v = record.getCellValue(f);
+    return v && v.name ? clean(v.name) : text(record, f);
+}
+
+async function jsonRequest(url, options = {}, maxAttempts = 2) {
+    const retryable = new Set([408, 429, 500, 502, 503, 504]);
+    const phase = url.includes("/compare/portfolio-discovery") ? "COMPARATOR" : "EXTRACTION";
+    let lastError = null;
+
+    for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+        try {
+            const res = await fetch(url, options);
+            const body = await res.text();
+            // Busy and rate-limited services must be deferred until a later
+            // controlled Source Watch run rather than immediately retried.
+            if (res.status === 408 || res.status === 429 || res.status === 503) {
+                const header = res.headers.get("Retry-After");
+                const retryAfterSeconds = Math.max(30, Number(header || 30) || 30);
+                throw new Error(
+                    "DEFERRED_TRANSIENT_HTTP_" + res.status +
+                    " phase=" + phase +
+                    " retryAfterSeconds=" + retryAfterSeconds +
+                    " source retained for controlled retry"
+                );
+            }
+
+            let data;
+            try {
+                data = JSON.parse(body);
+            } catch (_) {
+                const err = new Error(
+                    "Non-JSON response. HTTP " + res.status + " phase=" + phase +
+                    " body=" + body.slice(0, 500)
+                );
+                if (attempt < maxAttempts && retryable.has(res.status)) {
+                    lastError = err;
+                    continue;
+                }
+                throw err;
+            }
+
+            if (res.ok) {
+                return data;
+            }
+
+            const err = new Error(
+                "HTTP " + res.status + " phase=" + phase + " " +
+                JSON.stringify(data).slice(0, 900)
+            );
+
+            if (attempt < maxAttempts && retryable.has(res.status)) {
+                lastError = err;
+                continue;
+            }
+
+            throw err;
+        } catch (e) {
+            lastError = e;
+
+            if (attempt >= maxAttempts) {
+                break;
+            }
+
+            const msg = String(e && e.message || e || "");
+            if (msg.includes("DEFERRED_TRANSIENT_HTTP_")) {
+                throw e; // Never immediately retry a 429 or 503.
+            }
+            const looksTransient =
+                /408|429|500|502|503|504|timeout|timed out|network/i.test(msg);
+
+            if (!looksTransient) {
+                throw e;
+            }
+
+            // Airtable automation scripts do not expose setTimeout.
+            // Retry immediately; the adapter itself remains fail-closed.
+            await Promise.resolve();
+        }
+    }
+
+    throw lastError || new Error("Request failed after retries.");
+}
+
+const swf = {
+    company: field(sourceWatchTable, "Company"),
+    sourceName: field(sourceWatchTable, "Source Name"),
+    sourceUrl: field(sourceWatchTable, "Source URL"),
+    machineUrl: field(sourceWatchTable, "Machine Source URL", false),
+    monitoring: field(sourceWatchTable, "Monitoring Status"),
+    sourceType: field(sourceWatchTable, "Source Type"),
+    adapterStatus: field(sourceWatchTable, "Pipeline Adapter Status"),
+    adapterRegistry: field(sourceWatchTable, "Adapter Registry"),
+    bindingStatus: field(sourceWatchTable, "Adapter Binding Status"),
+    retrievalMode: field(sourceWatchTable, "Retrieval Mode"),
+    baselineStatus: field(sourceWatchTable, "Pipeline Baseline Status"),
+    lastChecked: field(sourceWatchTable, "Last Checked", false)
+};
+
+const sw = await sourceWatchTable.selectRecordAsync(sourceWatchRecordId);
+if (!sw) {
+    throw new Error("Source Watch record not found: " + sourceWatchRecordId);
+}
+
+if (norm(selectName(sw, swf.monitoring)) !== "active") {
+    throw new Error("Source is not Active.");
+}
+if (norm(selectName(sw, swf.sourceType)) !== "pipeline page") {
+    throw new Error("Source Type is not Pipeline Page.");
+}
+if (norm(selectName(sw, swf.adapterStatus)) !== "validated") {
+    throw new Error("Pipeline Adapter Status is not Validated.");
+}
+if (norm(selectName(sw, swf.bindingStatus)) !== "validated") {
+    throw new Error("Adapter Binding Status is not Validated.");
+}
+const baselineStatusBefore = norm(selectName(sw, swf.baselineStatus));
+if (!["", "not established", "needs review"].includes(baselineStatusBefore)) {
+    throw new Error(
+        "Pipeline Baseline Status must be blank, Not Established, or Needs Review."
+    );
+}
+
+const companyIds = linkIds(sw, swf.company);
+if (companyIds.length !== 1) {
+    throw new Error("Source Watch must link exactly one Company.");
+}
+const companyId = companyIds[0];
+
+const companyNameField = field(companiesTable, "Name");
+const companyShortField = field(companiesTable, "Short Name", false);
+const companyLegalField = field(companiesTable, "Legal Name", false);
+
+const company = await companiesTable.selectRecordAsync(companyId);
+if (!company) {
+    throw new Error("Company record not found: " + companyId);
+}
+
+const companyName = text(company, companyNameField);
+const companyAliases = [
+    companyName,
+    text(company, companyShortField),
+    text(company, companyLegalField)
+]
+    .filter(Boolean)
+    .filter((x, i, a) => a.indexOf(x) === i);
+
+const adapterIds = linkIds(sw, swf.adapterRegistry);
+if (adapterIds.length !== 1) {
+    throw new Error("Source Watch must link exactly one Adapter Registry record.");
+}
+
+const adapter = await adapterTable.selectRecordAsync(adapterIds[0]);
+if (!adapter) {
+    throw new Error("Adapter Registry record not found.");
+}
+
+const arf = {
+    profile: field(adapterTable, "Adapter Profile"),
+    status: field(adapterTable, "Adapter Status"),
+    handler: field(adapterTable, "Endpoint / Handler"),
+    retrievalModes: field(adapterTable, "Supported Retrieval Modes"),
+    failClosed: field(adapterTable, "Fail Closed")
+};
+
+const adapterProfile = text(adapter, arf.profile);
+const adapterStatus = norm(selectName(adapter, arf.status));
+const handlerRaw = text(adapter, arf.handler);
+const handlerPath = handlerRaw.replace(/^pharma-pipeline-pdf-adapter:/i, "");
+const retrievalMode = selectName(sw, swf.retrievalMode);
+const supportedModes = linkNames(adapter, arf.retrievalModes);
+
+if (adapterStatus !== "validated") {
+    throw new Error("Adapter Registry status is not Validated.");
+}
+if (adapter.getCellValue(arf.failClosed) !== true) {
+    throw new Error("Adapter is not configured Fail Closed.");
+}
+if (!handlerPath || handlerPath[0] !== "/") {
+    throw new Error("Invalid adapter handler: " + handlerRaw);
+}
+if (!supportedModes.includes(retrievalMode)) {
+    throw new Error("Retrieval mode not supported by adapter.");
+}
+
+const publicSourceUrl =
+    text(sw, swf.sourceUrl);
+
+const machineSourceUrl =
+    text(sw, swf.machineUrl);
+
+// Most source-specific adapters should receive the machine endpoint where one
+// exists. BioNTech is the exception: its adapter must first read the official
+// HTML page to discover the AEM content-fragment references before it can query
+// the first-party GraphQL endpoint.
+const sourceUrl =
+    adapterProfile === "PIPELINE_BIONTECH_AEM_GRAPHQL_V1"
+        ? (publicSourceUrl || machineSourceUrl)
+        : (machineSourceUrl || publicSourceUrl);
+
+if (!sourceUrl) {
+    throw new Error("Source URL is blank.");
+}
+
+let requestPath = handlerPath;
+
+const noQueryHandlers = new Set([
+    "/extract/pfizer",
+    "/extract/sanofi"
+]);
+
+const sourceOnlyHandlers = new Set([
+    "/extract-bms-v4"
+]);
+
+if (noQueryHandlers.has(handlerPath)) {
+    requestPath = handlerPath;
+} else if (sourceOnlyHandlers.has(handlerPath)) {
+    requestPath =
+        handlerPath +
+        "?source_url=" +
+        encodeURIComponent(sourceUrl);
+} else if (handlerPath.startsWith("/extract/")) {
+    const joiner = handlerPath.includes("?") ? "&" : "?";
+    requestPath =
+        handlerPath +
+        joiner +
+        "company=" + encodeURIComponent(companyName) +
+        "&source_url=" + encodeURIComponent(sourceUrl);
+
+    // Keep Amgen's upstream request below Airtable's external-fetch ceiling so
+    // a transient slow source can fail fast and use the bounded retry above.
+    if (adapterProfile === "PIPELINE_AMGEN_JSON_V1") {
+        requestPath += "&timeout_seconds=20";
+    }
+} else {
+    throw new Error("Handler outside approved /extract/ namespace.");
+}
+
+const external = await jsonRequest(
+    ADAPTER_BASE_URL + requestPath,
+    {
+        method: "GET",
+        headers: {
+            "Accept": "application/json",
+            "X-Adapter-Key": adapterApiKey
+        }
+    }
+);
+
+const sourceRows =
+    Array.isArray(external.rows)
+        ? external.rows
+        : [];
+
+const sourceContextByRecordId = new Map();
+
+for (let i = 0; i < sourceRows.length; i++) {
+    const r = sourceRows[i] || {};
+    const sourceRecordId =
+        clean(
+            r.sourceRecordId ||
+            r.sourceCardOrdinal ||
+            r.recordId ||
+            String(i + 1)
+        );
+
+    const context = {
+        therapeuticArea:
+            clean(r.therapeuticArea),
+        modality:
+            clean(r.modality),
+        description:
+            clean(r.description),
+        additionalInformation:
+            clean(r.additionalInformation),
+        study:
+            clean(r.study),
+        trialIds:
+            Array.isArray(r.trialIds)
+                ? r.trialIds
+                    .map(clean)
+                    .filter(Boolean)
+                : []
+    };
+
+    if (
+        Object.entries(context).some(
+            ([key, value]) =>
+                Array.isArray(value)
+                    ? value.length > 0
+                    : Boolean(value)
+        )
+    ) {
+        sourceContextByRecordId.set(
+            sourceRecordId,
+            context
+        );
+    }
+}
+
+const issues =
+    Array.isArray(external.issues)
+        ? external.issues
+        : [];
+
+const summary = external.summary || {};
+const diagnostics = external.diagnostics || {};
+
+const structuralPass =
+    external.readyForDiscovery === true &&
+    summary.structuralValidationPass === true &&
+    issues.length === 0 &&
+    sourceRows.length > 0 &&
+    Number(diagnostics.rowFailures || 0) === 0 &&
+    Number(diagnostics.boundaryWarnings || 0) === 0 &&
+    Number(diagnostics.coverageWarnings || 0) === 0;
+
+if (!structuralPass) {
+    const structuralReasons = [];
+
+    if (external.readyForDiscovery !== true) {
+        structuralReasons.push("readyForDiscovery=false");
+    }
+    if (summary.structuralValidationPass !== true) {
+        structuralReasons.push("structuralValidationPass=false");
+    }
+    if (sourceRows.length === 0) {
+        structuralReasons.push("sourceRows=0");
+    }
+    if (issues.length > 0) {
+        structuralReasons.push(
+            "issues=" +
+            JSON.stringify(issues).slice(0, 500)
+        );
+    }
+
+    const rowFailures =
+        Number(diagnostics.rowFailures || 0);
+    const boundaryWarnings =
+        Number(diagnostics.boundaryWarnings || 0);
+    const coverageWarnings =
+        Number(diagnostics.coverageWarnings || 0);
+
+    if (rowFailures) {
+        structuralReasons.push(
+            "rowFailures=" + rowFailures
+        );
+    }
+    if (boundaryWarnings) {
+        structuralReasons.push(
+            "boundaryWarnings=" + boundaryWarnings
+        );
+    }
+    if (coverageWarnings) {
+        structuralReasons.push(
+            "coverageWarnings=" + coverageWarnings
+        );
+    }
+
+    throw new Error(
+        "Source adapter failed staging guardrail: " +
+        (structuralReasons.join("; ") || "unspecified structural failure")
+    );
+}
+
+/*
+Semantic identity guardrail:
+A structurally complete row can still be semantically misaligned when page
+metadata is shifted into asset/indication columns. This is unsafe for a
+company-agnostic promotion pipeline. Fail the whole source rather than stage
+partially trustworthy identities.
+*/
+const invalidAssetPrefixes = [
+    /^area under investigation\s*:/i,
+    /^country\s*$/i,
+    /^date\s*$/i,
+    /^molecule size\s*:/i,
+    /^additional information\s*:/i,
+    /^status change\s*:/i,
+    /^therapeutic area\s*:/i,
+    /^modality\s*:/i,
+    /^clinical stage\s*:/i,
+    /^phase\/?status\s*:?\s*$/i,
+    /^development details\s*:?\s*$/i,
+    /^development phase\s*:?\s*$/i,
+    /^development stage\s*:?\s*$/i,
+    /^proof of concept\s*$/i,
+    /^under regulatory review\s*$/i,
+    /^late\s*$/i,
+    /^stage\s*$/i,
+    /^clinical\s*$/i,
+    /^discover\/?\s*$/i,
+    /^(oncology|immunology|neuroscience|hematology|cardiovascular|metabolic|rare diseases?|infectious diseases?)\s*$/i
+];
+
+const invalidIndicationPrefixes = [
+    /^molecule size\s*:/i,
+    /^additional information\s*:/i,
+    /^status change\s*:/i,
+    /^therapeutic area\s*:/i,
+    /^modality\s*:/i,
+    /^clinical stage\s*:/i,
+    /^phase\/?status\s*:?\s*$/i,
+    /^development details\s*:?\s*$/i,
+    /^development phase\s*:?\s*$/i,
+    /^development stage\s*:?\s*$/i,
+    /^stage\s*$/i,
+    /^clinical\s*$/i,
+    /^discover\/?\s*$/i,
+    /^in collaboration with\b/i,
+    /^partnered product\b/i
+];
+
+const semanticReviewIndicationPatterns = [
+    /^anti[- ]?[a-z0-9]+(?:[- ][a-z0-9]+)*\s+(?:monoclonal\s+|bispecific\s+)?antibody$/i,
+    /^(?:monoclonal|bispecific)\s+antibody$/i,
+    /^(?:small|large)\s+molecule$/i,
+    /^(oncology|immunology|neuroscience|hematology|cardiovascular|metabolic|rare diseases?|infectious diseases?)\s*$/i
+];
+
+const semanticIdentityIssues = [];
+const semanticReviewBySourceRecordId = new Map();
+
+function stripTrailingAcronym(value) {
+    return norm(
+        clean(value).replace(
+            /\s*\([A-Z0-9-]{2,12}\)\s*$/,
+            ""
+        )
+    );
+}
+
+for (let i = 0; i < sourceRows.length; i++) {
+    const row = sourceRows[i] || {};
+    const sourceRecordId = clean(
+        row.sourceRecordId ||
+        row.sourceCardOrdinal ||
+        row.recordId ||
+        String(i + 1)
+    );
+
+    const asset = clean(
+        row.asset ||
+        row.brand ||
+        row.molecule ||
+        row.developmentCode
+    );
+    const indication = clean(row.indication);
+
+    const badAsset =
+        invalidAssetPrefixes.some(rx => rx.test(asset));
+
+    const badIndication =
+        invalidIndicationPrefixes.some(
+            rx => rx.test(indication)
+        );
+
+    const assetNorm =
+        norm(asset);
+    const indicationNorm =
+        norm(indication);
+
+    const exactAssetIndicationCollapse =
+        !!assetNorm &&
+        !!indicationNorm &&
+        assetNorm.length >= 10 &&
+        assetNorm === indicationNorm;
+
+    const acronymOnlyCollapse =
+        !!assetNorm &&
+        !!indicationNorm &&
+        assetNorm.length >= 10 &&
+        stripTrailingAcronym(asset) ===
+            stripTrailingAcronym(indication) &&
+        assetNorm !== indicationNorm;
+
+    const softIndicationIssue =
+        semanticReviewIndicationPatterns.some(
+            rx => rx.test(indication)
+        );
+
+    if (badAsset || badIndication) {
+        semanticIdentityIssues.push({
+            row: i + 1,
+            sourceRecordId,
+            asset,
+            indication,
+            semanticReason:
+                badAsset
+                    ? "INVALID_ASSET_LABEL"
+                    : "INVALID_INDICATION_LABEL",
+            phase: clean(
+                row.phase || row.sourceStage
+            )
+        });
+        continue;
+    }
+
+    if (
+        exactAssetIndicationCollapse ||
+        acronymOnlyCollapse ||
+        softIndicationIssue
+    ) {
+        const reason =
+            exactAssetIndicationCollapse ||
+            acronymOnlyCollapse
+                ? "ASSET_INDICATION_COLLAPSE_REVIEW"
+                : "NON_DISEASE_INDICATION_REVIEW";
+
+        semanticReviewBySourceRecordId.set(
+            sourceRecordId,
+            {
+                reason,
+                asset,
+                indication,
+                phase: clean(
+                    row.phase || row.sourceStage
+                )
+            }
+        );
+    }
+}
+
+if (semanticIdentityIssues.length > 0) {
+    throw new Error(
+        "Semantic staging guardrail failed: " +
+        semanticIdentityIssues.length +
+        " source row(s) contain metadata in asset/indication identity fields; sample=" +
+        JSON.stringify(
+            semanticIdentityIssues.slice(0, 3)
+        ).slice(0, 800)
+    );
+}
+
+const pf = {
+    company: field(portfolioTable, "Company"),
+    asset: field(portfolioTable, "Brand / Asset"),
+    molecule: field(portfolioTable, "Molecule / INN"),
+    devCode: field(portfolioTable, "Development Code"),
+    aliases: field(portfolioTable, "Asset Aliases / Former Codes"),
+    indication: field(portfolioTable, "Indication"),
+    controlled: field(portfolioTable, "Indication (Controlled)", false),
+    setting: field(portfolioTable, "Treatment Setting / Line", false),
+    biomarker: field(portfolioTable, "Biomarker / Patient Segment", false),
+    status: field(portfolioTable, "Portfolio Status", false),
+    phase: field(portfolioTable, "Development Phase")
+};
+
+const indicationName = field(indicationsTable, "Indication");
+const indicationAlias = field(
+    indicationsTable,
+    "Aliases / Source Terms",
+    false
+);
+
+const indicationQuery =
+    await indicationsTable.selectRecordsAsync({
+        fields: [indicationName].concat(
+            indicationAlias
+                ? [indicationAlias]
+                : []
+        )
+    });
+
+const indicationMeta = new Map();
+
+for (const r of indicationQuery.records) {
+    indicationMeta.set(
+        r.id,
+        {
+            name: text(r, indicationName),
+            aliases:
+                indicationAlias
+                    ? splitTerms(text(r, indicationAlias))
+                    : []
+        }
+    );
+}
+
+const portfolioQuery =
+    await portfolioTable.selectRecordsAsync({
+        fields: Object.values(pf).filter(Boolean)
+    });
+
+/*
+Portfolio identity alias bridge V4.4.1
+-------------------------------------
+Some legacy Portfolio rows represent multiple named components in one
+Brand / Asset value, e.g.
+"Cenvacibart / REGN7508 and Amrecibart / REGN9933".
+Do not rewrite the Portfolio master here. Instead expose only deterministic
+"name / development-code" pairs as comparator aliases so current source rows
+can resolve to the existing identity without unsafe free-form token splitting.
+*/
+function portfolioCompositeIdentityAliases(
+    asset,
+    molecule,
+    developmentCode,
+    existingAliases
+) {
+    const out = [];
+    const add = value => {
+        const v = clean(value);
+        if (!v) return;
+        if (!out.some(x => norm(x) === norm(v))) {
+            out.push(v);
+        }
+    };
+
+    for (const a of (existingAliases || [])) add(a);
+    add(developmentCode);
+
+    for (const label of [asset, molecule]) {
+        const raw = clean(label);
+        if (!raw) continue;
+
+        const components = raw.split(
+            /\s+(?:and|or)\s+|\s*[+±]\s*/i
+        );
+
+        for (const component of components) {
+            if (!component.includes("/")) continue;
+
+            const pieces = component
+                .split(/\s*\/\s*/)
+                .map(clean)
+                .filter(Boolean);
+
+            const hasDevelopmentCode = pieces.some(piece => {
+                const compact = piece.replace(/\s+/g, "");
+                return (
+                    compact.length >= 4 &&
+                    compact.length <= 30 &&
+                    /[A-Za-z]/.test(compact) &&
+                    /\d/.test(compact) &&
+                    !/^NCT/i.test(compact) &&
+                    /^[A-Za-z][A-Za-z0-9-]*$/.test(compact)
+                );
+            });
+
+            if (!hasDevelopmentCode) continue;
+
+            for (const piece of pieces) add(piece);
+        }
+    }
+
+    return out;
+}
+
+const portfolioRows = [];
+
+for (const r of portfolioQuery.records) {
+    const companyLinks = linkIds(r, pf.company);
+
+    if (!companyLinks.includes(companyId)) {
+        continue;
+    }
+
+    const controlledIds =
+        pf.controlled
+            ? linkIds(r, pf.controlled)
+            : [];
+
+    const controlledNames = [];
+    const indicationAliases = [];
+
+    for (const id of controlledIds) {
+        const meta = indicationMeta.get(id);
+
+        if (!meta) continue;
+
+        if (meta.name) {
+            controlledNames.push(meta.name);
+        }
+
+        for (const a of meta.aliases) {
+            indicationAliases.push(a);
+        }
+    }
+
+    portfolioRows.push({
+        recordId: r.id,
+        company: companyName,
+        asset: text(r, pf.asset) || null,
+        molecule: text(r, pf.molecule) || null,
+        developmentCode: text(r, pf.devCode) || null,
+        brand: text(r, pf.asset) || null,
+        aliases:
+            portfolioCompositeIdentityAliases(
+                text(r, pf.asset),
+                text(r, pf.molecule),
+                text(r, pf.devCode),
+                splitTerms(text(r, pf.aliases))
+            ),
+        indication: text(r, pf.indication) || null,
+        controlledIndication:
+            controlledNames.join("; ") || null,
+        indicationAliases:
+            Array.from(
+                new Set(
+                    controlledNames.concat(indicationAliases)
+                )
+            ),
+        treatmentSettingLine:
+            splitTerms(text(r, pf.setting)),
+        biomarkerPatientSegment:
+            text(r, pf.biomarker) || null,
+        portfolioStatus:
+            selectName(r, pf.status) || null,
+        phase:
+            selectName(r, pf.phase) || null
+    });
+}
+
+/*
+Comparator preprocessing V4.4.0
+-------------------------------
+1) Normalize source asset labels such as "AMRECIBART (REGN9933)" into
+   canonical asset + development-code identity before comparison.
+2) Split semicolon/newline multi-indication source cards only when every
+   segment independently resolves to the controlled indication vocabulary.
+   This prevents one source card from collapsing distinct programmes while
+   avoiding unsafe splits of free-text qualifiers.
+*/
+
+const knownIndicationTerms = [];
+for (const meta of indicationMeta.values()) {
+    const terms = [meta.name].concat(meta.aliases || []);
+    for (const term of terms) {
+        const cleaned = clean(term);
+        if (!cleaned) continue;
+        knownIndicationTerms.push({
+            raw: cleaned,
+            normalized: norm(cleaned)
+        });
+    }
+}
+
+function isDevelopmentCodeLike(value) {
+    const v = clean(value).replace(/\s+/g, "");
+    if (!v || v.length < 4 || v.length > 30) return false;
+    if (!/[A-Za-z]/.test(v) || !/\d/.test(v)) return false;
+    if (/^(phase|stage|dose|age|year|years|mg|mcg|kg|nct)/i.test(v)) {
+        return false;
+    }
+    return /^[A-Za-z][A-Za-z0-9-]*$/.test(v);
+}
+
+function normalizeSourceAssetIdentity(row) {
+    const rawAsset = clean(
+        row.asset ||
+        row.brand ||
+        row.molecule ||
+        row.developmentCode
+    );
+
+    if (!rawAsset) {
+        return {
+            rawAsset: "",
+            asset: "",
+            developmentCode: clean(row.developmentCode),
+            normalized: false,
+            extractedCodes: []
+        };
+    }
+
+    const extractedCodes = [];
+    let normalizedAsset = rawAsset;
+
+    normalizedAsset = normalizedAsset.replace(
+        /\(([^()]*)\)/g,
+        (whole, inner) => {
+            const tokens = clean(inner)
+                .split(/[,;|/]+/)
+                .map(clean)
+                .filter(Boolean);
+
+            const codes = tokens
+                .map(x => x.replace(/\s+/g, ""))
+                .filter(isDevelopmentCodeLike);
+
+            if (!codes.length) {
+                return whole;
+            }
+
+            for (const code of codes) {
+                if (!extractedCodes.includes(code)) {
+                    extractedCodes.push(code);
+                }
+            }
+
+            return " ";
+        }
+    );
+
+    normalizedAsset = clean(normalizedAsset);
+
+    const existingDevelopmentCode =
+        clean(row.developmentCode);
+
+    return {
+        rawAsset,
+        asset: normalizedAsset || rawAsset,
+        developmentCode:
+            existingDevelopmentCode ||
+            extractedCodes[0] ||
+            "",
+        normalized:
+            norm(normalizedAsset || rawAsset) !== norm(rawAsset) ||
+            (!existingDevelopmentCode && extractedCodes.length > 0),
+        extractedCodes
+    };
+}
+
+function indicationSegmentResolves(value) {
+    const raw = clean(value);
+    if (!raw) return false;
+
+    const withoutTrailingAcronym = clean(
+        raw.replace(
+            /\s*\(\s*["“”']*[A-Za-z0-9-]{2,12}["“”']*\s*\)\s*$/,
+            ""
+        )
+    );
+
+    const variants = Array.from(
+        new Set(
+            [norm(raw), norm(withoutTrailingAcronym)]
+                .filter(Boolean)
+        )
+    );
+
+    for (const sourceNorm of variants) {
+        const paddedSource = " " + sourceNorm + " ";
+
+        for (const term of knownIndicationTerms) {
+            const t = term.normalized;
+            if (!t) continue;
+
+            if (sourceNorm === t) {
+                return true;
+            }
+
+            // Long disease names and short clinical abbreviations such as
+            // VTE/ATTR are allowed when they appear as complete tokens.
+            if (
+                (t.length >= 4 || /^[a-z0-9]{2,6}$/.test(t)) &&
+                paddedSource.includes(" " + t + " ")
+            ) {
+                return true;
+            }
+        }
+    }
+
+    return false;
+}
+
+function splitSourceIndication(value) {
+    const original = clean(value);
+    if (!original) return [""];
+
+    const parts = original
+        .split(/\s*;\s*|\n+/)
+        .map(clean)
+        .filter(Boolean);
+
+    if (parts.length <= 1) {
+        return [original];
+    }
+
+    if (parts.every(indicationSegmentResolves)) {
+        return parts;
+    }
+
+    return [original];
+}
+
+let sourceIdentityNormalizationCount = 0;
+let multiIndicationSourceRowCount = 0;
+let comparisonRowCount = 0;
+
+const mappedSourceRows = [];
+
+for (let i = 0; i < sourceRows.length; i++) {
+    const r = sourceRows[i] || {};
+    const phase = clean(r.phase || r.sourceStage);
+
+    const baseSourceRecordId =
+        clean(
+            r.sourceRecordId ||
+            r.sourceCardOrdinal ||
+            r.recordId ||
+            String(i + 1)
+        );
+
+    const identity =
+        normalizeSourceAssetIdentity(r);
+
+    if (identity.normalized) {
+        sourceIdentityNormalizationCount++;
+    }
+
+    const indicationSegments =
+        splitSourceIndication(r.indication);
+
+    if (indicationSegments.length > 1) {
+        multiIndicationSourceRowCount++;
+    }
+
+    for (
+        let segmentIndex = 0;
+        segmentIndex < indicationSegments.length;
+        segmentIndex++
+    ) {
+        const segment =
+            indicationSegments[segmentIndex];
+
+        const splitRecordId =
+            indicationSegments.length > 1
+                ? (
+                    baseSourceRecordId +
+                    "::split:" +
+                    String(segmentIndex + 1)
+                )
+                : baseSourceRecordId;
+
+        const brandRaw = clean(r.brand);
+        const moleculeRaw = clean(r.molecule);
+
+        const normalizedBrand =
+            identity.normalized &&
+            brandRaw &&
+            norm(brandRaw) === norm(identity.rawAsset)
+                ? identity.asset
+                : brandRaw;
+
+        const normalizedMolecule =
+            identity.normalized &&
+            moleculeRaw &&
+            norm(moleculeRaw) === norm(identity.rawAsset)
+                ? identity.asset
+                : moleculeRaw;
+
+        mappedSourceRows.push({
+            company: companyName,
+            sourceFamily: "Company Pipeline",
+            sourceRecordId:
+                splitRecordId,
+            sourceUrl:
+                clean(
+                    r.sourceUrl ||
+                    external.sourceUrl ||
+                    text(sw, swf.sourceUrl)
+                ),
+            sourceWatchRecordId:
+                sourceWatchRecordId,
+            asset:
+                identity.asset || null,
+            molecule:
+                normalizedMolecule || null,
+            developmentCode:
+                identity.developmentCode || null,
+            brand:
+                normalizedBrand || null,
+            indication:
+                segment || null,
+            controlledIndicationCandidate:
+                indicationSegments.length > 1
+                    ? null
+                    : (
+                        clean(
+                            r.controlledIndicationCandidate
+                        ) || null
+                    ),
+            phase:
+                phase || null,
+            programStatus:
+                clean(
+                    r.programStatus ||
+                    r.status ||
+                    "Active"
+                ),
+            sponsorOwner:
+                clean(
+                    r.sponsorOwner ||
+                    companyName
+                ),
+            partners:
+                Array.isArray(r.partners)
+                    ? r.partners
+                        .map(clean)
+                        .filter(Boolean)
+                    : [],
+            sourceUnavailable: false,
+            ownershipResolved: true,
+            strategicPhase1: false,
+            importantLabelExpansion: false,
+            marketedStrategicRx:
+                /approved|marketed/i.test(phase),
+            genericCommodity: false
+        });
+
+        comparisonRowCount++;
+
+        const baseContext =
+            sourceContextByRecordId.get(
+                baseSourceRecordId
+            ) || {};
+
+        if (
+            identity.normalized ||
+            indicationSegments.length > 1
+        ) {
+            sourceContextByRecordId.set(
+                splitRecordId,
+                {
+                    ...baseContext,
+                    originalAsset:
+                        identity.rawAsset || "",
+                    normalizedAsset:
+                        identity.asset || "",
+                    extractedDevelopmentCodes:
+                        identity.extractedCodes,
+                    originalIndication:
+                        clean(r.indication),
+                    comparisonIndication:
+                        segment,
+                    sourcePreprocessingVersion:
+                        "V4.4.1"
+                }
+            );
+        } else if (
+            splitRecordId !== baseSourceRecordId &&
+            Object.keys(baseContext).length > 0
+        ) {
+            sourceContextByRecordId.set(
+                splitRecordId,
+                baseContext
+            );
+        }
+    }
+}
+
+/* ------------------------------------------------------------
+Shared source-row identity contract.
+
+Within one Source Watch extraction, Source Record ID / Key is the durable
+row identity after any deterministic multi-indication split. The same key
+must never identify two current rows. Fail closed before comparator/staging
+writes if an adapter violates this contract.
+------------------------------------------------------------ */
+const currentSourceRowsByStableKey = new Map();
+const duplicateCurrentStableKeys = [];
+for (const row of mappedSourceRows) {
+    const key = clean(row && row.sourceRecordId);
+    if (!key) {
+        throw new Error(
+            "SOURCE_STABLE_KEY_CONTRACT_FAILED blank sourceRecordId"
+        );
+    }
+    if (!currentSourceRowsByStableKey.has(key)) {
+        currentSourceRowsByStableKey.set(key, []);
+    }
+    currentSourceRowsByStableKey.get(key).push(row);
+}
+for (const [key, rows] of currentSourceRowsByStableKey.entries()) {
+    if (rows.length > 1) {
+        duplicateCurrentStableKeys.push({
+            stableSourceRecordKey: key,
+            rowCount: rows.length,
+            assets: rows.map(x => clean(x.asset)),
+            indications: rows.map(x => clean(x.indication))
+        });
+    }
+}
+if (duplicateCurrentStableKeys.length > 0) {
+    throw new Error(
+        "SOURCE_STABLE_KEY_CONTRACT_FAILED duplicate current source keys=" +
+        JSON.stringify(duplicateCurrentStableKeys).slice(0, 4000)
+    );
+}
+
+const batchRunId =
+    "DISCOVERY|" +
+    sourceWatchRecordId +
+    "|" +
+    new Date().toISOString();
+
+const COMPARATOR_BATCH_SIZE = 24;
+const comparisonCandidates = [];
+let comparatorVersion = '';
+for (let offset = 0; offset < mappedSourceRows.length; offset += COMPARATOR_BATCH_SIZE) {
+    const part = mappedSourceRows.slice(offset, offset + COMPARATOR_BATCH_SIZE);
+    let response;
+    try {
+        response = await jsonRequest(
+            ADAPTER_BASE_URL + '/compare/portfolio-discovery',
+            {method:'POST',headers:{'Accept':'application/json','Content-Type':'application/json','X-Adapter-Key':adapterApiKey},
+             body:JSON.stringify({company:companyName,sourceRows:part,portfolioRows,companyAliases,batchRunId})},
+            1
+        );
+    } catch (error) {
+        throw new Error('COMPARATOR_BATCH_FAILED offset=' + offset + ' size=' + part.length + ': ' + String(error.message || error));
+    }
+    if (!response || response.readOnly !== true || !Array.isArray(response.candidates) ||
+        response.candidates.length !== part.length || Number(response.sourceRowCount) !== part.length ||
+        !response.version || (comparatorVersion && response.version !== comparatorVersion) ||
+        response.candidates.some((candidate,index) => String(candidate.sourceRecordId) !== String(part[index].sourceRecordId))) {
+        throw new Error('COMPARATOR_BATCH_CONTRACT_FAILED offset=' + offset);
+    }
+    comparatorVersion = response.version;
+    comparisonCandidates.push(...response.candidates);
+}
+if (comparisonCandidates.length !== mappedSourceRows.length) throw new Error('COMPARATOR_INCOMPLETE: fail closed before writes');
+const comparison = {readOnly:true, version:comparatorVersion, candidates:comparisonCandidates};
+
+/*
+Source classification cross-field identity gate. Compare every proposed
+NEW ASSET to exact names of existing company Portfolio assets/molecules/
+brands/development codes/recorded aliases. A marketed brand may be stored
+as Brand / Asset while the source uses the INN as its asset name.
+An identity collision is a review hold, never an exact programme match.
+*/
+const knownPortfolioIdentity = new Map();
+for (const p of portfolioRows) {
+    const tokens = [
+        p.asset, p.molecule, p.brand, p.developmentCode,
+        ...(Array.isArray(p.aliases) ? p.aliases : [])
+    ];
+    for (const token of tokens) {
+        const key = norm(token);
+        if (!key || key.length < 4) continue;
+        if (!knownPortfolioIdentity.has(key)) {
+            knownPortfolioIdentity.set(key, new Set());
+        }
+        knownPortfolioIdentity.get(key).add(p.recordId);
+    }
+}
+let sameAssetNewAssetHolds = 0;
+for (const c of comparison.candidates) {
+    if (c.classification !== "NEW ASSET") continue;
+    const keys = [c.asset, c.molecule, c.brand, c.developmentCode]
+        .map(norm).filter(key => key && key.length >= 4);
+    const ids = new Set();
+    for (const key of keys) {
+        for (const id of (knownPortfolioIdentity.get(key) || [])) ids.add(id);
+    }
+    if (!ids.size) continue;
+    const why = "EXACT_CROSS_FIELD_IDENTITY_HOLD: source asset/INN/brand/code matches " + ids.size + " existing same-company Portfolio identity row(s): " + [...ids].slice(0, 8).join(", ") + ". Programme, indication, setting, regimen and population must be verified before any master write.";
+    c.classification = "POSSIBLE DUPLICATE";
+    c.matchMethod = "Ambiguous";
+    c.matchConfidence = "Low";
+    c.commercialInclusionDecision = "Review";
+    c.reviewReason = [clean(c.reviewReason), why].filter(Boolean).join(" | ");
+    c.matchEvidence = [...(Array.isArray(c.matchEvidence) ? c.matchEvidence : []), why];
+    sameAssetNewAssetHolds++;
+}
+const cf = {
+    id: field(candidateTable, "Discovery Candidate ID"),
+    company: field(candidateTable, "Company"),
+    sourceWatch: field(candidateTable, "Source Watch"),
+    family: field(candidateTable, "Discovery Source Family"),
+    classification: field(candidateTable, "Discovery Classification"),
+    reviewStatus: field(candidateTable, "Review Status"),
+    asset: field(candidateTable, "Source Asset Name"),
+    molecule: field(candidateTable, "Source Molecule / INN"),
+    devCode: field(candidateTable, "Source Development Code"),
+    brand: field(candidateTable, "Source Brand"),
+    indication: field(candidateTable, "Source Indication"),
+    canonicalIndication:
+        field(
+            candidateTable,
+            "Canonical Indication Candidate"
+        ),
+    phase: field(candidateTable, "Source Phase"),
+    programStatus:
+        field(
+            candidateTable,
+            "Source Program Status"
+        ),
+    owner:
+        field(
+            candidateTable,
+            "Source Sponsor / Owner"
+        ),
+    partners:
+        field(
+            candidateTable,
+            "Source Partners"
+        ),
+    sourceRecord:
+        field(
+            candidateTable,
+            "Source Record ID / Key"
+        ),
+    sourceUrl:
+        field(
+            candidateTable,
+            "Source URL"
+        ),
+    existingMatch:
+        field(
+            candidateTable,
+            "Existing Portfolio Match"
+        ),
+    matchMethod:
+        field(
+            candidateTable,
+            "Match Method"
+        ),
+    confidence:
+        field(
+            candidateTable,
+            "Match Confidence"
+        ),
+    decision:
+        field(
+            candidateTable,
+            "Commercial Inclusion Decision"
+        ),
+    basis:
+        field(
+            candidateTable,
+            "Inclusion Basis"
+        ),
+    reason:
+        field(
+            candidateTable,
+            "Exclusion / Review Reason"
+        ),
+    evidence:
+        field(
+            candidateTable,
+            "Evidence Summary"
+        ),
+    latestStagingEvidence:
+        field(candidateTable, "Latest Staging Evidence"),
+    batch:
+        field(
+            candidateTable,
+            "Discovery Batch / Run ID"
+        ),
+    firstDetected:
+        field(
+            candidateTable,
+            "First Detected"
+        ),
+    lastChecked:
+        field(
+            candidateTable,
+            "Last Checked"
+        ),
+    sourceScope: field(candidateTable, "Source Scope Granularity"),
+    programmeGate: field(candidateTable, "Programme Reconciliation Gate"),
+    reconciliationException: field(candidateTable, "Reconciliation Exception Type", false),
+    nextVerificationGate: field(candidateTable, "Next Verification Gate", false),
+    programmeNextAction: field(candidateTable, "Programme Review Next Action", false)
+};
+
+const existingCandidatesQuery =
+    await candidateTable.selectRecordsAsync({
+        fields: [
+            cf.id,
+            cf.company,
+            cf.sourceWatch,
+            cf.sourceRecord,
+            cf.reviewStatus,
+            cf.firstDetected,
+            cf.sourceScope,
+            cf.classification,
+            cf.programmeGate,
+            cf.reconciliationException,
+            cf.nextVerificationGate,
+            cf.programmeNextAction,
+            cf.decision
+        ].filter(Boolean)
+    });
+
+function durableCandidateSourceKey(watchId, sourceRecordId) {
+    return clean(watchId) + "|" + clean(sourceRecordId);
+}
+
+const existingById = new Map();
+const activeExistingByStableKey = new Map();
+const supersededExistingByStableKey = new Map();
+
+for (const r of existingCandidatesQuery.records) {
+    const candidateId = text(r, cf.id);
+    if (candidateId) {
+        if (!existingById.has(candidateId)) {
+            existingById.set(candidateId, []);
+        }
+        existingById.get(candidateId).push(r);
+    }
+
+    const watchIds = linkIds(r, cf.sourceWatch);
+    const sourceRecordId = text(r, cf.sourceRecord);
+    if (watchIds.length !== 1 || !sourceRecordId) {
+        continue;
+    }
+
+    const stableKey =
+        durableCandidateSourceKey(
+            watchIds[0],
+            sourceRecordId
+        );
+    const status = selectName(r, cf.reviewStatus);
+    const targetMap =
+        status === "Superseded"
+            ? supersededExistingByStableKey
+            : activeExistingByStableKey;
+
+    if (!targetMap.has(stableKey)) {
+        targetMap.set(stableKey, []);
+    }
+    targetMap.get(stableKey).push(r);
+}
+
+function mappedMatchMethod(value) {
+    const allowed = new Set([
+        "Exact Molecule / INN",
+        "Exact Brand",
+        "Exact Development Code",
+        "Verified Alias",
+        "Composite Exact Identity",
+        "No Match",
+        "Ambiguous"
+    ]);
+
+    if (allowed.has(value)) {
+        return value;
+    }
+
+    if (value === "Exact Asset") {
+        return "Composite Exact Identity";
+    }
+
+    return value
+        ? "Ambiguous"
+        : "No Match";
+}
+
+function reviewStatusFor(c) {
+    const semanticReview =
+        semanticReviewBySourceRecordId.get(
+            clean(c.sourceRecordId)
+        );
+
+    if (
+        semanticReview ||
+        c.classification === "POSSIBLE DUPLICATE" ||
+        c.classification === "OWNERSHIP REVIEW" ||
+        c.classification === "SOURCE UNAVAILABLE" ||
+        c.classification === "MATCHED" ||
+        c.commercialInclusionDecision === "Review"
+    ) {
+        return "Needs Review";
+    }
+
+    return "New";
+}
+
+// Conservative source-scope classifier. This does NOT approve programme matching.
+// A single independently supplied NCT identifies study scope; source cards without
+// verifiable singularity are never labelled programme-specific just from phase/asset.
+function inferSourceScope(c, sourceContext) {
+    const ctx = sourceContext || {};
+    const indication = clean(c.indication);
+    const trialIds = Array.from(new Set(
+        (Array.isArray(ctx.trialIds) ? ctx.trialIds : [])
+            .map(x => clean(x).toUpperCase())
+            .filter(x => /^NCT[0-9]{8}$/.test(x))
+    ));
+    const full = [indication, clean(ctx.description), clean(ctx.additionalInformation), clean(ctx.study)].join(" ");
+    if (/multiple\s+(lines|settings|indications|programmes|programs|cohorts)|various\s+(lines|settings|indications)|across\s+multiple\s+(indications|settings)/i.test(full)) {
+        return {scope: "Asset / phase umbrella", why: "Explicit multiple-programme/setting source wording"};
+    }
+    if (trialIds.length > 1) {
+        return {scope: "Asset / phase umbrella", why: `One source card references ${trialIds.length} trials; no unique programme inference`};
+    }
+    if (trialIds.length === 1 && indication) {
+        return {scope: "Specific trial / protocol", why: `Source adapter supplied exactly one valid official NCT: ${trialIds[0]}`};
+    }
+    return {scope: "Uncertain", why: indication ? "No singular official trial identifier or validated programme-granularity evidence" : "Indication/setting absent from source card"};
+}
+
+function structuredProgrammeHoldState(reason, scopeInference) {
+    if (!reason) return null;
+
+    if (reason === "SEMANTIC_IDENTITY_QA_REQUIRED") {
+        return {
+            exception: "Insufficient Identity Evidence",
+            next:
+                "Re-validate source asset and disease identity from the source structure. A therapy area, mechanism, disease label used as an asset, or other semantic parser artefact cannot become programme-ready.",
+            gate:
+                "Shared semantic QA → Portfolio Reconciliation Preflight V3.1"
+        };
+    }
+
+    if (reason === "CO_INFECTION_INDSET_RECONCILIATION_REQUIRED") {
+        return {
+            exception: "Other",
+            next:
+                "Resolve every simultaneous co-infection disease component to an active controlled indication, then preview one deterministic PFK1 indset. Do not invent a composite controlled disease.",
+            gate:
+                "Portfolio Reconciliation Preflight V3.1 → PFK1 Batch Preflight V1.8"
+        };
+    }
+
+    if (reason === "MULTI_INDICATION_CONTEXT_SPLIT_REQUIRED") {
+        return {
+            exception: "Multi-Programme / Basket Ambiguity",
+            next:
+                "Split independent disease contexts into separate programme identities. Do not collapse independent indications into one PFK1 indset.",
+            gate:
+                "Portfolio Reconciliation Preflight V3.1 → programme-context split → PFK1 Batch Preflight V1.8"
+        };
+    }
+
+    if (reason === "UMBRELLA_SCOPE_RECONCILIATION_REQUIRED") {
+        return {
+            exception:
+                scopeInference && scopeInference.scope === "Asset / phase umbrella"
+                    ? "Multi-Programme / Basket Ambiguity"
+                    : "Broad Indication / Source Scope",
+            next:
+                "Retain the source row as umbrella evidence and reconcile child trial/programme contexts separately before any controlled master review.",
+            gate:
+                "Shared Portfolio Reconciliation Preflight V3.1"
+        };
+    }
+
+    return {
+        exception: "Other",
+        next: "Resolve the shared programme semantic hold before controlled master review.",
+        gate: "Shared Portfolio Reconciliation Preflight V3.1"
+    };
+}
+
+const now = new Date().toISOString();
+
+const stageCandidates =
+    comparison.candidates.filter(c => {
+        if (
+            c.commercialInclusionDecision === "Exclude"
+        ) {
+            return false;
+        }
+
+        const deltas =
+            Array.isArray(c.fieldDeltas)
+                ? c.fieldDeltas
+                : [];
+
+        return (
+            c.classification !== "MATCHED" ||
+            deltas.length > 0
+        );
+    });
+
+const creates = [];
+const updates = [];
+let programmeSemanticHoldCount = 0;
+const programmeSemanticHoldReasons = {};
+
+for (const c of stageCandidates) {
+    const candidateId =
+        clean(c.discoveryCandidateId);
+
+    if (!candidateId) {
+        throw new Error(
+            "Comparator candidate missing discoveryCandidateId."
+        );
+    }
+
+    const sourceRecordId =
+        clean(c.sourceRecordId);
+    if (!sourceRecordId) {
+        throw new Error(
+            "CANDIDATE_STABLE_KEY_CONTRACT_FAILED comparator candidate missing sourceRecordId"
+        );
+    }
+
+    const durableKey =
+        durableCandidateSourceKey(
+            sourceWatchRecordId,
+            sourceRecordId
+        );
+    const activeStableMatches =
+        activeExistingByStableKey.get(durableKey) || [];
+    const supersededStableMatches =
+        supersededExistingByStableKey.get(durableKey) || [];
+    const candidateIdMatches =
+        existingById.get(candidateId) || [];
+
+    if (activeStableMatches.length > 1) {
+        throw new Error(
+            "CANDIDATE_STABLE_KEY_CONTRACT_FAILED multiple active Candidates stableKey=" +
+            durableKey +
+            " recordIds=" +
+            activeStableMatches.map(x => x.id).join(",")
+        );
+    }
+    if (candidateIdMatches.length > 1) {
+        throw new Error(
+            "CANDIDATE_ID_CONTRACT_FAILED duplicate Discovery Candidate ID=" +
+            candidateId +
+            " recordIds=" +
+            candidateIdMatches.map(x => x.id).join(",")
+        );
+    }
+
+    let existing = null;
+    if (activeStableMatches.length === 1) {
+        existing = activeStableMatches[0];
+
+        if (
+            candidateIdMatches.length === 1 &&
+            candidateIdMatches[0].id !== existing.id
+        ) {
+            throw new Error(
+                "CANDIDATE_ID_STABLE_KEY_CONFLICT candidateId=" +
+                candidateId +
+                " stableKey=" +
+                durableKey +
+                " candidateIdRecord=" +
+                candidateIdMatches[0].id +
+                " stableKeyRecord=" +
+                existing.id
+            );
+        }
+    } else if (supersededStableMatches.length > 0) {
+        throw new Error(
+            "CANDIDATE_STABLE_KEY_CONTRACT_FAILED superseded history without active Candidate stableKey=" +
+            durableKey +
+            " recordIds=" +
+            supersededStableMatches.map(x => x.id).join(",")
+        );
+    } else if (candidateIdMatches.length === 1) {
+        throw new Error(
+            "CANDIDATE_ID_STABLE_KEY_CONFLICT Discovery Candidate ID exists under a different durable source key candidateId=" +
+            candidateId +
+            " recordId=" +
+            candidateIdMatches[0].id +
+            " expectedStableKey=" +
+            durableKey
+        );
+    }
+
+    let reviewStatus =
+        reviewStatusFor(c);
+
+    if (existing) {
+        const currentStatus =
+            selectName(
+                existing,
+                cf.reviewStatus
+            );
+
+        if (
+            [
+                "Reviewed - Include",
+                "Reviewed - Exclude",
+                "Needs Review",
+                "Superseded",
+                "Resolved"
+            ].includes(currentStatus)
+        ) {
+            reviewStatus =
+                currentStatus;
+        }
+    }
+
+    /*
+    Respect prior reviewed exclusions and in-progress programme gates.
+    Restaging may refresh source evidence, but must not silently turn a
+    quarantined parser artefact back into NEW ASSET or remove its review hold.
+    */
+    if (existing) {
+        const priorGate = selectName(existing, cf.programmeGate);
+        const priorClass = selectName(existing, cf.classification);
+        if (priorGate === "Out of Programme Scope" &&
+            priorClass === "EXCLUDED BY RULE") {
+            c.classification = "EXCLUDED BY RULE";
+        } else if (priorGate === "Evidence Captured – Scope Unresolved" &&
+            priorClass === "POSSIBLE DUPLICATE" &&
+            c.classification === "NEW ASSET") {
+            c.classification = "POSSIBLE DUPLICATE";
+        }
+        if (priorGate && priorGate !== "Unassessed" &&
+            ["New", "Needs Review"].includes(selectName(existing, cf.reviewStatus))) {
+            reviewStatus = "Needs Review";
+        }
+    }
+    const evidenceBits = [];
+
+    if (
+        Array.isArray(c.matchEvidence) &&
+        c.matchEvidence.length
+    ) {
+        evidenceBits.push(
+            "Match evidence: " +
+            c.matchEvidence.join("; ")
+        );
+    }
+
+    if (
+        Array.isArray(c.fieldDeltas) &&
+        c.fieldDeltas.length
+    ) {
+        evidenceBits.push(
+            "Field deltas: " +
+            JSON.stringify(c.fieldDeltas)
+        );
+    }
+
+    const semanticReview =
+        semanticReviewBySourceRecordId.get(
+            clean(c.sourceRecordId)
+        );
+
+    if (semanticReview) {
+        evidenceBits.push(
+            "Semantic QA hold: " +
+            JSON.stringify(semanticReview)
+        );
+    }
+
+    const sourceContext =
+        sourceContextByRecordId.get(
+            clean(c.sourceRecordId)
+        );
+
+    if (sourceContext) {
+        evidenceBits.push(
+            "Source context: " +
+            JSON.stringify(sourceContext)
+        );
+    }
+
+    const scopeInference = inferSourceScope(c, sourceContext);
+
+    /*
+    Shared programme-semantic safety hold. Staging V4 does not approve
+    programme readiness, but it must also clear any stale machine-derived
+    Ready gate when semantic identity is unresolved.
+    */
+    const sourceIndicationForProgramme = clean(c.indication);
+    let programmeSemanticHoldReason = "";
+
+    if (semanticReview) {
+        programmeSemanticHoldReason =
+            "SEMANTIC_IDENTITY_QA_REQUIRED";
+    } else if (
+        /\bco[- ]?infection\b|\bcoinfection\b/i.test(
+            sourceIndicationForProgramme
+        )
+    ) {
+        programmeSemanticHoldReason =
+            "CO_INFECTION_INDSET_RECONCILIATION_REQUIRED";
+    } else if (
+        clean(c.classification) ===
+        "MULTI-INDICATION REVIEW"
+    ) {
+        programmeSemanticHoldReason =
+            "MULTI_INDICATION_CONTEXT_SPLIT_REQUIRED";
+    } else if (
+        scopeInference.scope ===
+        "Asset / phase umbrella"
+    ) {
+        programmeSemanticHoldReason =
+            "UMBRELLA_SCOPE_RECONCILIATION_REQUIRED";
+    }
+
+    if (programmeSemanticHoldReason) {
+        programmeSemanticHoldCount += 1;
+        programmeSemanticHoldReasons[
+            programmeSemanticHoldReason
+        ] =
+            (
+                programmeSemanticHoldReasons[
+                    programmeSemanticHoldReason
+                ] || 0
+            ) + 1;
+        reviewStatus = "Needs Review";
+        evidenceBits.push(
+            "Programme semantic hold: " +
+            programmeSemanticHoldReason +
+            ". Resolve through the shared Portfolio Reconciliation Preflight before programme readiness."
+        );
+    }
+
+    evidenceBits.push("Source scope inference V2: " + scopeInference.scope + " | " + scopeInference.why + ". This is not programme reconciliation approval.");
+
+    evidenceBits.push(
+        "Comparator: " +
+        clean(comparison.version)
+    );
+
+    evidenceBits.push(
+        "Adapter: " +
+        adapterProfile
+    );
+
+    const fields = {};
+
+    const persistedCandidateId =
+        existing
+            ? text(existing, cf.id)
+            : candidateId;
+    if (!persistedCandidateId) {
+        throw new Error(
+            "CANDIDATE_ID_CONTRACT_FAILED blank persisted Candidate ID stableKey=" +
+            durableKey
+        );
+    }
+
+    fields[cf.id.id] =
+        persistedCandidateId;
+
+    fields[cf.company.id] =
+        [{id: companyId}];
+
+    fields[cf.sourceWatch.id] =
+        [{id: sourceWatchRecordId}];
+
+    fields[cf.family.id] =
+        {name: "Company Pipeline"};
+
+    fields[cf.classification.id] =
+        {name: clean(c.classification)};
+
+    fields[cf.reviewStatus.id] =
+        {name: reviewStatus};
+
+    // Preserve any human-reviewed or previously verified scope on upsert.
+    const existingScope = existing ? selectName(existing, cf.sourceScope) : "";
+    if (!existingScope) {
+        fields[cf.sourceScope.id] = {name: scopeInference.scope};
+    }
+
+    const structuredHoldState =
+        structuredProgrammeHoldState(
+            programmeSemanticHoldReason,
+            scopeInference
+        );
+
+    if (structuredHoldState) {
+        const priorException =
+            existing && cf.reconciliationException
+                ? selectName(existing, cf.reconciliationException)
+                : "";
+        const priorNext =
+            existing && cf.programmeNextAction
+                ? text(existing, cf.programmeNextAction)
+                : "";
+        const priorVerification =
+            existing && cf.nextVerificationGate
+                ? text(existing, cf.nextVerificationGate)
+                : "";
+
+        if (cf.reconciliationException && !priorException) {
+            fields[cf.reconciliationException.id] = {
+                name: structuredHoldState.exception
+            };
+        }
+        if (cf.programmeNextAction && !priorNext) {
+            fields[cf.programmeNextAction.id] =
+                structuredHoldState.next;
+        }
+        if (cf.nextVerificationGate && !priorVerification) {
+            fields[cf.nextVerificationGate.id] =
+                structuredHoldState.gate;
+        }
+    }
+
+    if (cf.programmeGate && programmeSemanticHoldReason) {
+        const currentGate =
+            existing
+                ? selectName(existing, cf.programmeGate)
+                : "";
+
+        if (
+            [
+                "",
+                "Unassessed",
+                "Ready for Controlled Master Review"
+            ].includes(currentGate)
+        ) {
+            fields[cf.programmeGate.id] = {
+                name: "Evidence Captured – Scope Unresolved"
+            };
+        }
+    }
+
+    fields[cf.asset.id] =
+        clean(c.asset);
+
+    fields[cf.molecule.id] =
+        clean(c.molecule);
+
+    fields[cf.devCode.id] =
+        clean(c.developmentCode);
+
+    fields[cf.brand.id] =
+        clean(c.brand);
+
+    fields[cf.indication.id] =
+        clean(c.indication);
+
+    fields[cf.canonicalIndication.id] =
+        clean(
+            c.controlledIndicationCandidate
+        );
+
+    fields[cf.phase.id] =
+        clean(c.phase);
+
+    fields[cf.programStatus.id] =
+        clean(c.programStatus);
+
+    fields[cf.owner.id] =
+        clean(c.sponsorOwner);
+
+    fields[cf.partners.id] =
+        Array.isArray(c.partners)
+            ? c.partners
+                .map(clean)
+                .filter(Boolean)
+                .join("; ")
+            : "";
+
+    fields[cf.sourceRecord.id] =
+        clean(c.sourceRecordId);
+
+    fields[cf.sourceUrl.id] =
+        clean(c.sourceUrl);
+
+    fields[cf.existingMatch.id] =
+        (
+            Array.isArray(
+                c.existingPortfolioRecordIds
+            )
+                ? c.existingPortfolioRecordIds
+                : []
+        )
+            .filter(
+                x =>
+                    /^rec[A-Za-z0-9]{14}$/.test(x)
+            )
+            .map(id => ({id}));
+
+    fields[cf.matchMethod.id] =
+        {
+            name:
+                mappedMatchMethod(
+                    clean(c.matchMethod)
+                )
+        };
+
+    fields[cf.confidence.id] =
+        {
+            name:
+                clean(
+                    c.matchConfidence ||
+                    "Low"
+                )
+        };
+
+    // Preserve a completed review's commercial decision as well as its
+    // status, scope, gate, narrative and classification. A parser artefact
+    // excluded from programme scope can never silently become Include.
+    const priorReviewStatus = existing
+        ? selectName(existing, cf.reviewStatus)
+        : "";
+    const priorDecision = existing
+        ? selectName(existing, cf.decision)
+        : "";
+    const priorProgrammeGate = existing
+        ? selectName(existing, cf.programmeGate)
+        : "";
+    const lockedReviewStatus = [
+        "Reviewed - Include",
+        "Reviewed - Exclude",
+        "Resolved",
+        "Superseded"
+    ].includes(priorReviewStatus);
+    const retainedDecision =
+        (priorReviewStatus === "Reviewed - Exclude" ||
+         priorProgrammeGate === "Out of Programme Scope")
+            ? "Exclude"
+            : (
+                lockedReviewStatus &&
+                ["Include", "Exclude", "Review"].includes(priorDecision)
+                    ? priorDecision
+                    : ""
+            );
+
+    fields[cf.decision.id] =
+        {
+            name: retainedDecision ||
+                (semanticReview
+                    ? "Review"
+                    : clean(
+                        c.commercialInclusionDecision ||
+                        "Review"
+                    ))
+        };
+
+    fields[cf.basis.id] =
+        (
+            Array.isArray(c.inclusionBasis)
+                ? c.inclusionBasis
+                : []
+        )
+            .map(x => clean(x))
+            .filter(Boolean)
+            .map(name => ({name}));
+
+    fields[cf.reason.id] =
+        semanticReview
+            ? (
+                "Semantic QA hold: " +
+                semanticReview.reason +
+                (
+                    clean(c.reviewReason)
+                        ? " | " + clean(c.reviewReason)
+                        : ""
+                )
+            )
+            : clean(c.reviewReason);
+
+    fields[cf.evidence.id] =
+        evidenceBits.join("\n");
+
+    // Current machine comparator output has a dedicated overwrite-safe field.
+    // Never replace a reviewer's previously appended notes during upsert.
+    fields[cf.latestStagingEvidence.id] =
+        evidenceBits.concat(
+            clean(c.reviewReason)
+                ? ["Latest comparator review reason: " + clean(c.reviewReason)]
+                : []
+        ).join("\n");
+
+    fields[cf.batch.id] =
+        batchRunId;
+
+    fields[cf.lastChecked.id] =
+        now;
+
+    if (existing) {
+        // Preserve both existing narratives, whether machine-originated or curated.
+        // Fresh comparison evidence is still recorded in Latest Staging Evidence.
+        delete fields[cf.reason.id];
+        delete fields[cf.evidence.id];
+        updates.push({
+            id: existing.id,
+            fields
+        });
+    } else {
+        fields[cf.firstDetected.id] =
+            now;
+
+        creates.push({
+            fields
+        });
+    }
+}
+
+const createdIds = [];
+
+for (
+    let i = 0;
+    i < creates.length;
+    i += 50
+) {
+    const ids =
+        await candidateTable
+            .createRecordsAsync(
+                creates.slice(i, i + 50)
+            );
+
+    if (Array.isArray(ids)) {
+        createdIds.push(...ids);
+    }
+}
+
+for (
+    let i = 0;
+    i < updates.length;
+    i += 50
+) {
+    await candidateTable
+        .updateRecordsAsync(
+            updates.slice(i, i + 50)
+        );
+}
+
+/*
+Bootstrap transition:
+A newly validated canonical pipeline source may have a blank Pipeline Baseline
+Status. Once and only once its adapter passes the same structural guardrails
+and staging completes successfully, move that Source Watch record to
+"Needs Review". This lets the existing Baseline Preflight -> Safety Gate
+workflow pick it up without any company-specific scripting.
+*/
+let baselineStatusAfter =
+    selectName(sw, swf.baselineStatus);
+
+const sourceWatchSuccessFields = {};
+
+if (["", "not established"].includes(baselineStatusBefore)) {
+    sourceWatchSuccessFields[swf.baselineStatus.id] = {
+        name: "Needs Review"
+    };
+    baselineStatusAfter = "Needs Review";
+}
+
+if (swf.lastChecked) {
+    sourceWatchSuccessFields[swf.lastChecked.id] =
+        now;
+}
+
+if (stagingStateNotesField) {
+    const previous =
+        String(
+            sw.getCellValueAsString(
+                stagingStateNotesField
+            ) || ""
+        ).trim();
+
+    const retained =
+        previous
+            .split(/\n+/)
+            .filter(
+                line =>
+                    !line.includes(
+                        "PORTFOLIO_DISCOVERY_STAGING_V4.4.6 SUCCESS"
+                    ) &&
+                    !line.includes(
+                        "PORTFOLIO_DISCOVERY_STAGING_V4.4.6 FAIL CLOSED"
+                    )
+            )
+            .join("\n")
+            .trim();
+
+    const successDiagnostic =
+        "PORTFOLIO_DISCOVERY_STAGING_V4.4.6 SUCCESS " +
+        now +
+        ": sourceRows=" +
+        sourceRows.length +
+        "; stagedCandidates=" +
+        stageCandidates.length +
+        "; semanticReviewRows=" +
+        semanticReviewBySourceRecordId.size +
+        "; created=" +
+        creates.length +
+        "; updated=" +
+        updates.length;
+
+    sourceWatchSuccessFields[
+        stagingStateNotesField.id
+    ] =
+        (
+            retained
+                ? retained + "\n" + successDiagnostic
+                : successDiagnostic
+        ).slice(-10000);
+}
+
+if (Object.keys(sourceWatchSuccessFields).length > 0) {
+    await sourceWatchTable.updateRecordAsync(
+        sw.id,
+        sourceWatchSuccessFields
+    );
+}
+
+const classificationCounts = {};
+
+for (const c of comparison.candidates) {
+    classificationCounts[c.classification] =
+        (
+            classificationCounts[
+                c.classification
+            ] || 0
+        ) + 1;
+}
+
+output.set(
+    "summary",
+    JSON.stringify(
+        {
+            version: VERSION,
+            company: companyName,
+            sourceWatchRecordId,
+            sourceName:
+                text(sw, swf.sourceName),
+            adapterProfile,
+            retrievalMode,
+            baselineStatusBefore:
+                baselineStatusBefore || "BLANK",
+            baselineStatusAfter,
+            sourceRows:
+                sourceRows.length,
+            portfolioRows:
+                portfolioRows.length,
+            comparatorVersion:
+                comparison.version,
+            classificationCounts,
+            stagedCandidates:
+                stageCandidates.length,
+            semanticReviewRows:
+                semanticReviewBySourceRecordId.size,
+            programmeSemanticHoldCount,
+            programmeSemanticHoldReasons,
+            created:
+                creates.length,
+            updated:
+                updates.length,
+            createdRecordIds:
+                createdIds,
+            masterWrites: 0,
+            status:
+                "STAGING COMPLETE - Portfolio remains read-only"
+        },
+        null,
+        2
+    )
+);
+
+} catch (e) {
+    const stagingError = String(
+        (e && e.message) ||
+        e ||
+        "Unknown staging error"
+    ).slice(0, 1200);
+
+    /*
+    Source-level observability for scale.
+
+    Deterministic source/parser failures must not remain production-eligible.
+    Structural and semantic contract failures quarantine only this source
+    binding (not the reusable adapter globally) and reset its baseline to
+    Not Established. Transient transport failures such as 429/5xx remain
+    eligible for retry and are not auto-demoted.
+    */
+    const deterministicSourceFailure =
+        /Source adapter failed staging guardrail|Semantic staging guardrail failed/i
+            .test(stagingError);
+
+    if (deterministicSourceFailure) {
+        try {
+            const failureSw =
+                await sourceWatchTable.selectRecordAsync(
+                    sourceWatchRecordId
+                );
+
+            if (failureSw) {
+                const bindingField =
+                    sourceWatchTable.getField(
+                        "Adapter Binding Status"
+                    );
+                const baselineField =
+                    sourceWatchTable.getField(
+                        "Pipeline Baseline Status"
+                    );
+
+                await sourceWatchTable.updateRecordAsync(
+                    failureSw.id,
+                    {
+                        [bindingField.id]: {
+                            name: "Needs Review"
+                        },
+                        [baselineField.id]: {
+                            name: "Not Established"
+                        }
+                    }
+                );
+            }
+        } catch (_) {
+            // Quarantine bookkeeping failure must not change fail-closed behavior.
+        }
+    }
+
+    if (stagingStateNotesField) {
+        try {
+            const failureSw =
+                await sourceWatchTable.selectRecordAsync(
+                    sourceWatchRecordId
+                );
+
+            if (failureSw) {
+                const previous =
+                    String(
+                        failureSw.getCellValueAsString(
+                            stagingStateNotesField
+                        ) || ""
+                    ).trim();
+
+                const retained =
+                    previous
+                        .split(/\n+/)
+                        .filter(
+                            line =>
+                                !line.includes(
+                                    "PORTFOLIO_DISCOVERY_STAGING_V4.4.6 FAIL CLOSED"
+                                )
+                        )
+                        .join("\n")
+                        .trim();
+
+                const diagnostic =
+                    "PORTFOLIO_DISCOVERY_STAGING_V4.4.6 FAIL CLOSED " +
+                    new Date().toISOString() +
+                    ": " +
+                    stagingError;
+
+                const nextNotes =
+                    (retained ? retained + "\n" : "") +
+                    diagnostic;
+
+                await sourceWatchTable.updateRecordAsync(
+                    failureSw.id,
+                    {
+                        [stagingStateNotesField.id]:
+                            nextNotes.slice(-10000)
+                    }
+                );
+            }
+        } catch (_) {
+            // Observability failure must never convert a safe source skip
+            // into an automation-level failure.
+        }
+    }
+
+    output.set(
+        "summary",
+        JSON.stringify(
+            {
+                version: VERSION,
+                sourceWatchRecordId,
+                error: stagingError,
+                deterministicSourceFailure,
+                sourceBindingQuarantined:
+                    deterministicSourceFailure,
+                masterWrites: 0,
+                status:
+                    "FAIL CLOSED - SOURCE SKIPPED; AUTOMATION CONTINUES"
+            },
+            null,
+            2
+        )
+    );
+}

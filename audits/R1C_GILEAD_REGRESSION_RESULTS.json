@@ -1,0 +1,138 @@
+{
+  "ruleVersion": "R1C_SHARED_RESOLVER_V1_READ_ONLY_DRAFT",
+  "frameworkVersion": "2.22",
+  "status": "BLOCKED — INPUT SNAPSHOT REQUIRED",
+  "testedSourceKeys": 0,
+  "expectedSourceCount": 53,
+  "issues": [
+    "No official row-level Gilead snapshot was supplied"
+  ],
+  "rows": [],
+  "matrixAvailability": "No observed row matrix — snapshot required",
+  "cases": [
+    {
+      "name": "iMMagine-1",
+      "status": "HOLD",
+      "ncts": [
+        "NCT05396885"
+      ],
+      "reasonCodes": [
+        "INPUT_SNAPSHOT_REQUIRED"
+      ],
+      "testedSourceKeys": 0,
+      "syntheticSafetyChecks": {
+        "test_line_mismatch": "PASS",
+        "test_parent_nct_without_arm": "PASS"
+      },
+      "acceptanceProof": "NOT RUN — source-key/record/arm snapshot required"
+    },
+    {
+      "name": "iMMagine-3",
+      "status": "HOLD",
+      "ncts": [
+        "NCT06413498"
+      ],
+      "reasonCodes": [
+        "INPUT_SNAPSHOT_REQUIRED"
+      ],
+      "testedSourceKeys": 0,
+      "syntheticSafetyChecks": {
+        "test_unproved_prior_line_conversion": "PASS",
+        "test_population_mismatch": "PASS"
+      },
+      "acceptanceProof": "NOT RUN — source-key/record/arm snapshot required"
+    },
+    {
+      "name": "ISLEND-1/2",
+      "status": "HOLD",
+      "ncts": [
+        "NCT06630286",
+        "NCT06630299"
+      ],
+      "reasonCodes": [
+        "INPUT_SNAPSHOT_REQUIRED"
+      ],
+      "testedSourceKeys": 0,
+      "syntheticSafetyChecks": {
+        "test_comparator_leakage": "PASS",
+        "test_placebo_leakage": "PASS",
+        "test_single_vs_combination": "PASS"
+      },
+      "acceptanceProof": "NOT RUN — source-key/record/arm snapshot required"
+    },
+    {
+      "name": "NAPISTAR 1-01",
+      "status": "HOLD",
+      "ncts": [
+        "NCT06303505"
+      ],
+      "reasonCodes": [
+        "INPUT_SNAPSHOT_REQUIRED"
+      ],
+      "testedSourceKeys": 0,
+      "syntheticSafetyChecks": {
+        "test_indication_mismatch": "PASS",
+        "test_combination_arm_leakage": "PASS"
+      },
+      "acceptanceProof": "NOT RUN — source-key/record/arm snapshot required"
+    },
+    {
+      "name": "PALISADES-1",
+      "status": "HOLD",
+      "ncts": [
+        "NCT04989803"
+      ],
+      "reasonCodes": [
+        "INPUT_SNAPSHOT_REQUIRED"
+      ],
+      "testedSourceKeys": 0,
+      "syntheticSafetyChecks": {
+        "test_separate_arm_asset_mismatch": "PASS",
+        "test_mixed_arms_as_combination": "PASS"
+      },
+      "acceptanceProof": "NOT RUN — source-key/record/arm snapshot required"
+    },
+    {
+      "name": "ARTISTRY-1/2",
+      "status": "HOLD",
+      "ncts": [
+        "NCT05502341",
+        "NCT06333808"
+      ],
+      "reasonCodes": [
+        "INPUT_SNAPSHOT_REQUIRED"
+      ],
+      "testedSourceKeys": 0,
+      "syntheticSafetyChecks": {
+        "test_comparator_leakage": "PASS",
+        "test_dose_mismatch": "PASS",
+        "test_route_mismatch": "PASS",
+        "test_population_mismatch": "PASS"
+      },
+      "acceptanceProof": "NOT RUN — source-key/record/arm snapshot required"
+    }
+  ],
+  "guardrails": {
+    "readOnly": true,
+    "candidateMutation": false,
+    "portfolioMutation": false,
+    "sourceWatchMutation": false,
+    "queueMutation": false,
+    "masterWrites": false,
+    "automationMutation": false,
+    "fuzzyMatching": false,
+    "queueEligible": false,
+    "portfolioWriteEligible": false,
+    "systemProgrammeKeyMutation": false,
+    "pfk1Mutation": false
+  },
+  "syntheticSafetySuite": {
+    "run": 43,
+    "passed": 43,
+    "failures": 0,
+    "errors": 0,
+    "skipped": 0,
+    "log": "test_active_candidate_routing_flags_never_enable_writes (test_r1c_shared_lineage.SafetyTests.test_active_candidate_routing_flags_never_enable_writes) ... ok\ntest_background_and_supportive_drugs (test_r1c_shared_lineage.SafetyTests.test_background_and_supportive_drugs) ... ok\ntest_combination_arm_leakage (test_r1c_shared_lineage.SafetyTests.test_combination_arm_leakage) ... ok\ntest_comparator_leakage (test_r1c_shared_lineage.SafetyTests.test_comparator_leakage) ... ok\ntest_dose_mismatch (test_r1c_shared_lineage.SafetyTests.test_dose_mismatch) ... ok\ntest_duplicate_active_candidate (test_r1c_shared_lineage.SafetyTests.test_duplicate_active_candidate) ... ok\ntest_duplicate_source_keys_fail_full_contract (test_r1c_shared_lineage.SafetyTests.test_duplicate_source_keys_fail_full_contract) ... ok\ntest_foreign_source_watch_candidate_not_reused (test_r1c_shared_lineage.SafetyTests.test_foreign_source_watch_candidate_not_reused) ... ok\ntest_historical_candidate_does_not_break_active_identity (test_r1c_shared_lineage.SafetyTests.test_historical_candidate_does_not_break_active_identity) ... ok\ntest_incomplete_snapshot_blocked (test_r1c_shared_lineage.SafetyTests.test_incomplete_snapshot_blocked) ... ok\ntest_indication_mismatch (test_r1c_shared_lineage.SafetyTests.test_indication_mismatch) ... ok\ntest_input_unknown_fields_rejected (test_r1c_shared_lineage.SafetyTests.test_input_unknown_fields_rejected) ... ok\ntest_joint_company_views_share_study_not_duplicate_effort (test_r1c_shared_lineage.SafetyTests.test_joint_company_views_share_study_not_duplicate_effort) ... ok\ntest_line_mismatch (test_r1c_shared_lineage.SafetyTests.test_line_mismatch) ... ok\ntest_missing_candidate (test_r1c_shared_lineage.SafetyTests.test_missing_candidate) ... ok\ntest_missing_tl_link_is_coverage_review_not_defect (test_r1c_shared_lineage.SafetyTests.test_missing_tl_link_is_coverage_review_not_defect) ... ok\ntest_mixed_arms_as_combination (test_r1c_shared_lineage.SafetyTests.test_mixed_arms_as_combination) ... ok\ntest_multi_indication_projection_requires_verified_source_scope (test_r1c_shared_lineage.SafetyTests.test_multi_indication_projection_requires_verified_source_scope) ... ok\ntest_nct_match_needs_official_source_relationship_proof (test_r1c_shared_lineage.SafetyTests.test_nct_match_needs_official_source_relationship_proof) ... ok\ntest_new_excluded_discovery_candidate_is_not_promoted (test_r1c_shared_lineage.SafetyTests.test_new_excluded_discovery_candidate_is_not_promoted) ... ok\ntest_no_network_calls_or_routes_added (test_r1c_shared_lineage.SafetyTests.test_no_network_calls_or_routes_added) ... ok\ntest_nonreciprocal_tl_link (test_r1c_shared_lineage.SafetyTests.test_nonreciprocal_tl_link) ... ok\ntest_parent_nct_without_arm (test_r1c_shared_lineage.SafetyTests.test_parent_nct_without_arm) ... ok\ntest_phase_delta_stays_held (test_r1c_shared_lineage.SafetyTests.test_phase_delta_stays_held) ... ok\ntest_placebo_leakage (test_r1c_shared_lineage.SafetyTests.test_placebo_leakage) ... ok\ntest_population_mismatch (test_r1c_shared_lineage.SafetyTests.test_population_mismatch) ... ok\ntest_positive_and_replay_without_mutation (test_r1c_shared_lineage.SafetyTests.test_positive_and_replay_without_mutation) ... ok\ntest_protocol_backed_normalization_requires_proof (test_r1c_shared_lineage.SafetyTests.test_protocol_backed_normalization_requires_proof) ... ok\ntest_r1a_held_is_not_promoted_by_new_positive_evidence (test_r1c_shared_lineage.SafetyTests.test_r1a_held_is_not_promoted_by_new_positive_evidence) ... ok\ntest_route_mismatch (test_r1c_shared_lineage.SafetyTests.test_route_mismatch) ... ok\ntest_separate_arm_asset_mismatch (test_r1c_shared_lineage.SafetyTests.test_separate_arm_asset_mismatch) ... ok\ntest_signal_republication_does_not_add_independent_source (test_r1c_shared_lineage.SafetyTests.test_signal_republication_does_not_add_independent_source) ... ok\ntest_single_vs_combination (test_r1c_shared_lineage.SafetyTests.test_single_vs_combination) ... ok\ntest_snapshot_cli_uses_typed_cases_and_exit_status (test_r1c_shared_lineage.SafetyTests.test_snapshot_cli_uses_typed_cases_and_exit_status) ... ok\ntest_snapshot_count_and_disposition_mismatch (test_r1c_shared_lineage.SafetyTests.test_snapshot_count_and_disposition_mismatch) ... ok\ntest_source_projection_cannot_replace_asset_or_phase (test_r1c_shared_lineage.SafetyTests.test_source_projection_cannot_replace_asset_or_phase) ... ok\ntest_stale_source_grain_stays_held (test_r1c_shared_lineage.SafetyTests.test_stale_source_grain_stays_held) ... ok\ntest_superseded_only (test_r1c_shared_lineage.SafetyTests.test_superseded_only) ... ok\ntest_tl_segment_line_and_competitor_role_preserved (test_r1c_shared_lineage.SafetyTests.test_tl_segment_line_and_competitor_role_preserved) ... ok\ntest_trial_family_requires_official_registry_urls_not_news_title (test_r1c_shared_lineage.SafetyTests.test_trial_family_requires_official_registry_urls_not_news_title) ... ok\ntest_unknown_official_grain_stays_held (test_r1c_shared_lineage.SafetyTests.test_unknown_official_grain_stays_held) ... ok\ntest_unlinked_news_and_regulatory_cannot_corroborate (test_r1c_shared_lineage.SafetyTests.test_unlinked_news_and_regulatory_cannot_corroborate) ... ok\ntest_unproved_prior_line_conversion (test_r1c_shared_lineage.SafetyTests.test_unproved_prior_line_conversion) ... ok\n\n----------------------------------------------------------------------\nRan 43 tests in 4.166s\n\nOK\n",
+    "fixtureType": "SYNTHETIC — NOT GILEAD OBSERVATIONS"
+  }
+}

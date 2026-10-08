@@ -1,0 +1,1026 @@
+{
+  "$defs": {
+    "Arm": {
+      "additionalProperties": false,
+      "properties": {
+        "recordId": {
+          "minLength": 1,
+          "title": "Recordid",
+          "type": "string"
+        },
+        "trialRecordId": {
+          "minLength": 1,
+          "title": "Trialrecordid",
+          "type": "string"
+        },
+        "nct": {
+          "pattern": "^NCT\\d{8}$",
+          "title": "Nct",
+          "type": "string"
+        },
+        "armRef": {
+          "minLength": 1,
+          "title": "Armref",
+          "type": "string"
+        },
+        "interventionRole": {
+          "enum": [
+            "experimental",
+            "comparator",
+            "placebo",
+            "background",
+            "supportive"
+          ],
+          "title": "Interventionrole",
+          "type": "string"
+        },
+        "comparison": {
+          "additionalProperties": true,
+          "title": "Comparison",
+          "type": "object"
+        },
+        "scope": {
+          "$ref": "#/$defs/Scope"
+        },
+        "provenance": {
+          "$ref": "#/$defs/Provenance"
+        }
+      },
+      "required": [
+        "recordId",
+        "trialRecordId",
+        "nct",
+        "armRef",
+        "interventionRole",
+        "comparison",
+        "scope",
+        "provenance"
+      ],
+      "title": "Arm",
+      "type": "object"
+    },
+    "Candidate": {
+      "additionalProperties": false,
+      "properties": {
+        "recordId": {
+          "minLength": 1,
+          "title": "Recordid",
+          "type": "string"
+        },
+        "stableKey": {
+          "minLength": 1,
+          "title": "Stablekey",
+          "type": "string"
+        },
+        "sourceWatchRecordId": {
+          "minLength": 1,
+          "title": "Sourcewatchrecordid",
+          "type": "string"
+        },
+        "sourceRecordId": {
+          "minLength": 1,
+          "title": "Sourcerecordid",
+          "type": "string"
+        },
+        "company": {
+          "minLength": 1,
+          "title": "Company",
+          "type": "string"
+        },
+        "sourceVersion": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Sourceversion"
+        },
+        "sourceGranularity": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Sourcegranularity"
+        },
+        "active": {
+          "title": "Active",
+          "type": "boolean"
+        },
+        "reviewStatus": {
+          "minLength": 1,
+          "title": "Reviewstatus",
+          "type": "string"
+        },
+        "programmeGate": {
+          "minLength": 1,
+          "title": "Programmegate",
+          "type": "string"
+        },
+        "discoveryClassification": {
+          "minLength": 1,
+          "title": "Discoveryclassification",
+          "type": "string"
+        },
+        "holdReason": {
+          "title": "Holdreason",
+          "type": "string"
+        },
+        "portfolioIds": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Portfolioids",
+          "type": "array"
+        },
+        "queueEligible": {
+          "title": "Queueeligible",
+          "type": "boolean"
+        },
+        "portfolioWriteEligible": {
+          "title": "Portfoliowriteeligible",
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "recordId",
+        "stableKey",
+        "sourceWatchRecordId",
+        "sourceRecordId",
+        "company",
+        "sourceVersion",
+        "sourceGranularity",
+        "active",
+        "reviewStatus",
+        "programmeGate",
+        "discoveryClassification",
+        "holdReason",
+        "portfolioIds",
+        "queueEligible",
+        "portfolioWriteEligible"
+      ],
+      "title": "Candidate",
+      "type": "object"
+    },
+    "Case": {
+      "additionalProperties": false,
+      "properties": {
+        "name": {
+          "minLength": 1,
+          "title": "Name",
+          "type": "string"
+        },
+        "sourceKeys": {
+          "items": {
+            "type": "string"
+          },
+          "minItems": 1,
+          "title": "Sourcekeys",
+          "type": "array"
+        },
+        "expectedNcts": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Expectedncts",
+          "type": "array"
+        },
+        "expectedPortfolioIds": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Expectedportfolioids",
+          "type": "array"
+        },
+        "expectedLandscapeIds": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Expectedlandscapeids",
+          "type": "array"
+        },
+        "expectedDisposition": {
+          "enum": [
+            "SUPPORTED_EXACT",
+            "SUPPORTED_RELATIONSHIP_WITH_SCOPE_HOLD",
+            "HELD_AMBIGUOUS",
+            "NOT_YET_CORROBORATED"
+          ],
+          "title": "Expecteddisposition",
+          "type": "string"
+        },
+        "oracleProvenance": {
+          "minLength": 1,
+          "title": "Oracleprovenance",
+          "type": "string"
+        }
+      },
+      "required": [
+        "name",
+        "sourceKeys",
+        "expectedNcts",
+        "expectedPortfolioIds",
+        "expectedLandscapeIds",
+        "expectedDisposition",
+        "oracleProvenance"
+      ],
+      "title": "Case",
+      "type": "object"
+    },
+    "Evidence": {
+      "additionalProperties": false,
+      "properties": {
+        "recordId": {
+          "minLength": 1,
+          "title": "Recordid",
+          "type": "string"
+        },
+        "family": {
+          "enum": [
+            "TRIAL_REGISTRY",
+            "REGULATORY",
+            "SIGNAL"
+          ],
+          "title": "Family",
+          "type": "string"
+        },
+        "portfolioIds": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Portfolioids",
+          "type": "array"
+        },
+        "provenance": {
+          "$ref": "#/$defs/Provenance"
+        },
+        "armId": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Armid"
+        },
+        "comparison": {
+          "additionalProperties": true,
+          "title": "Comparison",
+          "type": "object"
+        },
+        "scope": {
+          "$ref": "#/$defs/Scope"
+        },
+        "jurisdiction": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Jurisdiction"
+        },
+        "independent": {
+          "title": "Independent",
+          "type": "boolean"
+        },
+        "verified": {
+          "title": "Verified",
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "recordId",
+        "family",
+        "portfolioIds",
+        "provenance",
+        "armId",
+        "comparison",
+        "scope",
+        "jurisdiction",
+        "independent",
+        "verified"
+      ],
+      "title": "Evidence",
+      "type": "object"
+    },
+    "Landscape": {
+      "additionalProperties": false,
+      "properties": {
+        "recordId": {
+          "minLength": 1,
+          "title": "Recordid",
+          "type": "string"
+        },
+        "portfolioIds": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Portfolioids",
+          "type": "array"
+        },
+        "comparison": {
+          "additionalProperties": true,
+          "title": "Comparison",
+          "type": "object"
+        },
+        "scope": {
+          "$ref": "#/$defs/Scope"
+        },
+        "market": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Market"
+        },
+        "provenance": {
+          "$ref": "#/$defs/Provenance"
+        },
+        "confidence": {
+          "title": "Confidence",
+          "type": "string"
+        },
+        "readiness": {
+          "title": "Readiness",
+          "type": "string"
+        },
+        "lastVerified": {
+          "title": "Lastverified",
+          "type": "string"
+        }
+      },
+      "required": [
+        "recordId",
+        "portfolioIds",
+        "comparison",
+        "scope",
+        "market",
+        "provenance",
+        "confidence",
+        "readiness",
+        "lastVerified"
+      ],
+      "title": "Landscape",
+      "type": "object"
+    },
+    "Portfolio": {
+      "additionalProperties": false,
+      "properties": {
+        "recordId": {
+          "minLength": 1,
+          "title": "Recordid",
+          "type": "string"
+        },
+        "company": {
+          "minLength": 1,
+          "title": "Company",
+          "type": "string"
+        },
+        "comparison": {
+          "additionalProperties": true,
+          "title": "Comparison",
+          "type": "object"
+        },
+        "scope": {
+          "$ref": "#/$defs/Scope"
+        },
+        "candidateIds": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Candidateids",
+          "type": "array"
+        },
+        "landscapeIds": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Landscapeids",
+          "type": "array"
+        },
+        "trialIds": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Trialids",
+          "type": "array"
+        },
+        "evidenceFamilies": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Evidencefamilies",
+          "type": "array"
+        },
+        "crossSourceStatus": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Crosssourcestatus"
+        }
+      },
+      "required": [
+        "recordId",
+        "company",
+        "comparison",
+        "scope",
+        "candidateIds",
+        "landscapeIds",
+        "trialIds",
+        "evidenceFamilies",
+        "crossSourceStatus"
+      ],
+      "title": "Portfolio",
+      "type": "object"
+    },
+    "Provenance": {
+      "additionalProperties": false,
+      "properties": {
+        "url": {
+          "minLength": 1,
+          "title": "Url",
+          "type": "string"
+        },
+        "sourceRecordId": {
+          "minLength": 1,
+          "title": "Sourcerecordid",
+          "type": "string"
+        },
+        "asOf": {
+          "minLength": 1,
+          "title": "Asof",
+          "type": "string"
+        },
+        "retrievedAt": {
+          "minLength": 1,
+          "title": "Retrievedat",
+          "type": "string"
+        },
+        "version": {
+          "minLength": 1,
+          "title": "Version",
+          "type": "string"
+        },
+        "authorityId": {
+          "minLength": 1,
+          "title": "Authorityid",
+          "type": "string"
+        },
+        "originalText": {
+          "minLength": 1,
+          "title": "Originaltext",
+          "type": "string"
+        }
+      },
+      "required": [
+        "url",
+        "sourceRecordId",
+        "asOf",
+        "retrievedAt",
+        "version",
+        "authorityId",
+        "originalText"
+      ],
+      "title": "Provenance",
+      "type": "object"
+    },
+    "Relation": {
+      "additionalProperties": false,
+      "properties": {
+        "recordId": {
+          "minLength": 1,
+          "title": "Recordid",
+          "type": "string"
+        },
+        "stableKey": {
+          "minLength": 1,
+          "title": "Stablekey",
+          "type": "string"
+        },
+        "portfolioId": {
+          "minLength": 1,
+          "title": "Portfolioid",
+          "type": "string"
+        },
+        "relationType": {
+          "enum": [
+            "CANONICAL_PROGRAMME",
+            "JOINT_DEVELOPMENT_VIEW",
+            "INDICATION_RELATIONSHIP"
+          ],
+          "title": "Relationtype",
+          "type": "string"
+        },
+        "sharedStudyIdentity": {
+          "minLength": 1,
+          "title": "Sharedstudyidentity",
+          "type": "string"
+        },
+        "companyRoleProof": {
+          "minLength": 1,
+          "title": "Companyroleproof",
+          "type": "string"
+        },
+        "sourceComparison": {
+          "additionalProperties": true,
+          "title": "Sourcecomparison",
+          "type": "object"
+        },
+        "sourceScope": {
+          "$ref": "#/$defs/Scope"
+        },
+        "sourceProvenance": {
+          "$ref": "#/$defs/Provenance"
+        },
+        "sourceProjectionVerified": {
+          "title": "Sourceprojectionverified",
+          "type": "boolean"
+        },
+        "sourceProjectionProof": {
+          "title": "Sourceprojectionproof",
+          "type": "string"
+        },
+        "evidenceIds": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Evidenceids",
+          "type": "array"
+        }
+      },
+      "required": [
+        "recordId",
+        "stableKey",
+        "portfolioId",
+        "relationType",
+        "sharedStudyIdentity",
+        "companyRoleProof",
+        "sourceComparison",
+        "sourceScope",
+        "sourceProvenance",
+        "sourceProjectionVerified",
+        "sourceProjectionProof",
+        "evidenceIds"
+      ],
+      "title": "Relation",
+      "type": "object"
+    },
+    "Scope": {
+      "additionalProperties": false,
+      "properties": {
+        "components": {
+          "items": {
+            "type": "string"
+          },
+          "minItems": 1,
+          "title": "Components",
+          "type": "array"
+        },
+        "indication": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Indication"
+        },
+        "line": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Line"
+        },
+        "population": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Population"
+        },
+        "setting": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Setting"
+        },
+        "route": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Route"
+        },
+        "dose": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Dose"
+        },
+        "proofReferences": {
+          "additionalProperties": {
+            "type": "string"
+          },
+          "title": "Proofreferences",
+          "type": "object"
+        },
+        "companyRole": {
+          "enum": [
+            "owner",
+            "partner",
+            "co-developer",
+            "competitor",
+            "unknown"
+          ],
+          "title": "Companyrole",
+          "type": "string"
+        },
+        "roleProof": {
+          "title": "Roleproof",
+          "type": "string"
+        }
+      },
+      "required": [
+        "components",
+        "indication",
+        "line",
+        "population",
+        "setting",
+        "route",
+        "dose",
+        "proofReferences",
+        "companyRole",
+        "roleProof"
+      ],
+      "title": "Scope",
+      "type": "object"
+    },
+    "Source": {
+      "additionalProperties": false,
+      "properties": {
+        "stableKey": {
+          "minLength": 1,
+          "title": "Stablekey",
+          "type": "string"
+        },
+        "sourceWatchRecordId": {
+          "minLength": 1,
+          "title": "Sourcewatchrecordid",
+          "type": "string"
+        },
+        "company": {
+          "minLength": 1,
+          "title": "Company",
+          "type": "string"
+        },
+        "adapterVersion": {
+          "minLength": 1,
+          "title": "Adapterversion",
+          "type": "string"
+        },
+        "parserVersion": {
+          "minLength": 1,
+          "title": "Parserversion",
+          "type": "string"
+        },
+        "granularity": {
+          "enum": [
+            "programme",
+            "multi_indication",
+            "asset_umbrella",
+            "unknown"
+          ],
+          "title": "Granularity",
+          "type": "string"
+        },
+        "provenance": {
+          "$ref": "#/$defs/Provenance"
+        },
+        "comparison": {
+          "additionalProperties": true,
+          "title": "Comparison",
+          "type": "object"
+        },
+        "scope": {
+          "$ref": "#/$defs/Scope"
+        },
+        "baselineDisposition": {
+          "enum": [
+            "MATCHED",
+            "HELD",
+            "NEW",
+            "EXCLUDED"
+          ],
+          "title": "Baselinedisposition",
+          "type": "string"
+        },
+        "baselineReason": {
+          "title": "Baselinereason",
+          "type": "string"
+        },
+        "baselineProof": {
+          "minLength": 1,
+          "title": "Baselineproof",
+          "type": "string"
+        },
+        "assessedFamilies": {
+          "items": {
+            "enum": [
+              "PIPELINE",
+              "TRIAL_REGISTRY",
+              "REGULATORY",
+              "SIGNAL"
+            ],
+            "type": "string"
+          },
+          "title": "Assessedfamilies",
+          "type": "array"
+        },
+        "relationIds": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Relationids",
+          "type": "array"
+        },
+        "trialReferences": {
+          "additionalProperties": {
+            "type": "string"
+          },
+          "title": "Trialreferences",
+          "type": "object"
+        }
+      },
+      "required": [
+        "stableKey",
+        "sourceWatchRecordId",
+        "company",
+        "adapterVersion",
+        "parserVersion",
+        "granularity",
+        "provenance",
+        "comparison",
+        "scope",
+        "baselineDisposition",
+        "baselineReason",
+        "baselineProof",
+        "assessedFamilies",
+        "relationIds",
+        "trialReferences"
+      ],
+      "title": "Source",
+      "type": "object"
+    },
+    "Trial": {
+      "additionalProperties": false,
+      "properties": {
+        "recordId": {
+          "minLength": 1,
+          "title": "Recordid",
+          "type": "string"
+        },
+        "nct": {
+          "pattern": "^NCT\\d{8}$",
+          "title": "Nct",
+          "type": "string"
+        },
+        "studyName": {
+          "minLength": 1,
+          "title": "Studyname",
+          "type": "string"
+        },
+        "status": {
+          "minLength": 1,
+          "title": "Status",
+          "type": "string"
+        },
+        "provenance": {
+          "$ref": "#/$defs/Provenance"
+        },
+        "portfolioIds": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Portfolioids",
+          "type": "array"
+        },
+        "armIds": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Armids",
+          "type": "array"
+        }
+      },
+      "required": [
+        "recordId",
+        "nct",
+        "studyName",
+        "status",
+        "provenance",
+        "portfolioIds",
+        "armIds"
+      ],
+      "title": "Trial",
+      "type": "object"
+    }
+  },
+  "additionalProperties": false,
+  "properties": {
+    "schemaVersion": {
+      "const": "R1C_SNAPSHOT_V1",
+      "title": "Schemaversion",
+      "type": "string"
+    },
+    "snapshotId": {
+      "minLength": 1,
+      "title": "Snapshotid",
+      "type": "string"
+    },
+    "capturedAt": {
+      "minLength": 1,
+      "title": "Capturedat",
+      "type": "string"
+    },
+    "company": {
+      "minLength": 1,
+      "title": "Company",
+      "type": "string"
+    },
+    "companyAliases": {
+      "items": {
+        "type": "string"
+      },
+      "title": "Companyaliases",
+      "type": "array"
+    },
+    "relatedCompanies": {
+      "items": {
+        "type": "string"
+      },
+      "title": "Relatedcompanies",
+      "type": "array"
+    },
+    "sourceWatchRecordId": {
+      "minLength": 1,
+      "title": "Sourcewatchrecordid",
+      "type": "string"
+    },
+    "expectedSourceCount": {
+      "exclusiveMinimum": 0,
+      "title": "Expectedsourcecount",
+      "type": "integer"
+    },
+    "expectedDispositionCounts": {
+      "additionalProperties": {
+        "type": "integer"
+      },
+      "title": "Expecteddispositioncounts",
+      "type": "object"
+    },
+    "completeTables": {
+      "items": {
+        "type": "string"
+      },
+      "title": "Completetables",
+      "type": "array"
+    },
+    "scopeDescription": {
+      "minLength": 1,
+      "title": "Scopedescription",
+      "type": "string"
+    },
+    "sources": {
+      "items": {
+        "$ref": "#/$defs/Source"
+      },
+      "title": "Sources",
+      "type": "array"
+    },
+    "candidates": {
+      "items": {
+        "$ref": "#/$defs/Candidate"
+      },
+      "title": "Candidates",
+      "type": "array"
+    },
+    "portfolio": {
+      "items": {
+        "$ref": "#/$defs/Portfolio"
+      },
+      "title": "Portfolio",
+      "type": "array"
+    },
+    "trials": {
+      "items": {
+        "$ref": "#/$defs/Trial"
+      },
+      "title": "Trials",
+      "type": "array"
+    },
+    "arms": {
+      "items": {
+        "$ref": "#/$defs/Arm"
+      },
+      "title": "Arms",
+      "type": "array"
+    },
+    "relations": {
+      "items": {
+        "$ref": "#/$defs/Relation"
+      },
+      "title": "Relations",
+      "type": "array"
+    },
+    "evidence": {
+      "items": {
+        "$ref": "#/$defs/Evidence"
+      },
+      "title": "Evidence",
+      "type": "array"
+    },
+    "landscape": {
+      "items": {
+        "$ref": "#/$defs/Landscape"
+      },
+      "title": "Landscape",
+      "type": "array"
+    },
+    "cases": {
+      "items": {
+        "$ref": "#/$defs/Case"
+      },
+      "title": "Cases",
+      "type": "array"
+    }
+  },
+  "required": [
+    "schemaVersion",
+    "snapshotId",
+    "capturedAt",
+    "company",
+    "companyAliases",
+    "relatedCompanies",
+    "sourceWatchRecordId",
+    "expectedSourceCount",
+    "expectedDispositionCounts",
+    "completeTables",
+    "scopeDescription",
+    "sources",
+    "candidates",
+    "portfolio",
+    "trials",
+    "arms",
+    "relations",
+    "evidence",
+    "landscape",
+    "cases"
+  ],
+  "title": "Snapshot",
+  "type": "object"
+}

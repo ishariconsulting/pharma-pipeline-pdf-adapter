@@ -1,0 +1,96 @@
+{
+  "ruleVersion": "R1C_SHARED_RESOLVER_V1_READ_ONLY_DRAFT",
+  "frameworkVersion": "2.22",
+  "status": "BLOCKED — INPUT SNAPSHOT REQUIRED",
+  "testedSourceKeys": 0,
+  "expectedSourceCount": 53,
+  "issues": [
+    "No row-level snapshot supplied; audit totals are not fixture data"
+  ],
+  "rows": [],
+  "matrixAvailability": "No observed row matrix — snapshot required",
+  "cases": [
+    {
+      "name": "iMMagine-1",
+      "status": "HOLD",
+      "ncts": [
+        "NCT05396885"
+      ],
+      "reasonCodes": [
+        "INPUT_SNAPSHOT_REQUIRED"
+      ],
+      "testedSourceKeys": 0
+    },
+    {
+      "name": "iMMagine-3",
+      "status": "HOLD",
+      "ncts": [
+        "NCT06413498"
+      ],
+      "reasonCodes": [
+        "INPUT_SNAPSHOT_REQUIRED"
+      ],
+      "testedSourceKeys": 0
+    },
+    {
+      "name": "ISLEND-1/2",
+      "status": "HOLD",
+      "ncts": [
+        "NCT06630286",
+        "NCT06630299"
+      ],
+      "reasonCodes": [
+        "INPUT_SNAPSHOT_REQUIRED"
+      ],
+      "testedSourceKeys": 0
+    },
+    {
+      "name": "NAPISTAR 1-01",
+      "status": "HOLD",
+      "ncts": [
+        "NCT06303505"
+      ],
+      "reasonCodes": [
+        "INPUT_SNAPSHOT_REQUIRED"
+      ],
+      "testedSourceKeys": 0
+    },
+    {
+      "name": "PALISADES-1",
+      "status": "HOLD",
+      "ncts": [
+        "NCT04989803"
+      ],
+      "reasonCodes": [
+        "INPUT_SNAPSHOT_REQUIRED"
+      ],
+      "testedSourceKeys": 0
+    },
+    {
+      "name": "ARTISTRY-1/2",
+      "status": "HOLD",
+      "ncts": [
+        "NCT05502341",
+        "NCT06333808"
+      ],
+      "reasonCodes": [
+        "INPUT_SNAPSHOT_REQUIRED"
+      ],
+      "testedSourceKeys": 0
+    }
+  ],
+  "guardrails": {
+    "readOnly": true,
+    "candidateMutation": false,
+    "portfolioMutation": false,
+    "sourceWatchMutation": false,
+    "queueMutation": false,
+    "masterWrites": false,
+    "automationMutation": false,
+    "fuzzyMatching": false,
+    "queueEligible": false,
+    "portfolioWriteEligible": false,
+    "systemProgrammeKeyMutation": false,
+    "pfk1Mutation": false
+  }
+}

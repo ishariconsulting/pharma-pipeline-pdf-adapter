@@ -1,0 +1,1621 @@
+{
+  "id": "wfllYSi0EXLMDrCx8",
+  "name": "Company 360 - Company & TA Strategy Enrichment",
+  "description": "Initial Company 360 Company/Strategy bootstrap. Uses Airtable AI web research restricted to primary/official sources, writes company strategy and supported full-year financials, then creates TA Strategy records. Intended for companies entering Bootstrapping with no TA Strategy records yet.",
+  "deploymentStatus": "undeployed",
+  "deploymentError": null,
+  "trigger": {
+    "type": "recordMatchesConditions",
+    "inputs": {
+      "tableId": "tbliseaiZjNPYKQCD",
+      "filtersObj": {
+        "obj": {
+          "operator": "and",
+          "operands": {
+            "tuple": [
+              {
+                "obj": {
+                  "operator": "=",
+                  "operands": {
+                    "tuple": [
+                      "fldSq49nY19V8QgcB",
+                      "selkT0zJN4GIakBVf"
+                    ]
+                  }
+                }
+              },
+              {
+                "obj": {
+                  "operator": "isNotEmpty",
+                  "operands": {
+                    "tuple": [
+                      "fld7vtyljAkyDBuf1"
+                    ]
+                  }
+                }
+              },
+              {
+                "obj": {
+                  "operator": "isEmpty",
+                  "operands": {
+                    "tuple": [
+                      "fldaMuSbiBsawQDm9"
+                    ]
+                  }
+                }
+              }
+            ]
+          }
+        }
+      }
+    }
+  },
+  "nodes": [
+    {
+      "key": "wacVTuseFajLbZdWN",
+      "type": "aiGenerateStructuredOutput",
+      "description": "Research company fundamentals and TA strategy from official sources",
+      "inputs": {
+        "availableTools": [
+          "brightDataSearch",
+          "brightDataReadWebpage"
+        ],
+        "randomness": 0,
+        "prompt": {
+          "template": [
+            "Research and structure the Company / Strategy layer for this pharmaceutical or biotech company.\n\nCompany name: ",
+            {
+              "$ref": "trigger",
+              "path": [
+                "cellValuesByFieldId",
+                "fld7vtyljAkyDBuf1"
+              ]
+            },
+            "\nOfficial website: ",
+            {
+              "$ref": "trigger",
+              "path": [
+                "cellValuesByFieldId",
+                "fld4dwP2NKPh6zkvY"
+              ]
+            },
+            "\nInvestor relations URL: ",
+            {
+              "$ref": "trigger",
+              "path": [
+                "cellValuesByFieldId",
+                "fldhw4Ht91PKcwwRy"
+              ]
+            },
+            "\nPipeline URL: ",
+            {
+              "$ref": "trigger",
+              "path": [
+                "cellValuesByFieldId",
+                "fldTJIFznS93LfdvH"
+              ]
+            },
+            "\n\nRules:\n1. Use current web research and PRIMARY/OFFICIAL sources only: official company website, investor relations, annual/financial reports, stock-exchange/regulatory filings, and official regulators when needed. No analyst reports, commercial databases, Wikipedia, blogs or media summaries as foundational evidence.\n2. Use the latest COMPLETED full fiscal year for revenue and R&D. Do not annualise a quarter.\n3. latestRevenueUSD and rdSpendUSD must be USD. If the official company source reports another currency, convert using an official central-bank/ECB average exchange rate for that fiscal year. Set the relevant Known boolean false if this cannot be supported. If latestRevenueKnown=true, revenueYearKnown must also be true.\n4. R&D means reported R&D expense/spend, not acquisition consideration or all operating costs.\n5. Corporate Strategy Summary, Growth Priorities, Financial Priorities and Key Risks / Challenges must be concise factual syntheses grounded in management disclosures. Do not invent targets or motives.\n6. Create TA Strategy items only for materially strategic areas supported by official evidence. Map therapeuticArea ONLY to: Biosimilars, Cardiovascular, Cardiovascular, Renal & Metabolism, Cardiovascular, Metabolism & Endocrinology, Dermatology, Gastroenterology, Fertility, Hematology, Immunology, Inflammation, Infectious Diseases, Neuroscience, Neurology, Oncology, Ophthalmology, Respiratory, Rare Disease, Vaccines, HIV, Hepatology, Nephrology, Pain, Endocrinology.\n7. Strategic Priority is our analytical tier: Core, High, Medium or Emerging, based on portfolio concentration, R&D emphasis, launches, management emphasis and BD. Do not imply the company uses this tier.\n8. Each TA item needs a short Strategy Summary, Management Statement, Growth Objectives, Financial Importance, Upcoming Catalysts, Confidence and one strongest primary source URL.\n9. Use one strongest primary official source URL for companySourceUrl. asOfDate must be YYYY-MM-DD.\n10. If evidence is genuinely unavailable, set Known=false rather than guessing. Narrative fields should still be grounded and useful.\n"
+          ]
+        },
+        "outputSchema": {
+          "obj": {
+            "response": {
+              "obj": {
+                "type": "object",
+                "properties": {
+                  "obj": {
+                    "latestRevenueKnown": {
+                      "obj": {
+                        "type": "boolean"
+                      }
+                    },
+                    "latestRevenueUSD": {
+                      "obj": {
+                        "type": "number"
+                      }
+                    },
+                    "revenueYearKnown": {
+                      "obj": {
+                        "type": "boolean"
+                      }
+                    },
+                    "revenueYear": {
+                      "obj": {
+                        "type": "number"
+                      }
+                    },
+                    "rdSpendKnown": {
+                      "obj": {
+                        "type": "boolean"
+                      }
+                    },
+                    "rdSpendUSD": {
+                      "obj": {
+                        "type": "number"
+                      }
+                    },
+                    "corporateStrategySummary": {
+                      "obj": {
+                        "type": "string"
+                      }
+                    },
+                    "growthPriorities": {
+                      "obj": {
+                        "type": "string"
+                      }
+                    },
+                    "financialPriorities": {
+                      "obj": {
+                        "type": "string"
+                      }
+                    },
+                    "keyRisksChallenges": {
+                      "obj": {
+                        "type": "string"
+                      }
+                    },
+                    "companySourceUrl": {
+                      "obj": {
+                        "type": "string"
+                      }
+                    },
+                    "confidence": {
+                      "obj": {
+                        "type": "string",
+                        "enum": [
+                          "High",
+                          "Medium",
+                          "Low"
+                        ]
+                      }
+                    },
+                    "asOfDate": {
+                      "obj": {
+                        "type": "string"
+                      }
+                    },
+                    "taStrategies": {
+                      "obj": {
+                        "type": "array",
+                        "items": {
+                          "obj": {
+                            "type": "object",
+                            "properties": {
+                              "obj": {
+                                "therapeuticArea": {
+                                  "obj": {
+                                    "type": "string",
+                                    "enum": [
+                                      "Biosimilars",
+                                      "Cardiovascular",
+                                      "Cardiovascular, Renal & Metabolism",
+                                      "Cardiovascular, Metabolism & Endocrinology",
+                                      "Dermatology",
+                                      "Gastroenterology",
+                                      "Fertility",
+                                      "Hematology",
+                                      "Immunology",
+                                      "Inflammation",
+                                      "Infectious Diseases",
+                                      "Neuroscience",
+                                      "Neurology",
+                                      "Oncology",
+                                      "Ophthalmology",
+                                      "Respiratory",
+                                      "Rare Disease",
+                                      "Vaccines",
+                                      "HIV",
+                                      "Hepatology",
+                                      "Nephrology",
+                                      "Pain",
+                                      "Endocrinology"
+                                    ]
+                                  }
+                                },
+                                "strategicPriority": {
+                                  "obj": {
+                                    "type": "string",
+                                    "enum": [
+                                      "Core",
+                                      "High",
+                                      "Medium",
+                                      "Emerging"
+                                    ]
+                                  }
+                                },
+                                "strategySummary": {
+                                  "obj": {
+                                    "type": "string"
+                                  }
+                                },
+                                "managementStatement": {
+                                  "obj": {
+                                    "type": "string"
+                                  }
+                                },
+                                "growthObjectives": {
+                                  "obj": {
+                                    "type": "string"
+                                  }
+                                },
+                                "financialImportance": {
+                                  "obj": {
+                                    "type": "string"
+                                  }
+                                },
+                                "upcomingCatalysts": {
+                                  "obj": {
+                                    "type": "string"
+                                  }
+                                },
+                                "confidence": {
+                                  "obj": {
+                                    "type": "string",
+                                    "enum": [
+                                      "High",
+                                      "Medium",
+                                      "Low"
+                                    ]
+                                  }
+                                },
+                                "sourceUrl": {
+                                  "obj": {
+                                    "type": "string"
+                                  }
+                                }
+                              }
+                            }
+                          }
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "key": "wacwVFVsqKUdNz15a",
+      "type": "updateRecord",
+      "description": "Write company strategy and provenance",
+      "inputs": {
+        "updateRecordMethod": "customFields",
+        "tableId": "tbliseaiZjNPYKQCD",
+        "rowId": {
+          "template": [
+            {
+              "$ref": "trigger",
+              "path": [
+                "id"
+              ]
+            }
+          ]
+        },
+        "fields": {
+          "obj": {
+            "fldTfUVibol0FtYGk": {
+              "template": [
+                {
+                  "$ref": "wacVTuseFajLbZdWN",
+                  "path": [
+                    "response",
+                    "corporateStrategySummary"
+                  ]
+                }
+              ]
+            },
+            "fldI8EPezD9uhTJLi": {
+              "template": [
+                {
+                  "$ref": "wacVTuseFajLbZdWN",
+                  "path": [
+                    "response",
+                    "growthPriorities"
+                  ]
+                }
+              ]
+            },
+            "fldZ9aWu2fW4z4LQR": {
+              "template": [
+                {
+                  "$ref": "wacVTuseFajLbZdWN",
+                  "path": [
+                    "response",
+                    "financialPriorities"
+                  ]
+                }
+              ]
+            },
+            "fldBIb7apVlRDaIWJ": {
+              "template": [
+                {
+                  "$ref": "wacVTuseFajLbZdWN",
+                  "path": [
+                    "response",
+                    "keyRisksChallenges"
+                  ]
+                }
+              ]
+            },
+            "fldGAuWkG2I9kROaO": {
+              "template": [
+                {
+                  "$ref": "wacVTuseFajLbZdWN",
+                  "path": [
+                    "response",
+                    "confidence"
+                  ]
+                }
+              ]
+            },
+            "fld3IWytDp6iDwoeJ": {
+              "template": [
+                {
+                  "$ref": "wacVTuseFajLbZdWN",
+                  "path": [
+                    "response",
+                    "asOfDate"
+                  ]
+                }
+              ]
+            },
+            "fld2fp4Hk5nV3I0oE": {
+              "template": [
+                {
+                  "$ref": "wacVTuseFajLbZdWN",
+                  "path": [
+                    "response",
+                    "companySourceUrl"
+                  ]
+                }
+              ]
+            }
+          }
+        }
+      }
+    },
+    {
+      "key": "wdeJCk6Wysyre4qJi",
+      "type": "conditionalGroup",
+      "branches": [
+        {
+          "name": "Revenue and R&D supported",
+          "condition": {
+            "conjunction": "and",
+            "conditions": [
+              {
+                "left": {
+                  "$ref": "wacVTuseFajLbZdWN",
+                  "path": [
+                    "response",
+                    "latestRevenueKnown"
+                  ]
+                },
+                "operator": "=",
+                "right": true,
+                "valueType": "checkbox",
+                "dataType": "literal"
+              },
+              {
+                "left": {
+                  "$ref": "wacVTuseFajLbZdWN",
+                  "path": [
+                    "response",
+                    "revenueYearKnown"
+                  ]
+                },
+                "operator": "=",
+                "right": true,
+                "valueType": "checkbox",
+                "dataType": "literal"
+              },
+              {
+                "left": {
+                  "$ref": "wacVTuseFajLbZdWN",
+                  "path": [
+                    "response",
+                    "rdSpendKnown"
+                  ]
+                },
+                "operator": "=",
+                "right": true,
+                "valueType": "checkbox",
+                "dataType": "literal"
+              }
+            ]
+          },
+          "nodes": [
+            {
+              "key": "wacZUVycdcNKvVcYK",
+              "type": "updateRecord",
+              "description": "Write supported company financials",
+              "inputs": {
+                "updateRecordMethod": "customFields",
+                "tableId": "tbliseaiZjNPYKQCD",
+                "rowId": {
+                  "template": [
+                    {
+                      "$ref": "trigger",
+                      "path": [
+                        "id"
+                      ]
+                    }
+                  ]
+                },
+                "fields": {
+                  "obj": {
+                    "fldnARjPBTTMWBbZ0": {
+                      "template": [
+                        {
+                          "$ref": "wacVTuseFajLbZdWN",
+                          "path": [
+                            "response",
+                            "latestRevenueUSD"
+                          ]
+                        }
+                      ]
+                    },
+                    "fldZrN85YSOgPmK1k": {
+                      "template": [
+                        {
+                          "$ref": "wacVTuseFajLbZdWN",
+                          "path": [
+                            "response",
+                            "revenueYear"
+                          ]
+                        }
+                      ]
+                    },
+                    "fldcdiI69KvGyvRDs": {
+                      "template": [
+                        {
+                          "$ref": "wacVTuseFajLbZdWN",
+                          "path": [
+                            "response",
+                            "rdSpendUSD"
+                          ]
+                        }
+                      ]
+                    }
+                  }
+                }
+              }
+            },
+            {
+              "key": "wde3Z2W47saBRfNEj",
+              "type": "repeatingGroup",
+              "name": "Create TA Strategy records",
+              "inputs": {
+                "items": {
+                  "$ref": "wacVTuseFajLbZdWN",
+                  "path": [
+                    "response",
+                    "taStrategies"
+                  ]
+                }
+              },
+              "nodes": [
+                {
+                  "key": "wacTMna335oIrnuC2",
+                  "type": "createRecord",
+                  "description": "Create one strategic therapeutic-area record",
+                  "inputs": {
+                    "createRecordMethod": "customFields",
+                    "tableId": "tblCB9lt4GX60G75M",
+                    "fields": {
+                      "obj": {
+                        "fldLuqMllTjSAmOgc": {
+                          "template": [
+                            {
+                              "$ref": "trigger",
+                              "path": [
+                                "id"
+                              ]
+                            }
+                          ]
+                        },
+                        "fldRu0DMcy2uP4Rpp": {
+                          "template": [
+                            {
+                              "fn": "readProperty",
+                              "args": [
+                                {
+                                  "fn": "pickBranchData",
+                                  "args": [
+                                    {
+                                      "$ref": "wde3Z2W47saBRfNEj",
+                                      "path": [
+                                        "selectedNextNodes"
+                                      ]
+                                    }
+                                  ]
+                                },
+                                "therapeuticArea"
+                              ]
+                            }
+                          ]
+                        },
+                        "fldijPo8c4bpP2IeA": {
+                          "template": [
+                            {
+                              "fn": "readProperty",
+                              "args": [
+                                {
+                                  "fn": "pickBranchData",
+                                  "args": [
+                                    {
+                                      "$ref": "wde3Z2W47saBRfNEj",
+                                      "path": [
+                                        "selectedNextNodes"
+                                      ]
+                                    }
+                                  ]
+                                },
+                                "strategicPriority"
+                              ]
+                            }
+                          ]
+                        },
+                        "flds90ShuwntE1eiL": {
+                          "template": [
+                            {
+                              "fn": "readProperty",
+                              "args": [
+                                {
+                                  "fn": "pickBranchData",
+                                  "args": [
+                                    {
+                                      "$ref": "wde3Z2W47saBRfNEj",
+                                      "path": [
+                                        "selectedNextNodes"
+                                      ]
+                                    }
+                                  ]
+                                },
+                                "strategySummary"
+                              ]
+                            }
+                          ]
+                        },
+                        "fldZFn1Ul9CBbBp0V": {
+                          "template": [
+                            {
+                              "fn": "readProperty",
+                              "args": [
+                                {
+                                  "fn": "pickBranchData",
+                                  "args": [
+                                    {
+                                      "$ref": "wde3Z2W47saBRfNEj",
+                                      "path": [
+                                        "selectedNextNodes"
+                                      ]
+                                    }
+                                  ]
+                                },
+                                "managementStatement"
+                              ]
+                            }
+                          ]
+                        },
+                        "fld3dgyaOKK8Kzrih": {
+                          "template": [
+                            {
+                              "fn": "readProperty",
+                              "args": [
+                                {
+                                  "fn": "pickBranchData",
+                                  "args": [
+                                    {
+                                      "$ref": "wde3Z2W47saBRfNEj",
+                                      "path": [
+                                        "selectedNextNodes"
+                                      ]
+                                    }
+                                  ]
+                                },
+                                "growthObjectives"
+                              ]
+                            }
+                          ]
+                        },
+                        "fldN9vyzD3cJ5nXwI": {
+                          "template": [
+                            {
+                              "fn": "readProperty",
+                              "args": [
+                                {
+                                  "fn": "pickBranchData",
+                                  "args": [
+                                    {
+                                      "$ref": "wde3Z2W47saBRfNEj",
+                                      "path": [
+                                        "selectedNextNodes"
+                                      ]
+                                    }
+                                  ]
+                                },
+                                "financialImportance"
+                              ]
+                            }
+                          ]
+                        },
+                        "fldN0OyoyOyC3SJ9R": {
+                          "template": [
+                            {
+                              "fn": "readProperty",
+                              "args": [
+                                {
+                                  "fn": "pickBranchData",
+                                  "args": [
+                                    {
+                                      "$ref": "wde3Z2W47saBRfNEj",
+                                      "path": [
+                                        "selectedNextNodes"
+                                      ]
+                                    }
+                                  ]
+                                },
+                                "upcomingCatalysts"
+                              ]
+                            }
+                          ]
+                        },
+                        "fldeG4pQQ381ZtEIl": {
+                          "template": [
+                            {
+                              "fn": "readProperty",
+                              "args": [
+                                {
+                                  "fn": "pickBranchData",
+                                  "args": [
+                                    {
+                                      "$ref": "wde3Z2W47saBRfNEj",
+                                      "path": [
+                                        "selectedNextNodes"
+                                      ]
+                                    }
+                                  ]
+                                },
+                                "confidence"
+                              ]
+                            }
+                          ]
+                        },
+                        "fldFRxU6djXXeFsfn": {
+                          "template": [
+                            {
+                              "$ref": "wacVTuseFajLbZdWN",
+                              "path": [
+                                "response",
+                                "asOfDate"
+                              ]
+                            }
+                          ]
+                        },
+                        "fld3znBgi8fFQ0bYq": {
+                          "template": [
+                            {
+                              "fn": "readProperty",
+                              "args": [
+                                {
+                                  "fn": "pickBranchData",
+                                  "args": [
+                                    {
+                                      "$ref": "wde3Z2W47saBRfNEj",
+                                      "path": [
+                                        "selectedNextNodes"
+                                      ]
+                                    }
+                                  ]
+                                },
+                                "sourceUrl"
+                              ]
+                            }
+                          ]
+                        }
+                      }
+                    }
+                  }
+                }
+              ]
+            }
+          ]
+        },
+        {
+          "name": "Revenue supported; R&D unavailable",
+          "condition": {
+            "conjunction": "and",
+            "conditions": [
+              {
+                "left": {
+                  "$ref": "wacVTuseFajLbZdWN",
+                  "path": [
+                    "response",
+                    "latestRevenueKnown"
+                  ]
+                },
+                "operator": "=",
+                "right": true,
+                "valueType": "checkbox",
+                "dataType": "literal"
+              },
+              {
+                "left": {
+                  "$ref": "wacVTuseFajLbZdWN",
+                  "path": [
+                    "response",
+                    "revenueYearKnown"
+                  ]
+                },
+                "operator": "=",
+                "right": true,
+                "valueType": "checkbox",
+                "dataType": "literal"
+              },
+              {
+                "left": {
+                  "$ref": "wacVTuseFajLbZdWN",
+                  "path": [
+                    "response",
+                    "rdSpendKnown"
+                  ]
+                },
+                "operator": "=",
+                "right": false,
+                "valueType": "checkbox",
+                "dataType": "literal"
+              }
+            ]
+          },
+          "nodes": [
+            {
+              "key": "waca3bRVsjwAcKiJ2",
+              "type": "updateRecord",
+              "description": "Write supported company financials",
+              "inputs": {
+                "updateRecordMethod": "customFields",
+                "tableId": "tbliseaiZjNPYKQCD",
+                "rowId": {
+                  "template": [
+                    {
+                      "$ref": "trigger",
+                      "path": [
+                        "id"
+                      ]
+                    }
+                  ]
+                },
+                "fields": {
+                  "obj": {
+                    "fldnARjPBTTMWBbZ0": {
+                      "template": [
+                        {
+                          "$ref": "wacVTuseFajLbZdWN",
+                          "path": [
+                            "response",
+                            "latestRevenueUSD"
+                          ]
+                        }
+                      ]
+                    },
+                    "fldZrN85YSOgPmK1k": {
+                      "template": [
+                        {
+                          "$ref": "wacVTuseFajLbZdWN",
+                          "path": [
+                            "response",
+                            "revenueYear"
+                          ]
+                        }
+                      ]
+                    }
+                  }
+                }
+              }
+            },
+            {
+              "key": "wdeT0yjfwsq3doQY2",
+              "type": "repeatingGroup",
+              "name": "Create TA Strategy records",
+              "inputs": {
+                "items": {
+                  "$ref": "wacVTuseFajLbZdWN",
+                  "path": [
+                    "response",
+                    "taStrategies"
+                  ]
+                }
+              },
+              "nodes": [
+                {
+                  "key": "wacedQk7sjj7ZihfM",
+                  "type": "createRecord",
+                  "description": "Create one strategic therapeutic-area record",
+                  "inputs": {
+                    "createRecordMethod": "customFields",
+                    "tableId": "tblCB9lt4GX60G75M",
+                    "fields": {
+                      "obj": {
+                        "fldLuqMllTjSAmOgc": {
+                          "template": [
+                            {
+                              "$ref": "trigger",
+                              "path": [
+                                "id"
+                              ]
+                            }
+                          ]
+                        },
+                        "fldRu0DMcy2uP4Rpp": {
+                          "template": [
+                            {
+                              "fn": "readProperty",
+                              "args": [
+                                {
+                                  "fn": "pickBranchData",
+                                  "args": [
+                                    {
+                                      "$ref": "wdeT0yjfwsq3doQY2",
+                                      "path": [
+                                        "selectedNextNodes"
+                                      ]
+                                    }
+                                  ]
+                                },
+                                "therapeuticArea"
+                              ]
+                            }
+                          ]
+                        },
+                        "fldijPo8c4bpP2IeA": {
+                          "template": [
+                            {
+                              "fn": "readProperty",
+                              "args": [
+                                {
+                                  "fn": "pickBranchData",
+                                  "args": [
+                                    {
+                                      "$ref": "wdeT0yjfwsq3doQY2",
+                                      "path": [
+                                        "selectedNextNodes"
+                                      ]
+                                    }
+                                  ]
+                                },
+                                "strategicPriority"
+                              ]
+                            }
+                          ]
+                        },
+                        "flds90ShuwntE1eiL": {
+                          "template": [
+                            {
+                              "fn": "readProperty",
+                              "args": [
+                                {
+                                  "fn": "pickBranchData",
+                                  "args": [
+                                    {
+                                      "$ref": "wdeT0yjfwsq3doQY2",
+                                      "path": [
+                                        "selectedNextNodes"
+                                      ]
+                                    }
+                                  ]
+                                },
+                                "strategySummary"
+                              ]
+                            }
+                          ]
+                        },
+                        "fldZFn1Ul9CBbBp0V": {
+                          "template": [
+                            {
+                              "fn": "readProperty",
+                              "args": [
+                                {
+                                  "fn": "pickBranchData",
+                                  "args": [
+                                    {
+                                      "$ref": "wdeT0yjfwsq3doQY2",
+                                      "path": [
+                                        "selectedNextNodes"
+                                      ]
+                                    }
+                                  ]
+                                },
+                                "managementStatement"
+                              ]
+                            }
+                          ]
+                        },
+                        "fld3dgyaOKK8Kzrih": {
+                          "template": [
+                            {
+                              "fn": "readProperty",
+                              "args": [
+                                {
+                                  "fn": "pickBranchData",
+                                  "args": [
+                                    {
+                                      "$ref": "wdeT0yjfwsq3doQY2",
+                                      "path": [
+                                        "selectedNextNodes"
+                                      ]
+                                    }
+                                  ]
+                                },
+                                "growthObjectives"
+                              ]
+                            }
+                          ]
+                        },
+                        "fldN9vyzD3cJ5nXwI": {
+                          "template": [
+                            {
+                              "fn": "readProperty",
+                              "args": [
+                                {
+                                  "fn": "pickBranchData",
+                                  "args": [
+                                    {
+                                      "$ref": "wdeT0yjfwsq3doQY2",
+                                      "path": [
+                                        "selectedNextNodes"
+                                      ]
+                                    }
+                                  ]
+                                },
+                                "financialImportance"
+                              ]
+                            }
+                          ]
+                        },
+                        "fldN0OyoyOyC3SJ9R": {
+                          "template": [
+                            {
+                              "fn": "readProperty",
+                              "args": [
+                                {
+                                  "fn": "pickBranchData",
+                                  "args": [
+                                    {
+                                      "$ref": "wdeT0yjfwsq3doQY2",
+                                      "path": [
+                                        "selectedNextNodes"
+                                      ]
+                                    }
+                                  ]
+                                },
+                                "upcomingCatalysts"
+                              ]
+                            }
+                          ]
+                        },
+                        "fldeG4pQQ381ZtEIl": {
+                          "template": [
+                            {
+                              "fn": "readProperty",
+                              "args": [
+                                {
+                                  "fn": "pickBranchData",
+                                  "args": [
+                                    {
+                                      "$ref": "wdeT0yjfwsq3doQY2",
+                                      "path": [
+                                        "selectedNextNodes"
+                                      ]
+                                    }
+                                  ]
+                                },
+                                "confidence"
+                              ]
+                            }
+                          ]
+                        },
+                        "fldFRxU6djXXeFsfn": {
+                          "template": [
+                            {
+                              "$ref": "wacVTuseFajLbZdWN",
+                              "path": [
+                                "response",
+                                "asOfDate"
+                              ]
+                            }
+                          ]
+                        },
+                        "fld3znBgi8fFQ0bYq": {
+                          "template": [
+                            {
+                              "fn": "readProperty",
+                              "args": [
+                                {
+                                  "fn": "pickBranchData",
+                                  "args": [
+                                    {
+                                      "$ref": "wdeT0yjfwsq3doQY2",
+                                      "path": [
+                                        "selectedNextNodes"
+                                      ]
+                                    }
+                                  ]
+                                },
+                                "sourceUrl"
+                              ]
+                            }
+                          ]
+                        }
+                      }
+                    }
+                  }
+                }
+              ]
+            }
+          ]
+        },
+        {
+          "name": "R&D supported; revenue unavailable",
+          "condition": {
+            "conjunction": "and",
+            "conditions": [
+              {
+                "left": {
+                  "$ref": "wacVTuseFajLbZdWN",
+                  "path": [
+                    "response",
+                    "latestRevenueKnown"
+                  ]
+                },
+                "operator": "=",
+                "right": false,
+                "valueType": "checkbox",
+                "dataType": "literal"
+              },
+              {
+                "left": {
+                  "$ref": "wacVTuseFajLbZdWN",
+                  "path": [
+                    "response",
+                    "rdSpendKnown"
+                  ]
+                },
+                "operator": "=",
+                "right": true,
+                "valueType": "checkbox",
+                "dataType": "literal"
+              }
+            ]
+          },
+          "nodes": [
+            {
+              "key": "wacVABN2gpRQT3kmJ",
+              "type": "updateRecord",
+              "description": "Write supported company financials",
+              "inputs": {
+                "updateRecordMethod": "customFields",
+                "tableId": "tbliseaiZjNPYKQCD",
+                "rowId": {
+                  "template": [
+                    {
+                      "$ref": "trigger",
+                      "path": [
+                        "id"
+                      ]
+                    }
+                  ]
+                },
+                "fields": {
+                  "obj": {
+                    "fldcdiI69KvGyvRDs": {
+                      "template": [
+                        {
+                          "$ref": "wacVTuseFajLbZdWN",
+                          "path": [
+                            "response",
+                            "rdSpendUSD"
+                          ]
+                        }
+                      ]
+                    }
+                  }
+                }
+              }
+            },
+            {
+              "key": "wdeUBdSKHsh0wNuW4",
+              "type": "repeatingGroup",
+              "name": "Create TA Strategy records",
+              "inputs": {
+                "items": {
+                  "$ref": "wacVTuseFajLbZdWN",
+                  "path": [
+                    "response",
+                    "taStrategies"
+                  ]
+                }
+              },
+              "nodes": [
+                {
+                  "key": "wacMZS8TOeP20xrUs",
+                  "type": "createRecord",
+                  "description": "Create one strategic therapeutic-area record",
+                  "inputs": {
+                    "createRecordMethod": "customFields",
+                    "tableId": "tblCB9lt4GX60G75M",
+                    "fields": {
+                      "obj": {
+                        "fldLuqMllTjSAmOgc": {
+                          "template": [
+                            {
+                              "$ref": "trigger",
+                              "path": [
+                                "id"
+                              ]
+                            }
+                          ]
+                        },
+                        "fldRu0DMcy2uP4Rpp": {
+                          "template": [
+                            {
+                              "fn": "readProperty",
+                              "args": [
+                                {
+                                  "fn": "pickBranchData",
+                                  "args": [
+                                    {
+                                      "$ref": "wdeUBdSKHsh0wNuW4",
+                                      "path": [
+                                        "selectedNextNodes"
+                                      ]
+                                    }
+                                  ]
+                                },
+                                "therapeuticArea"
+                              ]
+                            }
+                          ]
+                        },
+                        "fldijPo8c4bpP2IeA": {
+                          "template": [
+                            {
+                              "fn": "readProperty",
+                              "args": [
+                                {
+                                  "fn": "pickBranchData",
+                                  "args": [
+                                    {
+                                      "$ref": "wdeUBdSKHsh0wNuW4",
+                                      "path": [
+                                        "selectedNextNodes"
+                                      ]
+                                    }
+                                  ]
+                                },
+                                "strategicPriority"
+                              ]
+                            }
+                          ]
+                        },
+                        "flds90ShuwntE1eiL": {
+                          "template": [
+                            {
+                              "fn": "readProperty",
+                              "args": [
+                                {
+                                  "fn": "pickBranchData",
+                                  "args": [
+                                    {
+                                      "$ref": "wdeUBdSKHsh0wNuW4",
+                                      "path": [
+                                        "selectedNextNodes"
+                                      ]
+                                    }
+                                  ]
+                                },
+                                "strategySummary"
+                              ]
+                            }
+                          ]
+                        },
+                        "fldZFn1Ul9CBbBp0V": {
+                          "template": [
+                            {
+                              "fn": "readProperty",
+                              "args": [
+                                {
+                                  "fn": "pickBranchData",
+                                  "args": [
+                                    {
+                                      "$ref": "wdeUBdSKHsh0wNuW4",
+                                      "path": [
+                                        "selectedNextNodes"
+                                      ]
+                                    }
+                                  ]
+                                },
+                                "managementStatement"
+                              ]
+                            }
+                          ]
+                        },
+                        "fld3dgyaOKK8Kzrih": {
+                          "template": [
+                            {
+                              "fn": "readProperty",
+                              "args": [
+                                {
+                                  "fn": "pickBranchData",
+                                  "args": [
+                                    {
+                                      "$ref": "wdeUBdSKHsh0wNuW4",
+                                      "path": [
+                                        "selectedNextNodes"
+                                      ]
+                                    }
+                                  ]
+                                },
+                                "growthObjectives"
+                              ]
+                            }
+                          ]
+                        },
+                        "fldN9vyzD3cJ5nXwI": {
+                          "template": [
+                            {
+                              "fn": "readProperty",
+                              "args": [
+                                {
+                                  "fn": "pickBranchData",
+                                  "args": [
+                                    {
+                                      "$ref": "wdeUBdSKHsh0wNuW4",
+                                      "path": [
+                                        "selectedNextNodes"
+                                      ]
+                                    }
+                                  ]
+                                },
+                                "financialImportance"
+                              ]
+                            }
+                          ]
+                        },
+                        "fldN0OyoyOyC3SJ9R": {
+                          "template": [
+                            {
+                              "fn": "readProperty",
+                              "args": [
+                                {
+                                  "fn": "pickBranchData",
+                                  "args": [
+                                    {
+                                      "$ref": "wdeUBdSKHsh0wNuW4",
+                                      "path": [
+                                        "selectedNextNodes"
+                                      ]
+                                    }
+                                  ]
+                                },
+                                "upcomingCatalysts"
+                              ]
+                            }
+                          ]
+                        },
+                        "fldeG4pQQ381ZtEIl": {
+                          "template": [
+                            {
+                              "fn": "readProperty",
+                              "args": [
+                                {
+                                  "fn": "pickBranchData",
+                                  "args": [
+                                    {
+                                      "$ref": "wdeUBdSKHsh0wNuW4",
+                                      "path": [
+                                        "selectedNextNodes"
+                                      ]
+                                    }
+                                  ]
+                                },
+                                "confidence"
+                              ]
+                            }
+                          ]
+                        },
+                        "fldFRxU6djXXeFsfn": {
+                          "template": [
+                            {
+                              "$ref": "wacVTuseFajLbZdWN",
+                              "path": [
+                                "response",
+                                "asOfDate"
+                              ]
+                            }
+                          ]
+                        },
+                        "fld3znBgi8fFQ0bYq": {
+                          "template": [
+                            {
+                              "fn": "readProperty",
+                              "args": [
+                                {
+                                  "fn": "pickBranchData",
+                                  "args": [
+                                    {
+                                      "$ref": "wdeUBdSKHsh0wNuW4",
+                                      "path": [
+                                        "selectedNextNodes"
+                                      ]
+                                    }
+                                  ]
+                                },
+                                "sourceUrl"
+                              ]
+                            }
+                          ]
+                        }
+                      }
+                    }
+                  }
+                }
+              ]
+            }
+          ]
+        },
+        {
+          "name": "No supported financial write",
+          "condition": null,
+          "nodes": [
+            {
+              "key": "wdeN5ybsuoXU4aKS2",
+              "type": "repeatingGroup",
+              "name": "Create TA Strategy records",
+              "inputs": {
+                "items": {
+                  "$ref": "wacVTuseFajLbZdWN",
+                  "path": [
+                    "response",
+                    "taStrategies"
+                  ]
+                }
+              },
+              "nodes": [
+                {
+                  "key": "wac3CYAD0sZBoDhth",
+                  "type": "createRecord",
+                  "description": "Create one strategic therapeutic-area record",
+                  "inputs": {
+                    "createRecordMethod": "customFields",
+                    "tableId": "tblCB9lt4GX60G75M",
+                    "fields": {
+                      "obj": {
+                        "fldLuqMllTjSAmOgc": {
+                          "template": [
+                            {
+                              "$ref": "trigger",
+                              "path": [
+                                "id"
+                              ]
+                            }
+                          ]
+                        },
+                        "fldRu0DMcy2uP4Rpp": {
+                          "template": [
+                            {
+                              "fn": "readProperty",
+                              "args": [
+                                {
+                                  "fn": "pickBranchData",
+                                  "args": [
+                                    {
+                                      "$ref": "wdeN5ybsuoXU4aKS2",
+                                      "path": [
+                                        "selectedNextNodes"
+                                      ]
+                                    }
+                                  ]
+                                },
+                                "therapeuticArea"
+                              ]
+                            }
+                          ]
+                        },
+                        "fldijPo8c4bpP2IeA": {
+                          "template": [
+                            {
+                              "fn": "readProperty",
+                              "args": [
+                                {
+                                  "fn": "pickBranchData",
+                                  "args": [
+                                    {
+                                      "$ref": "wdeN5ybsuoXU4aKS2",
+                                      "path": [
+                                        "selectedNextNodes"
+                                      ]
+                                    }
+                                  ]
+                                },
+                                "strategicPriority"
+                              ]
+                            }
+                          ]
+                        },
+                        "flds90ShuwntE1eiL": {
+                          "template": [
+                            {
+                              "fn": "readProperty",
+                              "args": [
+                                {
+                                  "fn": "pickBranchData",
+                                  "args": [
+                                    {
+                                      "$ref": "wdeN5ybsuoXU4aKS2",
+                                      "path": [
+                                        "selectedNextNodes"
+                                      ]
+                                    }
+                                  ]
+                                },
+                                "strategySummary"
+                              ]
+                            }
+                          ]
+                        },
+                        "fldZFn1Ul9CBbBp0V": {
+                          "template": [
+                            {
+                              "fn": "readProperty",
+                              "args": [
+                                {
+                                  "fn": "pickBranchData",
+                                  "args": [
+                                    {
+                                      "$ref": "wdeN5ybsuoXU4aKS2",
+                                      "path": [
+                                        "selectedNextNodes"
+                                      ]
+                                    }
+                                  ]
+                                },
+                                "managementStatement"
+                              ]
+                            }
+                          ]
+                        },
+                        "fld3dgyaOKK8Kzrih": {
+                          "template": [
+                            {
+                              "fn": "readProperty",
+                              "args": [
+                                {
+                                  "fn": "pickBranchData",
+                                  "args": [
+                                    {
+                                      "$ref": "wdeN5ybsuoXU4aKS2",
+                                      "path": [
+                                        "selectedNextNodes"
+                                      ]
+                                    }
+                                  ]
+                                },
+                                "growthObjectives"
+                              ]
+                            }
+                          ]
+                        },
+                        "fldN9vyzD3cJ5nXwI": {
+                          "template": [
+                            {
+                              "fn": "readProperty",
+                              "args": [
+                                {
+                                  "fn": "pickBranchData",
+                                  "args": [
+                                    {
+                                      "$ref": "wdeN5ybsuoXU4aKS2",
+                                      "path": [
+                                        "selectedNextNodes"
+                                      ]
+                                    }
+                                  ]
+                                },
+                                "financialImportance"
+                              ]
+                            }
+                          ]
+                        },
+                        "fldN0OyoyOyC3SJ9R": {
+                          "template": [
+                            {
+                              "fn": "readProperty",
+                              "args": [
+                                {
+                                  "fn": "pickBranchData",
+                                  "args": [
+                                    {
+                                      "$ref": "wdeN5ybsuoXU4aKS2",
+                                      "path": [
+                                        "selectedNextNodes"
+                                      ]
+                                    }
+                                  ]
+                                },
+                                "upcomingCatalysts"
+                              ]
+                            }
+                          ]
+                        },
+                        "fldeG4pQQ381ZtEIl": {
+                          "template": [
+                            {
+                              "fn": "readProperty",
+                              "args": [
+                                {
+                                  "fn": "pickBranchData",
+                                  "args": [
+                                    {
+                                      "$ref": "wdeN5ybsuoXU4aKS2",
+                                      "path": [
+                                        "selectedNextNodes"
+                                      ]
+                                    }
+                                  ]
+                                },
+                                "confidence"
+                              ]
+                            }
+                          ]
+                        },
+                        "fldFRxU6djXXeFsfn": {
+                          "template": [
+                            {
+                              "$ref": "wacVTuseFajLbZdWN",
+                              "path": [
+                                "response",
+                                "asOfDate"
+                              ]
+                            }
+                          ]
+                        },
+                        "fld3znBgi8fFQ0bYq": {
+                          "template": [
+                            {
+                              "fn": "readProperty",
+                              "args": [
+                                {
+                                  "fn": "pickBranchData",
+                                  "args": [
+                                    {
+                                      "$ref": "wdeN5ybsuoXU4aKS2",
+                                      "path": [
+                                        "selectedNextNodes"
+                                      ]
+                                    }
+                                  ]
+                                },
+                                "sourceUrl"
+                              ]
+                            }
+                          ]
+                        }
+                      }
+                    }
+                  }
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    }
+  ],
+  "deployedVersion": null,
+  "configurationStatus": "valid"
+}

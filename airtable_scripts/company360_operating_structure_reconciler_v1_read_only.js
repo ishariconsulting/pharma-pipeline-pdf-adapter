@@ -57,7 +57,7 @@ const ALLOWED_LEVELS = new Set([
 const ALLOWED_VERIFY = new Set(["Verified", "Partially verified", "Needs verification"]);
 const DISCLOSURE_STATUSES = new Set([
   "DISCLOSED_STRUCTURE",
-  "VERIFIED_SINGLE_SEGMENT_OR_NO_SEPARATE_UNITS",
+  "VERIFIED_NO_SEPARATE_BUSINESS_UNIT_HIERARCHY",
   "INSUFFICIENT_EVIDENCE",
 ]);
 const COVERAGE_STATUSES = new Set(["FULL_CURRENT_STRUCTURE", "PARTIAL_DISCLOSURE", "NOT_APPLICABLE"]);
@@ -338,13 +338,13 @@ function buildPlan({ companyRecordId, companyName, research, existingRecords }) 
     auditStatus = "Needs Review";
     expectedCount = null;
     auditReason = "Authoritative evidence is insufficient to determine a reliable current operating structure.";
-  } else if (researchCheck.disclosureStatus === "VERIFIED_SINGLE_SEGMENT_OR_NO_SEPARATE_UNITS") {
+  } else if (researchCheck.disclosureStatus === "VERIFIED_NO_SEPARATE_BUSINESS_UNIT_HIERARCHY") {
     auditStatus = researchCheck.evidenceStrength === "High" ? "Pass" : "Needs Review";
     expectedCount = 0;
     capturedCount = 0;
     auditReason = researchCheck.evidenceStrength === "High"
-      ? "Authoritative evidence verifies a single consolidated operating segment or no separately disclosed business-unit hierarchy; zero structural records are expected."
-      : "Zero-unit conclusion has less than High evidence strength; retain review.";
+      ? "Authoritative evidence verifies that no separate business-unit hierarchy is publicly disclosed for this master scope; zero structural records are expected."
+      : "No-business-unit-hierarchy conclusion has less than High evidence strength; retain review.";
   } else if (researchCheck.disclosureStatus === "DISCLOSED_STRUCTURE") {
     expectedCount = candidates.filter(x => x.current).length;
     const projectedCaptured = new Set([
@@ -485,7 +485,9 @@ function selfTest() {
   if (p3.status !== "BLOCK") throw new Error("selfTest duplicate block failed");
 
   const zero = {
-    structureDisclosureStatus: "VERIFIED_SINGLE_SEGMENT_OR_NO_SEPARATE_UNITS",
+    // This path requires explicit evidence about BUSINESS-UNIT hierarchy.
+    // A single accounting operating segment is not sufficient.
+    structureDisclosureStatus: "VERIFIED_NO_SEPARATE_BUSINESS_UNIT_HIERARCHY",
     structureCoverage: "NOT_APPLICABLE",
     evidenceStrength: "High",
     asOfDate: "2026-10-08",

@@ -20,7 +20,7 @@ from main import _auth, app
 from html_fetch_extension import HtmlFetchResponse, _fetch_public_html
 
 
-ROUTER_VERSION = "RETRIEVAL_ROUTER_V1.0"
+ROUTER_VERSION = "RETRIEVAL_ROUTER_V1.1_FORCE_BROWSER_READ_ONLY"
 MIN_USABLE_VISIBLE_TEXT = 800
 ROUTABLE_SOURCE_STATUSES = {403, 408, 429}
 
@@ -170,9 +170,20 @@ async def routed_html_health() -> Dict[str, Any]:
 async def fetch_routed_html(
     url: str = Query(..., min_length=8),
     timeout_seconds: float = Query(default=35.0, ge=5.0, le=35.0),
+    force_browser: bool = Query(default=False),
     x_adapter_key: Optional[str] = Header(default=None),
 ) -> RoutedHtmlFetchResponse:
     _auth(x_adapter_key)
+
+    if force_browser:
+        payload = await _browser_payload(
+            url=url,
+            timeout_seconds=timeout_seconds,
+            reason="FORCED_BROWSER_REQUIRED",
+            direct_status=None,
+            direct_version=None,
+        )
+        return RoutedHtmlFetchResponse(**payload)
 
     try:
         direct = await _fetch_public_html(url, timeout_seconds=timeout_seconds)

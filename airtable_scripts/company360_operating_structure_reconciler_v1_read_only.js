@@ -7,11 +7,13 @@
  * Company Completeness Audit decision. No Portfolio access or writes.
  */
 
-const VERSION = "COMPANY360_OPERATING_STRUCTURE_RECONCILER_V1_READ_ONLY";
+const VERSION = "COMPANY360_OPERATING_STRUCTURE_RECONCILER_V1.1_MARKET_AWARE_READ_ONLY";
 const APPLY_WRITES = false;
 
 const TABLES = {
   regionalDefinitions: "tblKnET0GjoemCZE0",
+  regionMarketMapping: "tblgL5ZMMecFLd3n7",
+  markets: "tbldDJ2PaSggrkcnq",
   completenessAudit: "tbl4gfb4fkCUwR173",
 };
 
@@ -31,6 +33,24 @@ const F = {
     verification: "fldm1GxSgocLFRE9b",
     lastVerified: "fld7JCaemSyhKqBne",
     parentLink: "fld9Ow6TTUIdFCHaQ",
+  },
+  mapping: {
+    primary: "fldEnKjnPGgLXQ0bA",
+    company: "fldx9pbPQtWgdk4WN",
+    market: "fld34jYpHmIvEVtcE",
+    marketName: "fldGoHvsZ8owwU0W8",
+    region: "fldw1UhUtChuAksQC",
+    effectiveFrom: "fldcd4iXhc9Cq2abx",
+    effectiveTo: "fldqgRyERRvIhlE5A",
+    current: "fldwsEbNxt0oY4WMg",
+    sourceName: "fldct9P7twirFVYGB",
+    sourceUrl: "fldjq1JitjJrxtKix",
+    lastVerified: "fldbDMuOOydNVGNiC",
+    notes: "fldFgWiyhyixZsOsb",
+    topLevelRegion: "fld7jKMHhaeLrByE6",
+  },
+  market: {
+    name: "fldXwBVMJfM83Wn39",
   },
   audit: {
     primary: "fld1fMaYEpvdokv3z",
@@ -80,7 +100,15 @@ function isoDate(v) {
 }
 function linkIds(v) { return Array.isArray(v) ? v.map(x => x && x.id).filter(Boolean) : []; }
 function selectName(v) { return v && typeof v === "object" ? clean(v.name) : clean(v); }
-function semanticKey(name, level) { return `${norm(name)}|${clean(level)}`; }
+function normalizedMarkets(markets) {
+  return [...new Set((Array.isArray(markets) ? markets : []).map(norm).filter(Boolean))].sort();
+}
+function semanticKey(name, level, markets = []) {
+  const base = `${norm(name)}|${clean(level)}`;
+  if (clean(level) !== "Country Business Unit") return base;
+  const ms = normalizedMarkets(markets);
+  return `${base}|${ms.join("+")}`;
+}
 function isHttpsUrl(v) {
   try {
     const u = new URL(clean(v));
@@ -106,6 +134,7 @@ function candidateFromRaw(raw, global) {
     name: clean(c.name),
     level: clean(c.level),
     parentName: clean(c.parentName),
+    markets: [...new Set((Array.isArray(c.markets) ? c.markets : (c.market ? [c.market] : [])).map(clean).filter(Boolean))].sort((a,b) => norm(a).localeCompare(norm(b))),
     effectiveFrom: isoDate(c.effectiveFrom),
     effectiveTo: isoDate(c.effectiveTo),
     current: c.current !== false,
@@ -117,7 +146,7 @@ function candidateFromRaw(raw, global) {
   };
 }
 
-function existingFromRecordLike(r, companyRecordId) {
+function existingFromRecordLike(r, companyRecordId, marketNames = []) {
   const v = r.cellValuesByFieldId || r.fields || {};
   const companyIds = linkIds(v[F.regional.company]);
   if (companyRecordId && companyIds.length && !companyIds.includes(companyRecordId)) return null;
@@ -127,6 +156,7 @@ function existingFromRecordLike(r, companyRecordId) {
     name: clean(v[F.regional.name]),
     level: selectName(v[F.regional.level]),
     parentName: clean(v[F.regional.parentName]),
+    markets: [...new Set((marketNames || []).map(clean).filter(Boolean))].sort((a,b) => norm(a).localeCompare(norm(b))),
     effectiveFrom: clean(v[F.regional.effectiveFrom]),
     effectiveTo: clean(v[F.regional.effectiveTo]),
     current: !!v[F.regional.current],

@@ -291,16 +291,36 @@ function buildPlan({ companyRecordId, companyName, research, existingRecords }) 
       const nk = norm(c.parentName);
       const candidateParents = candidateByNormName.get(nk) || [];
       const existingParents = activeByNormName.get(nk) || [];
-      const total = candidateParents.length + existingParents.length;
-      if (total !== 1) {
-        blocks.push(`Parent '${c.parentName}' for '${c.name}' resolves to ${total} candidates/existing records; expected exactly 1`);
+
+      // Candidate + existing representations of the SAME semantic parent count as one logical parent.
+      const logicalParents = new Map();
+      for (const p of candidateParents) {
+        const pk = semanticKey(p.name, p.level);
+        logicalParents.set(pk, { semanticKey: pk, candidate: p, existing: null });
+      }
+      for (const p of existingParents) {
+        const pk = semanticKey(p.name, p.level);
+        const entry = logicalParents.get(pk) || { semanticKey: pk, candidate: null, existing: null };
+        entry.existing = p;
+        logicalParents.set(pk, entry);
+      }
+
+      if (logicalParents.size !== 1) {
+        blocks.push(`Parent '${c.parentName}' for '${c.name}' resolves to ${logicalParents.size} logical identities; expected exactly 1`);
       } else {
-        plannedParentLinks.push({
-          childSemanticKey: semanticKey(c.name, c.level),
-          parentName: c.parentName,
-          parentCandidateSemanticKey: candidateParents.length ? semanticKey(candidateParents[0].name, candidateParents[0].level) : null,
-          parentExistingRecordId: existingParents.length ? existingParents[0].id : null,
-        });
+        const parent = [...logicalParents.values()][0];
+        const childKey = semanticKey(c.name, c.level);
+        const childExisting = (activeByKey.get(childKey) || [])[0] || null;
+        const parentExistingRecordId = parent.existing?.id || null;
+        const alreadyLinked = !!(childExisting && parentExistingRecordId && childExisting.parentIds.includes(parentExistingRecordId));
+        if (!alreadyLinked) {
+          plannedParentLinks.push({
+            childSemanticKey: childKey,
+            parentName: c.parentName,
+            parentCandidateSemanticKey: parent.semanticKey,
+            parentExistingRecordId,
+          });
+        }
       }
     }
   }
@@ -488,7 +508,39 @@ function selfTest() {
   const p5 = buildPlan({ companyRecordId, companyName: "Example", research: changed, existingRecords: existing });
   if (p5.retirementReview.length !== 1 || p5.auditDecision.status !== "Needs Review") throw new Error("selfTest disappearance review failed");
 
-  return { ok: true, version: VERSION, tests: 5 };
+  const hierarchyResearch = deepClone(baseResearch);
+  hierarchyResearch.units.push({
+    name: "Japan Pharma Business Unit",
+    level: "Country Business Unit",
+    parentName: "International Business Unit",
+    effectiveFrom: "2026-04-01",
+    current: true,
+    definitionScope: "Japan operating unit",
+    verificationStatus: "Verified",
+    lastVerified: "2026-10-08",
+  });
+  const hierarchyExisting = [
+    existing[0],
+    { id: "recCHILD", cellValuesByFieldId: {
+      [F.regional.company]: [{ id: companyRecordId, name: "Example" }],
+      [F.regional.name]: "Japan Pharma Business Unit",
+      [F.regional.level]: { name: "Country Business Unit" },
+      [F.regional.parentName]: "International Business Unit",
+      [F.regional.effectiveFrom]: "2026-04-01",
+      [F.regional.effectiveTo]: null,
+      [F.regional.current]: true,
+      [F.regional.definition]: "Japan operating unit",
+      [F.regional.sourceName]: "Official organisation page",
+      [F.regional.sourceUrl]: "https://example.com/official",
+      [F.regional.verification]: { name: "Verified" },
+      [F.regional.lastVerified]: "2026-10-08",
+      [F.regional.parentLink]: [{ id: "recUNIT", name: "International Business Unit" }],
+    }},
+  ];
+  const p6 = buildPlan({ companyRecordId, companyName: "Example", research: hierarchyResearch, existingRecords: hierarchyExisting });
+  if (p6.status !== "PASS_PLAN" || p6.plannedParentLinks.length !== 0 || p6.blocks.length !== 0) throw new Error("selfTest parent-link idempotence failed");
+
+  return { ok: true, version: VERSION, tests: 6 };
 }
 
 if (typeof process !== "undefined" && process.env.COMPANY360_SELF_TEST === "1") {

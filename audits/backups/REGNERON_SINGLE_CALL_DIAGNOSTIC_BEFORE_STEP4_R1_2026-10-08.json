@@ -1,0 +1,39 @@
+{
+  "automationId": "wfl2gdaYYfSYzsN2X",
+  "name": "Regeneron Adapter Single-Call Timing V1 – READ ONLY / OFF",
+  "description": "One manual diagnostic only. Reads the same Source Watch and Adapter Registry binding as staging V4.4.13, then makes exactly one generic adapter extraction request with a deliberately short 5-second direct timeout. No comparator, no retries at Airtable layer, no Airtable record writes. Adapter may perform its existing bounded browser fallback. Leave OFF; use Test action once.",
+  "deploymentStatus": "undeployed",
+  "trigger": {
+    "type": "cron",
+    "inputs": {
+      "type": "oneTime",
+      "config": {
+        "obj": {
+          "triggerDateTime": "2027-01-04T00:00:00.000Z"
+        }
+      }
+    }
+  },
+  "node": {
+    "key": "wacehrMgiEL9TnGy9",
+    "type": "customScript",
+    "description": "Read binding and time one adapter extraction; zero Airtable writes",
+    "inputs": {
+      "script": "\nconst VERSION = \"REGN_ADAPTER_SINGLE_CALL_TIMING_V1_READ_ONLY\";\nconst cfg = input.config();\nconst result = {\n  version: VERSION,\n  scope: \"REGN_ADAPTER_ONLY_NO_COMPARATOR_NO_QUEUE\",\n  requestedDirectTimeoutSeconds: 5,\n  adapterAttempts: 1,\n  writes: 0,\n  liveStagingTouched: false,\n  liveWorkerTouched: false\n};\nconst overallStart = Date.now();\nlet stage = \"BINDING_READ\";\ntry {\n  const sourceWatch = base.getTable(\"Source Watch\");\n  const sw = await sourceWatch.selectRecordAsync(cfg.sourceWatchRecordId);\n  if (!sw) throw new Error(\"Source Watch record not found\");\n  const companyLinks = sw.getCellValue(\"Company\") || [];\n  const adapterLinks = sw.getCellValue(\"Adapter Registry\") || [];\n  if (companyLinks.length !== 1 || adapterLinks.length !== 1) {\n    throw new Error(\"Expected exactly one Company and Adapter Registry binding\");\n  }\n  const company = await base.getTable(\"Companies\").selectRecordAsync(companyLinks[0].id);\n  const adapter = await base.getTable(\"Adapter Registry\").selectRecordAsync(adapterLinks[0].id);\n  if (!company || !adapter) throw new Error(\"Linked Company or Adapter Registry not found\");\n  const companyName = company.getCellValueAsString(\"Name\").trim();\n  const profile = adapter.getCellValueAsString(\"Adapter Profile\").trim();\n  const handler = adapter.getCellValueAsString(\"Endpoint / Handler\")\n    .replace(/^pharma-pipeline-pdf-adapter:/i, \"\").trim();\n  if (profile !== \"PIPELINE_GENERIC_HTML_V1\" || handler !== \"/extract/generic/pipeline\") {\n    throw new Error(\"Adapter binding is not the expected generic HTML extraction route\");\n  }\n  const sourceUrl = sw.getCellValueAsString(\"Machine Source URL\").trim()\n    || sw.getCellValueAsString(\"Source URL\").trim();\n  if (!sourceUrl || !companyName) throw new Error(\"Missing company/source URL\");\n  const request = new URL(\"https://pharma-pipeline-pdf-adapter.onrender.com\" + handler);\n  request.searchParams.set(\"company\", companyName);\n  request.searchParams.set(\"source_url\", sourceUrl);\n  request.searchParams.set(\"timeout_seconds\", \"5\");\n  result.binding = {\n    company: companyName,\n    adapterProfile: profile,\n    handler,\n    sourceHost: new URL(sourceUrl).hostname\n  };\n  const key = String(input.secret(\"adapterApiKey\") || \"\");\n  if (!key) throw new Error(\"adapterApiKey secret is blank\");\n  stage = \"ONE_ADAPTER_FETCH\";\n  const callStart = Date.now();\n  console.log(\"REGN_SINGLE_CALL_STARTED\", JSON.stringify({startedAt:new Date().toISOString(), company:companyName, handler, timeoutSeconds:5}));\n  const response = await fetch(request.toString(), {\n    method: \"GET\",\n    headers: {\"Accept\":\"application/json\", \"X-Adapter-Key\":key}\n  });\n  result.adapterElapsedMs = Date.now() - callStart;\n  result.httpStatus = response.status;\n  result.httpOk = response.ok;\n  stage = \"BODY_READ\";\n  const body = await response.text();\n  result.totalBodyChars = body.length;\n  let parsed = null;\n  try { parsed = JSON.parse(body); } catch (_) {}\n  if (parsed) {\n    result.errorDetail = response.ok ? null : String(JSON.stringify(parsed.detail || parsed)).slice(0, 600);\n    result.rowCount = Array.isArray(parsed.rows) ? parsed.rows.length : null;\n    result.readyForDiscovery = parsed.readyForDiscovery === true;\n    result.structuralValidationPass = parsed.summary && parsed.summary.structuralValidationPass === true;\n    result.retrievalDiagnostics = parsed.diagnostics ? {\n      retrievalMode: parsed.diagnostics.retrievalMode || null,\n      routingReason: parsed.diagnostics.routingReason || null,\n      directFailure: parsed.diagnostics.directFailure || null\n    } : null;\n  } else {\n    result.nonJsonBodyPrefix = body.slice(0, 180);\n  }\n  result.status = response.ok ? \"ADAPTER_RESPONSE_RECEIVED\" : \"ADAPTER_HTTP_FAILURE\";\n} catch(e) {\n  result.status = \"PROBE_ERROR\";\n  result.errorStage = stage;\n  result.error = String(e && e.message || e).slice(0, 650);\n} finally {\n  result.totalElapsedMs = Date.now() - overallStart;\n  console.log(\"REGN_SINGLE_CALL_RESULT\", JSON.stringify(result));\n  output.set(\"timingDiagnostic\", JSON.stringify(result, null, 2));\n}\n",
+      "inputObj": {
+        "obj": {
+          "sourceWatchRecordId": "recp4DqsZgkBkQYMo"
+        }
+      }
+    },
+    "outputSchema": [
+      {
+        "name": "timingDiagnostic",
+        "type": "string"
+      }
+    ],
+    "secrets": {
+      "adapterApiKey": "eacBpp4ot0mTu0686"
+    }
+  }
+}

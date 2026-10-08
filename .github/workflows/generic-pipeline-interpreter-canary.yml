@@ -4,6 +4,7 @@ on:
   pull_request:
     paths:
       - "generic_pipeline_interpreter_canary.py"
+      - "generic_html_durable_key_migration_preflight.py"
       - "generic_pipeline_extension.py"
       - "service_entrypoint.py"
       - ".github/workflows/generic-pipeline-interpreter-canary.yml"
@@ -31,6 +32,18 @@ jobs:
       - name: Run read-only multi-company canary
         run: |
           python generic_pipeline_interpreter_canary.py
+
+      - name: Run Step 2 durable-key migration preflight
+        run: |
+          set -o pipefail
+          python generic_html_durable_key_migration_preflight.py | tee generic_html_durable_key_migration_preflight.json
+
+      - name: Upload Step 2 migration preflight artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: generic-html-durable-key-migration-preflight
+          path: generic_html_durable_key_migration_preflight.json
+          if-no-files-found: error
 
       - name: Smoke-test read-only generic extraction route
         run: |

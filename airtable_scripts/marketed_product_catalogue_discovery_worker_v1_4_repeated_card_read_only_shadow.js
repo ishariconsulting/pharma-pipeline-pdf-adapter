@@ -298,11 +298,14 @@ function pageDeclaredCatalogueCount(visibleText) {
 function visibleTextMedicineCandidates(visibleText, sourceUrl) {
     const t = clean(visibleText);
     const out = [];
-    const brandRe = /([A-Za-z][A-Za-z0-9'’+\-]*(?:\s+[A-Za-z][A-Za-z0-9'’+\-]*){0,4})[®™]/g;
+    const brandRe = /([A-Za-z][A-Za-z0-9'’+\-]*(?:\s+[A-Za-z][A-Za-z0-9'’+\-]*){0,3})[®™]/g;
     const markerRe = /\b(?:Prescribing Information|Medication Guide|Patient Information|View medicine site|View patient site|View HCP site|MORE INFO|INDICATIONS?\s*:)/i;
+    const leadingNoise = new Set(["view","medicine","site","hcp","patient","prescribing","information","more","info","medication","guide"]);
     let m;
     while ((m = brandRe.exec(t)) && out.length < 300) {
-        const display = canonicalBrand(m[1]);
+        const tokens = clean(m[1]).split(/\s+/).filter(Boolean);
+        while (tokens.length > 1 && leadingNoise.has(norm(tokens[0]))) tokens.shift();
+        const display = canonicalBrand(tokens.join(" "));
         const key = brandKey(display);
         if (!display || !key || looksGenericNav(display) || looksSectionHeading(display)) continue;
         const tail = t.slice(brandRe.lastIndex, brandRe.lastIndex + 420);

@@ -404,7 +404,7 @@ function buildPlan({ companyRecordId, companyName, research, existingRecords, ex
   } else if (researchCheck.disclosureStatus === "DISCLOSED_STRUCTURE") {
     expectedCount = candidates.filter(x => x.current).length;
     const projectedCaptured = new Set([
-      ...existing.filter(x => x.current).map(x => semanticKey(x.name, x.level)),
+      ...existing.filter(x => x.current).map(x => semanticKey(x.name, x.level, x.markets)),
       ...plannedCreates.filter(x => x.candidate.current).map(x => x.semanticKey),
     ]).size;
     capturedCount = projectedCaptured;
@@ -459,15 +459,51 @@ function buildPlan({ companyRecordId, companyName, research, existingRecords, ex
   };
 }
 
-async function loadExistingRecords(companyRecordId) {
-  const table = base.getTable(TABLES.regionalDefinitions);
-  const q = await table.selectRecordsAsync({ fields: Object.values(F.regional) });
-  return q.records
+async function loadExistingState(companyRecordId) {
+  const regionalTable = base.getTable(TABLES.regionalDefinitions);
+  const mappingTable = base.getTable(TABLES.regionMarketMapping);
+  const marketsTable = base.getTable(TABLES.markets);
+
+  const [regionalQ, mappingQ, marketsQ] = await Promise.all([
+    regionalTable.selectRecordsAsync({ fields: Object.values(F.regional) }),
+    mappingTable.selectRecordsAsync({ fields: Object.values(F.mapping) }),
+    marketsTable.selectRecordsAsync({ fields: [F.market.name] }),
+  ]);
+
+  const marketNameById = new Map(marketsQ.records.map(r => [r.id, clean(r.getCellValue(F.market.name))]));
+  const validMarketNames = new Set([...marketNameById.values()].filter(Boolean));
+  const existingMarketNamesByDefinition = new Map();
+
+  for (const r of mappingQ.records) {
+    if (!linkIds(r.getCellValue(F.mapping.company)).includes(companyRecordId)) continue;
+    const regionIds = [...new Set([
+      ...linkIds(r.getCellValue(F.mapping.region)),
+      ...linkIds(r.getCellValue(F.mapping.topLevelRegion)),
+    ])];
+    const linkedMarketIds = linkIds(r.getCellValue(F.mapping.market));
+    const marketNames = [
+      clean(r.getCellValue(F.mapping.marketName)),
+      ...linkedMarketIds.map(id => marketNameById.get(id) || ""),
+    ].filter(Boolean);
+    for (const regionId of regionIds) {
+      if (!existingMarketNamesByDefinition.has(regionId)) existingMarketNamesByDefinition.set(regionId, new Set());
+      const set = existingMarketNamesByDefinition.get(regionId);
+      for (const name of marketNames) set.add(name);
+    }
+  }
+
+  const normalizedMappingMap = new Map(
+    [...existingMarketNamesByDefinition.entries()].map(([id,set]) => [id, [...set]])
+  );
+
+  const existingRecords = regionalQ.records
     .filter(r => linkIds(r.getCellValue(F.regional.company)).includes(companyRecordId))
     .map(r => ({
       id: r.id,
       cellValuesByFieldId: Object.fromEntries(Object.values(F.regional).map(fid => [fid, r.getCellValue(fid)])),
     }));
+
+  return { existingRecords, existingMarketNamesByDefinition: normalizedMappingMap, validMarketNames };
 }
 
 async function main() {
@@ -479,8 +515,15 @@ async function main() {
   if (!companyRecordId) throw new Error("companyRecordId is required");
   if (!companyName) throw new Error("companyName is required");
 
-  const existingRecords = await loadExistingRecords(companyRecordId);
-  const plan = buildPlan({ companyRecordId, companyName, research, existingRecords });
+  const state = await loadExistingState(companyRecordId);
+  const plan = buildPlan({
+    companyRecordId,
+    companyName,
+    research,
+    existingRecords: state.existingRecords,
+    existingMarketNamesByDefinition: state.existingMarketNamesByDefinition,
+    validMarketNames: state.validMarketNames,
+  });
 
   output.set("version", VERSION);
   output.set("status", plan.status);
@@ -488,7 +531,9 @@ async function main() {
   output.set("plannedCreateCount", plan.plannedCreates.length);
   output.set("plannedUpdateCount", plan.plannedUpdates.length);
   output.set("plannedParentLinkCount", plan.plannedParentLinks.length);
+  output.set("plannedMarketMappingCount", plan.plannedMarketMappings.length);
   output.set("retirementReviewCount", plan.retirementReview.length);
+  output.set("mappingReviewCount", plan.mappingReview.length);
   output.set("versionChangeReviewCount", plan.versionChangeReview.length);
   output.set("blockCount", plan.blocks.length);
   output.set("airtableWrites", 0);
@@ -573,6 +618,7 @@ function selfTest() {
     name: "Japan Pharma Business Unit",
     level: "Country Business Unit",
     parentName: "International Business Unit",
+    markets: ["Japan"],
     effectiveFrom: "2026-04-01",
     current: true,
     definitionScope: "Japan operating unit",
@@ -597,10 +643,51 @@ function selfTest() {
       [F.regional.parentLink]: [{ id: "recUNIT", name: "International Business Unit" }],
     }},
   ];
-  const p6 = buildPlan({ companyRecordId, companyName: "Example", research: hierarchyResearch, existingRecords: hierarchyExisting });
-  if (p6.status !== "PASS_PLAN" || p6.plannedParentLinks.length !== 0 || p6.blocks.length !== 0) throw new Error("selfTest parent-link idempotence failed");
+  const p6 = buildPlan({
+    companyRecordId,
+    companyName: "Example",
+    research: hierarchyResearch,
+    existingRecords: hierarchyExisting,
+    existingMarketNamesByDefinition: new Map([["recCHILD", ["Japan"]]]),
+    validMarketNames: new Set(["Japan"]),
+  });
+  if (p6.status !== "PASS_PLAN" || p6.plannedParentLinks.length !== 0 || p6.plannedMarketMappings.length !== 0 || p6.blocks.length !== 0) {
+    throw new Error("selfTest parent-link/market idempotence failed");
+  }
 
-  return { ok: true, version: VERSION, tests: 6 };
+  const repeatedCountryName = deepClone(baseResearch);
+  repeatedCountryName.units = [
+    {
+      name: "Oncology Business Unit",
+      level: "Country Business Unit",
+      parentName: "",
+      markets: ["Canada"],
+      current: true,
+      definitionScope: "Canada oncology commercial unit",
+      verificationStatus: "Verified",
+    },
+    {
+      name: "Oncology Business Unit",
+      level: "Country Business Unit",
+      parentName: "",
+      markets: ["Israel"],
+      current: true,
+      definitionScope: "Israel oncology commercial unit",
+      verificationStatus: "Verified",
+    },
+  ];
+  const p7 = buildPlan({
+    companyRecordId,
+    companyName: "Example",
+    research: repeatedCountryName,
+    existingRecords: [],
+    validMarketNames: new Set(["Canada", "Israel"]),
+  });
+  if (p7.status !== "PASS_PLAN" || p7.plannedCreates.length !== 2 || p7.plannedMarketMappings.length !== 2 || p7.blocks.length !== 0) {
+    throw new Error("selfTest repeated country-business-unit names failed");
+  }
+
+  return { ok: true, version: VERSION, tests: 7 };
 }
 
 if (typeof process !== "undefined" && process.env.COMPANY360_SELF_TEST === "1") {

@@ -7,7 +7,7 @@
  * Company Completeness Audit decision. No Portfolio access or writes.
  */
 
-const VERSION = "COMPANY360_OPERATING_STRUCTURE_RECONCILER_V1.1_MARKET_AWARE_READ_ONLY";
+const VERSION = "COMPANY360_OPERATING_STRUCTURE_RECONCILER_V1.2_PUBLIC_SCOPE_COMPLETENESS_READ_ONLY";
 const APPLY_WRITES = false;
 
 const TABLES = {
@@ -80,7 +80,7 @@ const DISCLOSURE_STATUSES = new Set([
   "VERIFIED_NO_SEPARATE_BUSINESS_UNIT_HIERARCHY",
   "INSUFFICIENT_EVIDENCE",
 ]);
-const COVERAGE_STATUSES = new Set(["FULL_CURRENT_STRUCTURE", "PARTIAL_DISCLOSURE", "NOT_APPLICABLE"]);
+const COVERAGE_STATUSES = new Set(["FULL_CURRENT_STRUCTURE", "PUBLIC_EVIDENCE_SCOPE_COMPLETE", "PARTIAL_DISCLOSURE", "NOT_APPLICABLE"]);
 
 function clean(v) { return String(v ?? "").trim(); }
 function norm(v) {
@@ -177,6 +177,7 @@ function validateResearch(research) {
   const asOfDate = isoDate(research.asOfDate);
   const sourceName = clean(research.sourceName);
   const sourceUrl = clean(research.sourceUrl);
+  const scopeStatement = clean(research.scopeStatement);
 
   if (research.__parseError) blocks.push(research.__parseError);
   if (!DISCLOSURE_STATUSES.has(disclosureStatus)) blocks.push(`Invalid structureDisclosureStatus: ${disclosureStatus || "<blank>"}`);
@@ -185,12 +186,13 @@ function validateResearch(research) {
   if (!asOfDate) blocks.push("asOfDate must be YYYY-MM-DD");
   if (!sourceName) blocks.push("sourceName is required");
   if (!isHttpsUrl(sourceUrl)) blocks.push("sourceUrl must be an https URL");
+  if (structureCoverage === "PUBLIC_EVIDENCE_SCOPE_COMPLETE" && !scopeStatement) blocks.push("PUBLIC_EVIDENCE_SCOPE_COMPLETE requires a non-empty scopeStatement");
 
   const rawUnits = Array.isArray(research.units) ? research.units : [];
   if (disclosureStatus === "DISCLOSED_STRUCTURE" && rawUnits.length === 0) blocks.push("DISCLOSED_STRUCTURE requires at least one unit");
   if (disclosureStatus !== "DISCLOSED_STRUCTURE" && rawUnits.length > 0) blocks.push(`${disclosureStatus} must not include structural unit records`);
 
-  return { blocks, disclosureStatus, structureCoverage, evidenceStrength, asOfDate, sourceName, sourceUrl, rawUnits };
+  return { blocks, disclosureStatus, structureCoverage, evidenceStrength, asOfDate, sourceName, sourceUrl, scopeStatement, rawUnits };
 }
 
 function validateCandidates(rawUnits, global, validMarketNames = null) {
@@ -408,7 +410,8 @@ function buildPlan({ companyRecordId, companyName, research, existingRecords, ex
       ...plannedCreates.filter(x => x.candidate.current).map(x => x.semanticKey),
     ]).size;
     capturedCount = projectedCaptured;
-    if (researchCheck.structureCoverage !== "FULL_CURRENT_STRUCTURE") {
+    const scopeComplete = researchCheck.structureCoverage === "FULL_CURRENT_STRUCTURE" || researchCheck.structureCoverage === "PUBLIC_EVIDENCE_SCOPE_COMPLETE";
+    if (!scopeComplete) {
       auditStatus = "Needs Review";
       auditReason = "Current evidence is partial disclosure, so completeness cannot pass.";
     } else if (researchCheck.evidenceStrength !== "High") {
@@ -419,7 +422,9 @@ function buildPlan({ companyRecordId, companyName, research, existingRecords, ex
       auditReason = "Current structure is evidenced, but retirement/version-change review remains open.";
     } else {
       auditStatus = "Pass";
-      auditReason = "Full current structure is evidenced at High confidence and reconciles without unresolved semantic conflicts.";
+      auditReason = researchCheck.structureCoverage === "PUBLIC_EVIDENCE_SCOPE_COMPLETE"
+        ? `Declared public-evidence scope is complete at High confidence and reconciles without unresolved semantic conflicts. Scope: ${researchCheck.scopeStatement}. This does not claim undisclosed/private internal structure.`
+        : "Full current structure is evidenced at High confidence and reconciles without unresolved semantic conflicts.";
     }
   }
 
@@ -687,7 +692,13 @@ function selfTest() {
     throw new Error("selfTest repeated country-business-unit names failed");
   }
 
-  return { ok: true, version: VERSION, tests: 7 };
+  const publicScope = deepClone(baseResearch);
+  publicScope.structureCoverage = "PUBLIC_EVIDENCE_SCOPE_COMPLETE";
+  publicScope.scopeStatement = "Material company-defined operating/commercial units publicly disclosed for Company 360.";
+  const p8 = buildPlan({ companyRecordId, companyName: "Example", research: publicScope, existingRecords: empty });
+  if (p8.status !== "PASS_PLAN" || p8.auditDecision.status !== "Pass") throw new Error("selfTest public-scope completeness failed");
+
+  return { ok: true, version: VERSION, tests: 8 };
 }
 
 if (typeof process !== "undefined" && process.env.COMPANY360_SELF_TEST === "1") {

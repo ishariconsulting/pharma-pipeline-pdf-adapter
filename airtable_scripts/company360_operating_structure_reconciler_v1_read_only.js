@@ -193,10 +193,11 @@ function validateResearch(research) {
   return { blocks, disclosureStatus, structureCoverage, evidenceStrength, asOfDate, sourceName, sourceUrl, rawUnits };
 }
 
-function validateCandidates(rawUnits, global) {
+function validateCandidates(rawUnits, global, validMarketNames = null) {
   const candidates = rawUnits.map(x => candidateFromRaw(x, global));
   const blocks = [];
   const seen = new Map();
+  const validMarkets = validMarketNames ? new Set([...validMarketNames].map(norm)) : null;
 
   for (let i = 0; i < candidates.length; i++) {
     const c = candidates[i];
@@ -209,29 +210,37 @@ function validateCandidates(rawUnits, global) {
     if (!ALLOWED_VERIFY.has(c.verificationStatus)) blocks.push(`${label}: invalid verificationStatus '${c.verificationStatus}'`);
     if (!c.lastVerified) blocks.push(`${label}: lastVerified/asOfDate must be YYYY-MM-DD`);
     if (c.effectiveTo && c.current) blocks.push(`${label}: current=true cannot have effectiveTo`);
-    const key = semanticKey(c.name, c.level);
+    if (c.level === "Country Business Unit" && c.markets.length !== 1) {
+      blocks.push(`${label}: Country Business Unit requires exactly one explicit market`);
+    }
+    if (validMarkets) {
+      for (const market of c.markets) {
+        if (!validMarkets.has(norm(market))) blocks.push(`${label}: market '${market}' is not present in the Markets master`);
+      }
+    }
+    const key = semanticKey(c.name, c.level, c.markets);
     if (seen.has(key)) blocks.push(`${label}: duplicate candidate semantic identity with unit[${seen.get(key)}] (${key})`);
     else seen.set(key, i);
   }
   return { candidates, blocks };
 }
 
-function buildPlan({ companyRecordId, companyName, research, existingRecords }) {
+function buildPlan({ companyRecordId, companyName, research, existingRecords, existingMarketNamesByDefinition = new Map(), validMarketNames = null }) {
   const researchCheck = validateResearch(research);
   const global = {
     sourceName: researchCheck.sourceName,
     sourceUrl: researchCheck.sourceUrl,
     asOfDate: researchCheck.asOfDate,
   };
-  const candidateCheck = validateCandidates(researchCheck.rawUnits, global);
+  const candidateCheck = validateCandidates(researchCheck.rawUnits, global, validMarketNames);
   const blocks = [...researchCheck.blocks, ...candidateCheck.blocks];
   const candidates = candidateCheck.candidates;
-  const existing = (existingRecords || []).map(r => existingFromRecordLike(r, companyRecordId)).filter(Boolean);
+  const existing = (existingRecords || []).map(r => existingFromRecordLike(r, companyRecordId, existingMarketNamesByDefinition.get(r.id) || [])).filter(Boolean);
 
   const activeByKey = new Map();
   const historicalByKey = new Map();
   for (const e of existing) {
-    const key = semanticKey(e.name, e.level);
+    const key = semanticKey(e.name, e.level, e.markets);
     const target = e.current ? activeByKey : historicalByKey;
     if (!target.has(key)) target.set(key, []);
     target.get(key).push(e);
@@ -243,14 +252,16 @@ function buildPlan({ companyRecordId, companyName, research, existingRecords }) 
   const plannedCreates = [];
   const plannedUpdates = [];
   const plannedParentLinks = [];
+  const plannedMarketMappings = [];
   const noops = [];
   const retirementReview = [];
+  const mappingReview = [];
   const versionChangeReview = [];
 
   if (blocks.length === 0 && researchCheck.disclosureStatus === "DISCLOSED_STRUCTURE") {
     const candidateKeys = new Set();
     for (const c of candidates) {
-      const key = semanticKey(c.name, c.level);
+      const key = semanticKey(c.name, c.level, c.markets);
       candidateKeys.add(key);
       const active = activeByKey.get(key) || [];
       const historical = historicalByKey.get(key) || [];
@@ -277,6 +288,20 @@ function buildPlan({ companyRecordId, companyName, research, existingRecords }) 
         if (!e.effectiveFrom && c.effectiveFrom) changes.effectiveFrom = c.effectiveFrom;
         if (Object.keys(changes).length) plannedUpdates.push({ semanticKey: key, recordId: e.id, changes, candidate: c });
         else noops.push({ semanticKey: key, recordId: e.id });
+
+        const existingMarkets = new Set(e.markets.map(norm));
+        const candidateMarkets = new Set(c.markets.map(norm));
+        for (const market of c.markets) {
+          if (!existingMarkets.has(norm(market))) plannedMarketMappings.push({ semanticKey: key, definitionRecordId: e.id, market });
+        }
+        for (const market of e.markets) {
+          if (!candidateMarkets.has(norm(market))) mappingReview.push({
+            semanticKey: key,
+            definitionRecordId: e.id,
+            market,
+            reason: "Existing active market mapping is absent from current evidence. Review only; never auto-retire from one snapshot.",
+          });
+        }
       } else if (active.length === 0) {
         const sameHistoricalDate = historical.find(h => h.effectiveFrom && c.effectiveFrom && h.effectiveFrom === c.effectiveFrom);
         if (sameHistoricalDate) {
@@ -288,6 +313,7 @@ function buildPlan({ companyRecordId, companyName, research, existingRecords }) 
           continue;
         }
         plannedCreates.push({ semanticKey: key, candidate: c });
+        for (const market of c.markets) plannedMarketMappings.push({ semanticKey: key, definitionRecordId: null, market });
       }
     }
 
@@ -325,11 +351,11 @@ function buildPlan({ companyRecordId, companyName, research, existingRecords }) 
       // Candidate + existing representations of the SAME semantic parent count as one logical parent.
       const logicalParents = new Map();
       for (const p of candidateParents) {
-        const pk = semanticKey(p.name, p.level);
+        const pk = semanticKey(p.name, p.level, p.markets);
         logicalParents.set(pk, { semanticKey: pk, candidate: p, existing: null });
       }
       for (const p of existingParents) {
-        const pk = semanticKey(p.name, p.level);
+        const pk = semanticKey(p.name, p.level, p.markets);
         const entry = logicalParents.get(pk) || { semanticKey: pk, candidate: null, existing: null };
         entry.existing = p;
         logicalParents.set(pk, entry);
@@ -339,7 +365,7 @@ function buildPlan({ companyRecordId, companyName, research, existingRecords }) 
         blocks.push(`Parent '${c.parentName}' for '${c.name}' resolves to ${logicalParents.size} logical identities; expected exactly 1`);
       } else {
         const parent = [...logicalParents.values()][0];
-        const childKey = semanticKey(c.name, c.level);
+        const childKey = semanticKey(c.name, c.level, c.markets);
         const childExisting = (activeByKey.get(childKey) || [])[0] || null;
         const parentExistingRecordId = parent.existing?.id || null;
         const alreadyLinked = !!(childExisting && parentExistingRecordId && childExisting.parentIds.includes(parentExistingRecordId));
@@ -355,7 +381,7 @@ function buildPlan({ companyRecordId, companyName, research, existingRecords }) 
     }
   }
 
-  const reviewItems = [...retirementReview, ...versionChangeReview];
+  const reviewItems = [...retirementReview, ...mappingReview, ...versionChangeReview];
   let auditStatus = "Needs Review";
   let expectedCount = null;
   let capturedCount = existing.filter(x => x.current).length;
@@ -411,8 +437,10 @@ function buildPlan({ companyRecordId, companyName, research, existingRecords }) 
     plannedCreates,
     plannedUpdates,
     plannedParentLinks,
+    plannedMarketMappings,
     noops,
     retirementReview,
+    mappingReview,
     versionChangeReview,
     auditDecision: {
       status: auditStatus,
@@ -424,7 +452,7 @@ function buildPlan({ companyRecordId, companyName, research, existingRecords }) 
       notes: auditReason,
       nextAction: auditStatus === "Pass" ? "No action required; refresh on next authoritative structural change." : "Resolve structural evidence/reconciliation review before marking this completeness check Pass.",
     },
-    writesPlanned: plannedCreates.length + plannedUpdates.length + plannedParentLinks.length + 1,
+    writesPlanned: plannedCreates.length + plannedUpdates.length + plannedParentLinks.length + plannedMarketMappings.length + 1,
     airtableWrites: 0,
     portfolioWrites: 0,
     masterPortfolioWrites: 0,

@@ -1,0 +1,2059 @@
+/*
+V2.61.0 SOURCE-WATCH-DRIVEN REGISTRY-CONTRACT PIPELINE MONITOR + DYNAMIC ADAPTER ROUTING + QUEUE ROUTER
+Purpose
+-------
+Compare the structurally validated target company official pipeline snapshot against
+existing target-company Portfolio rows before any initial backfill or recurring monitoring.
+Delta classes
+-------------
+- NEW PROGRAMME
+- PHASE CHANGE
+- INDICATION / PROGRAMME CHANGE
+- SOURCE DISAPPEARANCE
+- NO CHANGE
+- LATER STAGE PRESERVED (verified Airtable state is ahead of R&D pipeline source)
+Required Airtable configuration
+-------------------------------
+Input:
+sourceWatchRecordId = current Source Watch record from the repeating group
+Secret:
+adapterApiKey     = existing Airtable secret
+Important
+---------
+- Portfolio master data remains read-only. Material deltas may be written only to Intelligence Update Queue, and Source Watch operational metadata may be refreshed.
+- The adapter's structural validation is the source guardrail.
+- Source counts are dynamic; no company-specific historical row count is a production requirement.
+- Absence from one pipeline refresh is never an automatic discontinuation.
+- Phase matching is not allowed to override asset/programme identity.
+*/
+const VERSION = "STEP4_R1B_CANDIDATE_PERSISTENCE_PREFLIGHT_V1_READ_ONLY - V2.61.3 RECONCILIATION LOGIC";
+const cfg = input.config();
+const sourceWatchRecordId = String(cfg.sourceWatchRecordId || "").trim();
+const CANARY_READ_ONLY = true;
+// Candidate-ledger execution is deliberately disabled by default.
+// Turning this true is the ONLY switch required for the controlled Candidate-only write.
+// Portfolio, Intelligence Update Queue and Source Watch writes remain separately disabled.
+const APPLY_CANDIDATE_HOLD_LEDGER_WRITES = false;
+const ALLOW_NON_CANDIDATE_AIRTABLE_WRITES = false;
+try {
+    const ADAPTER_BASE_URL = "https://pharma-pipeline-pdf-adapter.onrender.com";
+if (!sourceWatchRecordId) {
+    throw new Error(
+        "sourceWatchRecordId is blank. Map this input from the current Source Watch record in the repeating group."
+    );
+}
+let adapterApiKey = "";
+try {
+    if (typeof input.secret === "function") {
+        adapterApiKey = String(input.secret("adapterApiKey") || "");
+    } else if (input.secret && input.secret.adapterApiKey) {
+        adapterApiKey = String(input.secret.adapterApiKey || "");
+    }
+} catch (e) {
+    throw new Error(`Unable to read Airtable secret adapterApiKey: ${e.message || e}`);
+}
+if (!adapterApiKey) throw new Error("Airtable secret adapterApiKey is blank or unavailable.");
+const companiesTable = base.getTable("Companies");
+const sourceWatchTable = base.getTable("Source Watch");
+const adaptersTable = base.getTable("Adapter Registry");
+const portfolioTable = base.getTable("Portfolio");
+const updateQueueTable = base.getTable("Intelligence Update Queue");
+const candidateTable = base.getTable("Portfolio Discovery Candidates");
+function txt(v) {
+    return v === null || v === undefined ? "" : String(v);
+}
+function clean(v) {
+    return txt(v).replace(/\s+/g, " ").trim();
+}
+function norm(v) {
+    return txt(v)
+        .toLowerCase()
+        .normalize("NFKD")
+        .replace(/[\u0300-\u036f]/g, "")
+        .replace(/[®™]/g, "")
+        .replace(/\b([a-z][a-z0-9]{3,})tm\b/g, "$1")
+        .replace(/[–—‑−]/g, "-")
+        .replace(/[^a-z0-9]+/g, " ")
+        .replace(/\s+/g, " ")
+        .trim();
+}
+function compact(v) {
+    return norm(v).replace(/\s+/g, "");
+}
+function unique(arr) {
+    return [...new Set((arr || []).filter(Boolean))];
+}
+function field(name) {
+    try { return portfolioTable.getField(name); } catch (_) { return null; }
+}
+function cellText(record, f) {
+    if (!f) return "";
+    try { return clean(record.getCellValueAsString(f)); } catch (_) { return ""; }
+}
+function selectText(record, f) {
+    if (!f) return "";
+    const raw = record.getCellValue(f);
+    if (raw && typeof raw === "object" && raw.name) return clean(raw.name);
+    return cellText(record, f);
+}
+function linkNames(record, f) {
+    if (!f) return [];
+    const raw = record.getCellValue(f);
+    if (!Array.isArray(raw)) return [];
+    return raw.map(x => clean(x && x.name)).filter(Boolean);
+}
+function tokenSet(v, stop = new Set()) {
+    return new Set(
+        norm(v).split(" ").filter(t => t && t.length > 1 && !stop.has(t))
+    );
+}
+function similarity(a, b, stop = new Set()) {
+    const A = tokenSet(a, stop);
+    const B = tokenSet(b, stop);
+    if (!A.size || !B.size) return 0;
+    let inter = 0;
+    for (const t of A) if (B.has(t)) inter++;
+    const union = new Set([...A, ...B]).size;
+    const containment = inter / Math.min(A.size, B.size);
+    const jaccard = inter / union;
+    return 0.7 * containment + 0.3 * jaccard;
+}
+const IND_STOP = new Set([
+    "the","a","an","and","or","of","for","to","in","with","without","patients","patient",
+    "adults","adult","children","pediatric","biologic","us","eu","orphan","fast","track",
+    "prime","priority","review","study"
+]);
+function normalizedIndication(v) {
+    return norm(
+        txt(v)
+            .replace(/\bfirst[- ]line\b/gi, "1L")
+            .replace(/\bsecond[- ]line\b/gi, "2L")
+            .replace(/\bthird[- ]line\b/gi, "3L")
+            .replace(/\bnon[- ]small cell lung cancer\b/gi, "NSCLC")
+            .replace(/\bchronic weight management\b/gi, "obesity weight management")
+            .replace(/\bcastration resistant\b/gi, "CRPC")
+            .replace(/\bcastration sensitive\b/gi, "CSPC")
+    );
+}
+function indicationSimilarity(a, b) {
+    return similarity(normalizedIndication(a), normalizedIndication(b), IND_STOP);
+}
+function extractCodes(v) {
+    const raw = txt(v).toUpperCase().replace(/[–—‑−]/g, "-");
+    const patterns = [
+        /\bPF-\s?\d{5,9}\b/g,
+        /\bMET-\s?\d{2,5}I\b/g,
+        /\bVLA\s?\d{2,5}\b/g,
+        /\bSAR[- ]?\d{4,9}\b/g,
+        /\bSP[- ]?\d{4,9}\b/g
+    ];
+    let out = [];
+    for (const p of patterns) out = out.concat(raw.match(p) || []);
+    return unique(out.map(x => x.replace(/\s+/g, "")));
+}
+function sourceIdentityParts(row) {
+    const a = clean(row.asset);
+    const parts = [a, row.developmentCode];
+    const beforeParen = clean(a.split("(")[0]);
+    if (beforeParen) parts.push(beforeParen);
+    const paren = /\(([^)]+)\)/g;
+    let m;
+    while ((m = paren.exec(a)) !== null) parts.push(clean(m[1]));
+    for (const p of a.split(/\+|\//g)) parts.push(clean(p.replace(/[()]/g, " ")));
+    return unique(parts.map(norm).filter(Boolean));
+}
+function existingIdentityParts(record, f) {
+    const values = [
+        cellText(record, f.brand),
+        cellText(record, f.molecule),
+        cellText(record, f.devCode),
+        cellText(record, f.aliases)
+    ];
+    const parts = [];
+    for (const v of values) {
+        if (!v) continue;
+        parts.push(v);
+        for (const p of v.split(/\+|\/|;|\n/g)) parts.push(p);
+    }
+    return unique(parts.map(norm).filter(Boolean));
+}
+function identityEvidence(sourceRow, record, f) {
+    const sourceParts = sourceIdentityParts(sourceRow);
+    const existingParts = existingIdentityParts(record, f);
+    const sCodes = new Set(unique([
+        ...extractCodes(sourceRow.asset),
+        ...extractCodes(sourceRow.developmentCode)
+    ]).map(compact));
+    const eCodes = new Set(unique([
+        ...extractCodes(cellText(record, f.brand)),
+        ...extractCodes(cellText(record, f.molecule)),
+        ...extractCodes(cellText(record, f.devCode)),
+        ...extractCodes(cellText(record, f.aliases))
+    ]).map(compact));
+    const sharedCodes = [...sCodes].filter(c => eCodes.has(c));
+    let exactIdentity = false;
+    let exactPartIdentity = false;
+    let bestSimilarity = 0;
+    for (const s of sourceParts) {
+        for (const e of existingParts) {
+            if (!s || !e) continue;
+            if (s === e) {
+                exactPartIdentity = true;
+                exactIdentity = true;
+            } else if (
+                (s.length >= 5 && e.includes(s)) ||
+                (e.length >= 5 && s.includes(e))
+            ) {
+                exactIdentity = true;
+            }
+            bestSimilarity = Math.max(bestSimilarity, similarity(s, e));
+        }
+    }
+    return {
+        sharedCodes,
+        codeMatch: sharedCodes.length > 0,
+        exactIdentity,
+        exactPartIdentity,
+        identitySimilarity: bestSimilarity
+    };
+}
+function sourceWholeIdentityCandidates(row) {
+    const raw = clean(row.asset);
+    const noParen = clean(raw.replace(/\([^)]*\)/g, " "));
+    const values = [raw, noParen, row.developmentCode];
+    return unique(values.map(norm).filter(Boolean));
+}
+function existingWholeIdentityCandidates(record, f) {
+    const values = [
+        cellText(record, f.brand),
+        cellText(record, f.molecule),
+        cellText(record, f.devCode)
+    ];
+    const aliases = cellText(record, f.aliases);
+    if (aliases) {
+        for (const a of aliases.split(/\n|;|,/g)) values.push(clean(a));
+    }
+    return unique(values.map(norm).filter(Boolean));
+}
+function wholeIdentityEvidence(sourceRow, record, f) {
+    const sourceWhole = sourceWholeIdentityCandidates(sourceRow);
+    const existingWhole = existingWholeIdentityCandidates(record, f);
+    let exactWholeIdentity = false;
+    let wholeIdentitySimilarity = 0;
+    for (const a of sourceWhole) {
+        for (const b of existingWhole) {
+            if (!a || !b) continue;
+            if (a === b) exactWholeIdentity = true;
+            wholeIdentitySimilarity = Math.max(
+                wholeIdentitySimilarity,
+                similarity(a, b)
+            );
+        }
+    }
+    const sourceCodes = unique([
+        ...extractCodes(sourceRow.asset),
+        ...extractCodes(sourceRow.developmentCode)
+    ]).map(compact);
+    const existingCodes = unique([
+        ...extractCodes(cellText(record, f.brand)),
+        ...extractCodes(cellText(record, f.molecule)),
+        ...extractCodes(cellText(record, f.devCode)),
+        ...extractCodes(cellText(record, f.aliases))
+    ]).map(compact);
+    const sharedCodes = sourceCodes.filter(c => existingCodes.includes(c));
+    return {
+        exactWholeIdentity,
+        wholeIdentitySimilarity,
+        sourceCodes,
+        existingCodes,
+        sharedCodes,
+        sourceCodeCoverage: sourceCodes.length ? sharedCodes.length / sourceCodes.length : 0,
+        existingCodeCoverage: existingCodes.length ? sharedCodes.length / existingCodes.length : 0
+    };
+}
+function hasStrongIdentity(pair) {
+    if (!pair) return false;
+    if (pair.prog.programmeMatch) return true;
+    if (pair.whole.exactWholeIdentity) return true;
+    if (
+        pair.id.codeMatch &&
+        pair.whole.wholeIdentitySimilarity >= 0.60 &&
+        pair.whole.sourceCodeCoverage >= 0.50
+    ) return true;
+    if (
+        pair.id.exactIdentity &&
+        pair.whole.wholeIdentitySimilarity >= 0.72
+    ) return true;
+    return false;
+}
+function hasAnyIdentity(pair) {
+    if (!pair) return false;
+    return Boolean(
+        pair.prog.programmeMatch ||
+        pair.whole.exactWholeIdentity ||
+        pair.id.codeMatch ||
+        (
+            pair.id.exactIdentity &&
+            pair.whole.wholeIdentitySimilarity >= 0.45
+        )
+    );
+}
+/* ------------------------------------------------------------
+   Study / programme acronym extraction
+   ------------------------------------------------------------ */
+function programmeTokensFromSource(indication) {
+    const raw = txt(indication).replace(/[–—‑−]/g, "-");
+    const tokens = [];
+    const paren = /\(([^)]+)\)/g;
+    let m;
+    while ((m = paren.exec(raw)) !== null) {
+        const group = clean(m[1]);
+        if (!group) continue;
+        if (/^(biologic|orphan|fast track|prime|priority review|rpd)/i.test(group)) continue;
+        if (/[A-Za-z]/.test(group) && /\d/.test(group)) {
+            tokens.push(compact(group));
+        }
+    }
+    const common = raw.match(
+        /\b(?:MM|MEVPRO|FOURLIGHT|HER2CLIMB|TALAPRO|KATSIS|DV|EV|TV|VALOR|MOUNTAINEER|SYMBIOTIC[- A-Z0-9]*|BE6A\s*LUNG|PADL1NK)[- A-Z0-9]*\d+\b/gi
+    ) || [];
+    for (const x of common) tokens.push(compact(x));
+    return unique(tokens.filter(t => t.length >= 3));
+}
+function programmeTokensFromExisting(record, f) {
+    const names = linkNames(record, f.clinicalTrials);
+    const out = [];
+    for (const name of names) {
+        const cleaned = name.replace(/\bNCT\d+\b/gi, " ");
+        const pieces = cleaned.split(/[|/;,]/g).map(clean).filter(Boolean);
+        for (const p of pieces) out.push(compact(p));
+        out.push(compact(cleaned));
+    }
+    const indicationTokens = programmeTokensFromSource(
+        cellText(record, f.indication)
+    );
+    for (const t of indicationTokens) out.push(t);
+    return unique(out.filter(t => t.length >= 3));
+}
+function programmeMatchEvidence(sourceRow, record, f) {
+    const sourceTokens = programmeTokensFromSource(sourceRow.indication);
+    const existingTokens = programmeTokensFromExisting(record, f);
+    const matches = [];
+    for (const s of sourceTokens) {
+        for (const e of existingTokens) {
+            if (!s || !e) continue;
+            if (s === e || e.includes(s) || s.includes(e)) {
+                matches.push({source: s, existing: e});
+            }
+        }
+    }
+    return {
+        sourceTokens,
+        existingTokens,
+        matches,
+        programmeMatch: matches.length > 0
+    };
+}
+/* ------------------------------------------------------------
+   Clinical qualifier extraction: line/setting/segment
+   ------------------------------------------------------------ */
+function qualifierSet(v) {
+    const s = norm(v)
+        .replace(/\bfirst line\b/g, "1l")
+        .replace(/\bsecond line\b/g, "2l")
+        .replace(/\bthird line\b/g, "3l");
+    const q = new Set();
+    const tests = [
+        ["1l", /\b1l\b|\b1\/2l\b/],
+        ["2l", /\b2l\b|\b2l\+\b|\b1\/2l\b|\b2l\/3l\b/],
+        ["3l", /\b3l\b|\b3l\+\b|\b2l\/3l\b/],
+        ["maintenance", /\bmaintenance\b/],
+        ["post-transplant", /\bpost transplant\b|\bafter autologous stem cell transplantation\b/],
+        ["transplant-ineligible", /\btransplant ineligible\b/],
+        ["relapsed-refractory", /\brelapsed\b|\brefractory\b|\brrmm\b/],
+        ["adjuvant", /\badjuvant\b/],
+        ["neoadjuvant", /\bneoadjuvant\b/],
+        ["metastatic", /\bmetastatic\b/],
+        ["early", /\bearly\b/],
+        ["squamous", /\bsquamous\b/],
+        ["non-squamous", /\bnon squamous\b/],
+        ["cspc", /\bcspc\b|\bcastration sensitive\b/],
+        ["crpc", /\bcrpc\b|\bcastration resistant\b/],
+        ["post-cd38", /\bpost cd38\b|\bdaratumumab\b/],
+        ["double-class-exposed", /\bdouble class exposed\b/],
+    ];
+    for (const [label, re] of tests) if (re.test(s)) q.add(label);
+    return q;
+}
+function qualifierEvidence(sourceRow, record, f) {
+    const sourceQ = qualifierSet(sourceRow.indication);
+    const existingQ = qualifierSet([
+        cellText(record, f.indication),
+        cellText(record, f.setting),
+        cellText(record, f.segment),
+        cellText(record, f.subtype)
+    ].join(" "));
+    const shared = [...sourceQ].filter(x => existingQ.has(x));
+    const lineLabels = new Set(["1l","2l","3l"]);
+    const sourceLines = [...sourceQ].filter(x => lineLabels.has(x));
+    const existingLines = [...existingQ].filter(x => lineLabels.has(x));
+    let lineConflict = false;
+    if (sourceLines.length && existingLines.length) {
+        lineConflict = !sourceLines.some(x => existingLines.includes(x));
+    }
+    const keySettingLabels = new Set([
+        "maintenance","post-transplant","transplant-ineligible","adjuvant",
+        "neoadjuvant","cspc","crpc","post-cd38","double-class-exposed",
+        "squamous","non-squamous"
+    ]);
+    const sourceKey = [...sourceQ].filter(x => keySettingLabels.has(x));
+    const existingKey = [...existingQ].filter(x => keySettingLabels.has(x));
+    const keyConflict =
+        sourceKey.length > 0 &&
+        existingKey.length > 0 &&
+        !sourceKey.some(x => existingKey.includes(x));
+    return {
+        sourceQualifiers: [...sourceQ],
+        existingQualifiers: [...existingQ],
+        shared,
+        lineConflict,
+        keyConflict
+    };
+}
+/* ------------------------------------------------------------
+   Phase/state compatibility
+   ------------------------------------------------------------ */
+let phaseComparisonMode = "EXACT_PHASE";
+function stageRank(v){const x=norm(v);if(x.includes("approved"))return 5;if(x.includes("filed")||x.includes("registration"))return 4;if(x.includes("phase 3"))return 3;if(x.includes("phase 2"))return 2;if(x.includes("phase 1"))return 1;return 0;}
+function broadStageCategory(v){const x=norm(v);if(!x)return "";if(x.includes("approved")||x.includes("marketed"))return "approved";if(x.includes("filed")||x.includes("registration"))return "registration";if(x.includes("clinical")||x.includes("phase 1")||x.includes("phase 2")||x.includes("phase 3"))return "clinical";if(x.includes("ind cta")||x.includes("preclinical")||x.includes("discovery"))return "preclinical";return "";}
+function phaseEvidence(sourceRow,record,f){
+    const source=clean(sourceRow.phase),sourceStage=clean(sourceRow.sourceStage),existing=selectText(record,f.phase);
+    if(phaseComparisonMode==="BROAD_STAGE_ONLY"){
+        const bs=broadStageCategory(sourceStage),be=broadStageCategory(existing);
+        return {source:sourceStage||source,sourceStage,existing,exact:false,comparable:false,broadExact:Boolean(bs&&be&&bs===be),broadChanged:Boolean(bs&&be&&bs!==be),existingAhead:false,sourceAhead:false};
+    }
+    const exact=norm(source)===norm(existing),sr=stageRank(source),er=stageRank(existing);
+    return {source,sourceStage,existing,exact,comparable:true,broadExact:false,broadChanged:false,existingAhead:er>sr&&er>=4,sourceAhead:sr>er&&er>0};
+}
+/* ------------------------------------------------------------
+   HTTP
+   ------------------------------------------------------------ */
+async function sleep(ms) {
+    await Promise.resolve();
+}
+async function getJson(path) {
+    const retryableStatuses = new Set([408, 429, 500, 502, 503, 504]);
+    const attempts = 2;
+    let lastError = null;
+    for (let attempt = 1; attempt <= attempts; attempt++) {
+        try {
+            const res = await fetch(`${ADAPTER_BASE_URL}${path}`, {
+                method: "GET",
+                headers: {
+                    "Accept": "application/json",
+                    "X-Adapter-Key": adapterApiKey,
+                },
+            });
+            const body = await res.text();
+            let data;
+            try { data = JSON.parse(body); }
+            catch (_) {
+                throw new Error(
+                    `Adapter returned non-JSON. status=${res.status}; ` +
+                    `body=${body.slice(0,500)}`
+                );
+            }
+            if (res.ok) return data;
+            const err = new Error(
+                `Adapter request failed. status=${res.status}; ` +
+                `detail=${JSON.stringify(data).slice(0,700)}`
+            );
+            if (!retryableStatuses.has(res.status) || attempt === attempts) {
+                throw err;
+            }
+            lastError = err;
+            await sleep(1500);
+        } catch (error) {
+            lastError = error;
+            if (attempt === attempts) throw error;
+            await sleep(1500);
+        }
+    }
+    throw lastError || new Error("Adapter request failed after retry.");
+}
+/* ------------------------------------------------------------
+   1) Resolve Source Watch -> Company -> validated adapter route
+   ------------------------------------------------------------ */
+const sourceWatchCompanyField = sourceWatchTable.getField("Company");
+const sourceWatchNameField = sourceWatchTable.getField("Source Name");
+const sourceWatchStatusField = sourceWatchTable.getField("Monitoring Status");
+const sourceWatchAdapterStatusField = sourceWatchTable.getField("Pipeline Adapter Status");
+const sourceWatchSourceUrlField = sourceWatchTable.getField("Source URL");
+const sourceWatchMachineUrlField = sourceWatchTable.getField("Machine Source URL");
+const sourceWatchAdapterRegistryField = sourceWatchTable.getField("Adapter Registry");
+const sourceWatchBindingStatusField = sourceWatchTable.getField("Adapter Binding Status");
+const sourceWatchRetrievalModeField = sourceWatchTable.getField("Retrieval Mode");
+const sourceWatchRecord = await sourceWatchTable.selectRecordAsync(
+    sourceWatchRecordId
+);
+if (!sourceWatchRecord) {
+    throw new Error(
+        `Source Watch record not found: ${sourceWatchRecordId}`
+    );
+}
+const monitoringStatus = norm(
+    sourceWatchRecord.getCellValueAsString(sourceWatchStatusField)
+);
+if (monitoringStatus !== "active") {
+    throw new Error(
+        `Source Watch record ${sourceWatchRecordId} has Monitoring Status ` +
+        `"${sourceWatchRecord.getCellValueAsString(sourceWatchStatusField)}". ` +
+        `Only Active sources are processed.`
+    );
+}
+const pipelineAdapterStatus = norm(
+    sourceWatchRecord.getCellValueAsString(sourceWatchAdapterStatusField)
+);
+if (pipelineAdapterStatus !== "validated") {
+    throw new Error(
+        `Source Watch record ${sourceWatchRecordId} has Pipeline Adapter Status ` +
+        `"${sourceWatchRecord.getCellValueAsString(sourceWatchAdapterStatusField)}". ` +
+        `Only Validated pipeline sources are processed.`
+    );
+}
+const companyLinks = sourceWatchRecord.getCellValue(sourceWatchCompanyField) || [];
+if (!Array.isArray(companyLinks) || companyLinks.length !== 1) {
+    throw new Error(
+        `Source Watch ${sourceWatchRecordId} must link to exactly one Company; found ${companyLinks.length}.`
+    );
+}
+const companyRecordId = companyLinks[0].id;
+const companyNameField = companiesTable.getField("Name");
+const targetCompany = await companiesTable.selectRecordAsync(companyRecordId);
+if (!targetCompany) {
+    throw new Error(
+        `Company record linked from Source Watch was not found: ${companyRecordId}`
+    );
+}
+const companyName = clean(
+    targetCompany.getCellValueAsString(companyNameField)
+);
+const sourceWatchName = clean(
+    sourceWatchRecord.getCellValueAsString(sourceWatchNameField)
+);
+const adapterLinks = sourceWatchRecord.getCellValue(sourceWatchAdapterRegistryField) || [];
+if (!Array.isArray(adapterLinks) || adapterLinks.length !== 1) {
+    throw new Error(
+        `Source Watch ${sourceWatchRecordId} must link to exactly one Adapter Registry record; found ${adapterLinks.length}.`
+    );
+}
+const adapterRecord = await adaptersTable.selectRecordAsync(adapterLinks[0].id);
+if (!adapterRecord) {
+    throw new Error(
+        `Adapter Registry record not found: ${adapterLinks[0].id}`
+    );
+}
+const adapterProfileField = adaptersTable.getField("Adapter Profile");
+const adapterStatusField = adaptersTable.getField("Adapter Status");
+const adapterHandlerField = adaptersTable.getField("Endpoint / Handler");
+const adapterRetrievalModesField = adaptersTable.getField("Supported Retrieval Modes");
+const adapterRowGranularityField = adaptersTable.getField("Row Granularity Contract");
+const adapterProfile = clean(adapterRecord.getCellValueAsString(adapterProfileField));
+const adapterStatus = norm(adapterRecord.getCellValueAsString(adapterStatusField));
+const rowGranularityContract =
+    clean(adapterRecord.getCellValueAsString(adapterRowGranularityField)) || "UNKNOWN";
+const adapterHandlerRaw = clean(adapterRecord.getCellValueAsString(adapterHandlerField));
+const adapterHandlerPath = adapterHandlerRaw.replace(/^pharma-pipeline-pdf-adapter:/i, "");
+if (adapterStatus !== "validated") {
+    throw new Error(
+        `Adapter Registry profile "${adapterProfile}" is ` +
+        `"${adapterRecord.getCellValueAsString(adapterStatusField)}", not Validated.`
+    );
+}
+if (!adapterHandlerPath || !adapterHandlerPath.startsWith("/")) {
+    throw new Error(
+        `Adapter Registry profile "${adapterProfile}" has invalid Endpoint / Handler "${adapterHandlerRaw}".`
+    );
+}
+const retrievalMode = clean(
+    sourceWatchRecord.getCellValueAsString(sourceWatchRetrievalModeField)
+);
+const supportedRetrievalModes = (
+    sourceWatchRecord && adapterRecord.getCellValue(adapterRetrievalModesField) || []
+).map(x => clean(x && x.name)).filter(Boolean);
+if (!retrievalMode) {
+    throw new Error(
+        `Source Watch "${sourceWatchName}" has no Retrieval Mode.`
+    );
+}
+if (!supportedRetrievalModes.includes(retrievalMode)) {
+    throw new Error(
+        `Source Watch retrieval mode "${retrievalMode}" is not supported by adapter "${adapterProfile}". ` +
+        `Supported modes: ${supportedRetrievalModes.join(", ") || "none"}.`
+    );
+}
+const bindingStatus = norm(
+    sourceWatchRecord.getCellValueAsString(sourceWatchBindingStatusField)
+);
+const legacyValidatedProfiles = new Set([
+    "PIPELINE_PFIZER_PDF_V1",
+    "PIPELINE_SANOFI_HTML_V1",
+]);
+if (!legacyValidatedProfiles.has(adapterProfile) && bindingStatus !== "validated") {
+    throw new Error(
+        `Source Watch "${sourceWatchName}" has Adapter Binding Status ` +
+        `"${sourceWatchRecord.getCellValueAsString(sourceWatchBindingStatusField)}". ` +
+        `A validated source+adapter binding is required for "${adapterProfile}".`
+    );
+}
+const sourceUrl = clean(
+    sourceWatchRecord.getCellValueAsString(sourceWatchMachineUrlField) ||
+    sourceWatchRecord.getCellValueAsString(sourceWatchSourceUrlField)
+);
+if (!sourceUrl) {
+    throw new Error(
+        `Source Watch "${sourceWatchName}" has no Source URL / Machine Source URL.`
+    );
+}
+const companySlug = norm(companyName).replace(/\s+/g, "_");
+let adapterRequestPath = adapterHandlerPath;
+const specialisedNoQueryHandlers = new Set([
+    "/extract/pfizer",
+    "/extract/sanofi",
+]);
+const specialisedSourceUrlOnlyHandlers = new Set([
+    "/extract-bms-v4",
+]);
+let expectsCommonContract = false;
+if (specialisedNoQueryHandlers.has(adapterHandlerPath)) {
+} else if (specialisedSourceUrlOnlyHandlers.has(adapterHandlerPath)) {
+    adapterRequestPath =
+        `${adapterHandlerPath}?source_url=${encodeURIComponent(sourceUrl)}`;
+} else if (adapterHandlerPath.startsWith("/extract/")) {
+    expectsCommonContract = true;
+    const joiner = adapterHandlerPath.includes("?") ? "&" : "?";
+    adapterRequestPath =
+        `${adapterHandlerPath}${joiner}company=${encodeURIComponent(companyName)}&source_url=${encodeURIComponent(sourceUrl)}`;
+} else {
+    throw new Error(
+        `Validated adapter "${adapterProfile}" uses handler "${adapterHandlerPath}" outside the approved /extract/ namespace. ` +
+        `Failing closed.`
+    );
+}
+/* ------------------------------------------------------------
+   2) Official source guardrail
+   ------------------------------------------------------------ */
+const external = await getJson(adapterRequestPath);
+const sourceRows = Array.isArray(external.rows) ? external.rows : [];
+function stableSourceRecordKey(row, index) {
+    return clean(
+        (row && (
+            row.sourceRecordId ||
+            row.sourceCardOrdinal ||
+            row.recordId ||
+            row.sourceRow
+        )) ||
+        String(index + 1)
+    );
+}
+const counts = {"Phase 1":0,"Phase 2":0,"Phase 3":0,"Filed / Registration":0,"Approved":0};
+for (const r of sourceRows) if (counts[r.phase] !== undefined) counts[r.phase]++;
+const externalSummary = external.summary || {};
+const externalIssues = Array.isArray(external.issues) ? external.issues : [];
+const externalDiagnostics = external.diagnostics || {};
+const broadStageOnly =
+    norm(externalDiagnostics.phaseSpecificity) === "broad stage only" ||
+    (externalDiagnostics.exactClinicalPhaseFromCompanyPage === false &&
+     sourceRows.some(r => !clean(r.phase) && clean(r.sourceStage)));
+phaseComparisonMode = broadStageOnly ? "BROAD_STAGE_ONLY" : "EXACT_PHASE";
+const routeReady = expectsCommonContract
+    ? external.readyForDiscovery === true
+    : true;
+const structuralSummaryPass = expectsCommonContract
+    ? externalSummary.structuralValidationPass === true
+    : externalSummary.structuralValidationPass !== false;
+const guardrail =
+    routeReady &&
+    structuralSummaryPass &&
+    externalIssues.length === 0 &&
+    sourceRows.length >= 1 &&
+    sourceRows.every(r => r && clean(r.asset) && clean(r.indication) &&
+        (clean(r.phase) || (broadStageOnly && clean(r.sourceStage)))) &&
+    Number(externalDiagnostics.rowFailures || 0) === 0 &&
+    Number(externalDiagnostics.phaseUnresolved || 0) === 0 &&
+    Number(externalDiagnostics.boundaryWarnings || 0) === 0 &&
+    Number(externalDiagnostics.coverageWarnings || 0) === 0 &&
+    Number(externalDiagnostics.exactDuplicates || 0) === 0;
+if (!guardrail) {
+    output.set("genericDeltaSummary", JSON.stringify({
+        version: VERSION,
+        company: companyName,
+        companyRecordId: targetCompany.id,
+        companySlug,
+        adapterProfile,
+        adapterHandlerPath,
+        retrievalMode,
+        sourceGuardrailPass: false,
+        officialRows: sourceRows.length,
+        counts,
+        adapterVersion: external.version || "",
+        adapterProductionStatus: externalSummary.productionStatus || "",
+        externalIssues,
+        status: "FAIL CLOSED - adapter/source structure requires review"
+    }, null, 2));
+    output.set("newProgrammes", "[]");
+    output.set("phaseChanges", "[]");
+    output.set("programmeChanges", "[]");
+    output.set("sourceDisappearances", "[]");
+    output.set("laterStagePreserved", "[]");
+    output.set("matchReview", "[]");
+    output.set("noChangeSample", "[]");
+    return;
+}
+/* ------------------------------------------------------------
+   3) Load Portfolio
+   ------------------------------------------------------------ */
+const f = {
+    company: field("Company"),
+    brand: field("Brand / Asset"),
+    molecule: field("Molecule / INN"),
+    devCode: field("Development Code"),
+    aliases: field("Asset Aliases / Former Codes"),
+    indication: field("Indication"),
+    phase: field("Development Phase"),
+    status: field("Portfolio Status"),
+    setting: field("Treatment Setting / Line"),
+    segment: field("Biomarker / Patient Segment"),
+    subtype: field("Disease Subtype"),
+    clinicalTrials: field("Clinical Trials"),
+    sourceUrl: field("Source URL")
+};
+for (const k of ["company","brand","molecule","indication","phase","status"]) {
+    if (!f[k]) throw new Error(`Required Portfolio field missing: ${k}`);
+}
+const fields = unique(Object.values(f).filter(Boolean));
+const pq = await portfolioTable.selectRecordsAsync({fields});
+function isTargetCompany(record) {
+    const raw = record.getCellValue(f.company);
+    return Array.isArray(raw) && raw.some(x => x && x.id === targetCompany.id);
+}
+function isCurrentDevelopment(record) {
+    const s = norm(selectText(record, f.status));
+    const p = norm(selectText(record, f.phase));
+    if (s === "marketed" || s === "discontinued") return false;
+    if (s === "pipeline" || s.includes("filed")) return true;
+    return /phase [123]|registration|filed/.test(p);
+}
+const existingAll = pq.records.filter(isTargetCompany);
+const existingDevelopment = existingAll.filter(isCurrentDevelopment);
+/* ------------------------------------------------------------
+   4) Score source ↔ Portfolio pairs
+   ------------------------------------------------------------ */
+const sourceVariantCollisionKeys = new Set(
+    (Array.isArray(externalDiagnostics.variantCollisions)
+        ? externalDiagnostics.variantCollisions
+        : []
+    ).map(x => norm(x.key))
+);
+function sourceCoarseVariantKey(sourceRow) {
+    return [
+        norm(sourceRow.asset),
+        norm(sourceRow.indication),
+        norm(sourceRow.phase)
+    ].join(" ");
+}
+function sourceVariantQualifier(sourceRow) {
+    const key = sourceCoarseVariantKey(sourceRow);
+    const isCollision = [...sourceVariantCollisionKeys].some(k =>
+        compact(k) === compact(key)
+    );
+    return isCollision ? norm(sourceRow.description || "") : "";
+}
+function existingVariantQualifier(record) {
+    const brand = clean(cellText(record, f.brand));
+    const m = brand.match(/\(([^)]+)\)\s*$/);
+    return m ? norm(m[1]) : "";
+}
+function variantEvidence(sourceRow, record) {
+    const sourceVariant = sourceVariantQualifier(sourceRow);
+    if (!sourceVariant) {
+        return {
+            required: false,
+            exact: false,
+            conflict: false,
+            sourceVariant: "",
+            existingVariant: ""
+        };
+    }
+    const existingVariant = existingVariantQualifier(record);
+    const exact =
+        sourceVariant &&
+        existingVariant &&
+        (
+            compact(sourceVariant) === compact(existingVariant) ||
+            similarity(sourceVariant, existingVariant) >= 0.92
+        );
+    return {
+        required: true,
+        exact,
+        conflict: !exact,
+        sourceVariant,
+        existingVariant
+    };
+}
+function scorePair(sourceRow, record) {
+    const id = identityEvidence(sourceRow, record, f);
+    const whole = wholeIdentityEvidence(sourceRow, record, f);
+    const prog = programmeMatchEvidence(sourceRow, record, f);
+    const qual = qualifierEvidence(sourceRow, record, f);
+    const phase = phaseEvidence(sourceRow, record, f);
+    const variant = variantEvidence(sourceRow, record);
+    const ind = indicationSimilarity(sourceRow.indication, cellText(record, f.indication));
+    let score = 0;
+    const reasons = [];
+    if (prog.programmeMatch) {
+        score += 90;
+        reasons.push("linked Clinical Trial / study acronym match");
+    }
+    if (whole.exactWholeIdentity) {
+        score += 55;
+        reasons.push("whole asset/programme identity exact");
+    }
+    if (id.codeMatch) {
+        const codeWeight = Math.round(
+            35 + 25 * Math.max(
+                whole.sourceCodeCoverage,
+                whole.existingCodeCoverage
+            )
+        );
+        score += codeWeight;
+        reasons.push(`shared development code ${id.sharedCodes.join(", ")}`);
+    }
+    if (id.exactIdentity && !whole.exactWholeIdentity) {
+        score += 24;
+        reasons.push("partial asset/molecule identity");
+    } else if (!id.exactIdentity) {
+        score += Math.round(id.identitySimilarity * 20);
+    }
+    if (!phase.comparable) {
+        if (phase.broadExact) {score += 8; reasons.push("broad stage aligned");}
+        else if (phase.broadChanged) reasons.push("broad stage changed; exact phase not inferred");
+        else reasons.push("exact phase unavailable from source");
+    } else if (phase.exact) {
+        score += 18;
+        reasons.push("phase exact");
+    } else if (phase.existingAhead) {
+        score += 10;
+        reasons.push("existing regulatory state is ahead of R&D source; no downgrade");
+    } else {
+        score -= 28;
+        reasons.push(`phase differs (${phase.existing || "blank"})`);
+    }
+    score += Math.round(ind * 34);
+    if (ind >= 0.45) reasons.push(`indication similarity ${ind.toFixed(2)}`);
+    score += Math.min(qual.shared.length * 8, 24);
+    if (qual.shared.length) reasons.push(`shared qualifiers: ${qual.shared.join(", ")}`);
+    if (variant.required) {
+        if (variant.exact) {
+            score += 60;
+            reasons.push(`source variant exact: ${variant.sourceVariant}`);
+        } else {
+            score -= 100;
+            reasons.push(
+                `source variant conflict: ${variant.sourceVariant} vs ` +
+                `${variant.existingVariant || "blank"}`
+            );
+        }
+    }
+    if (qual.lineConflict) {
+        score -= 38;
+        reasons.push("treatment-line conflict");
+    }
+    if (qual.keyConflict) {
+        score -= 28;
+        reasons.push("clinical-setting conflict");
+    }
+    return {
+        record,
+        score,
+        id,
+        whole,
+        prog,
+        qual,
+        phase,
+        variant,
+        indicationSimilarity: ind,
+        reasons
+    };
+}
+const allPairs = [];
+for (let si = 0; si < sourceRows.length; si++) {
+    const sourceRow = sourceRows[si];
+    for (const record of existingDevelopment) {
+        const scored = scorePair(sourceRow, record);
+        allPairs.push({sourceIndex: si, sourceRow, ...scored});
+    }
+}
+/* ------------------------------------------------------------
+   5) Initial reconciliation programme grain
+   ------------------------------------------------------------
+   This is a read-only onboarding comparison. Existing rows are never split,
+   overwritten, archived or deleted automatically. Distinct official source
+   programmes remain distinct create candidates. Ambiguous identity is review-only.
+   target company also has a known legitimate source variant collision (SP0287) where
+   the same asset + indication + phase has two different vaccine combinations.
+   The adapter preserves both source cards; this reconciliation must not dedupe them.
+   ------------------------------------------------------------ */
+const splitExistingIds = new Set();
+const portfolioSplitRequired = [];
+/* ------------------------------------------------------------
+   6) Build one-to-one assignments
+   ------------------------------------------------------------ */
+const assignedSource = new Set();
+const assignedExisting = new Set();
+const assignedSourceToExisting = new Map();
+const heldSourceIndexes = new Set();
+const heldExistingIds = new Set();
+const confirmed = [];
+const stageConflictReview = [];
+const eligiblePairs = allPairs
+    .filter(p => !splitExistingIds.has(p.record.id))
+    .filter(p => {
+        if (!hasStrongIdentity(p)) return false;
+        if (p.qual.lineConflict || p.qual.keyConflict) return false;
+        if (p.variant.required && !p.variant.exact) return false;
+        const phaseTolerantIdentity =
+            p.prog.programmeMatch ||
+            p.whole.exactWholeIdentity ||
+            (
+                p.id.codeMatch &&
+                p.indicationSimilarity >= 0.45
+            ) ||
+            (
+                p.id.exactPartIdentity &&
+                p.whole.wholeIdentitySimilarity >= 0.80 &&
+                p.indicationSimilarity >= 0.60
+            );
+        return p.score >= 72 || phaseTolerantIdentity;
+    })
+    .sort((a,b) => {
+        const ap = a.prog.programmeMatch ? 1 : 0;
+        const bp = b.prog.programmeMatch ? 1 : 0;
+        if (bp !== ap) return bp - ap;
+        return b.score - a.score;
+    });
+for (const p of eligiblePairs) {
+    if (assignedSource.has(p.sourceIndex)) continue;
+    if (assignedExisting.has(p.record.id)) continue;
+    const otherCandidatesForSource = eligiblePairs
+        .filter(x => x.sourceIndex === p.sourceIndex && x.record.id !== p.record.id)
+        .sort((a,b) => b.score - a.score);
+    const second = otherCandidatesForSource[0] || null;
+    const margin = p.score - (second ? second.score : 0);
+    const directProgrammeResolution = p.prog.programmeMatch;
+    const uniqueWholeIdentityResolution =
+        p.whole.exactWholeIdentity &&
+        p.indicationSimilarity >= 0.72 &&
+        !p.qual.lineConflict &&
+        !p.qual.keyConflict;
+    const safeMargin =
+        directProgrammeResolution ||
+        uniqueWholeIdentityResolution ||
+        margin >= 10;
+    if (!safeMargin) continue;
+    if (p.phase.existingAhead) {
+        assignedSource.add(p.sourceIndex);
+        assignedExisting.add(p.record.id);
+        assignedSourceToExisting.set(p.sourceIndex, p.record.id);
+        stageConflictReview.push({
+            sourceIndex: p.sourceIndex,
+            external: {
+                asset: p.sourceRow.asset,
+                indication: p.sourceRow.indication,
+                phase: p.sourceRow.phase,
+            sourceStage: p.sourceRow.sourceStage || "",
+                sourcePage: p.sourceRow.sourcePage,
+                sourceRow: p.sourceRow.sourceRow,
+                sourceCardOrdinal: p.sourceRow.sourceCardOrdinal,
+                sourceDescription: p.sourceRow.description || ""
+            },
+            existing: {
+                recordId: p.record.id,
+                brandAsset: cellText(p.record, f.brand),
+                molecule: cellText(p.record, f.molecule),
+                indication: cellText(p.record, f.indication),
+                phase: selectText(p.record, f.phase),
+                portfolioStatus: selectText(p.record, f.status),
+                linkedTrials: linkNames(p.record, f.clinicalTrials)
+            },
+            decision:
+                "MATCH IDENTITY, PRESERVE LATER EXISTING STAGE. Do not downgrade Development Phase from the official R&D source.",
+            score: p.score,
+            reasons: p.reasons
+        });
+        continue;
+    }
+    assignedSource.add(p.sourceIndex);
+    assignedExisting.add(p.record.id);
+    assignedSourceToExisting.set(p.sourceIndex, p.record.id);
+    confirmed.push({
+        sourceIndex: p.sourceIndex,
+        external: {
+            asset: p.sourceRow.asset,
+            developmentCode: p.sourceRow.developmentCode,
+            indication: p.sourceRow.indication,
+            phase: p.sourceRow.phase,
+            sourceStage: p.sourceRow.sourceStage || "",
+            mechanismOfAction: p.sourceRow.mechanismOfAction,
+            submissionType: p.sourceRow.submissionType,
+            sourcePage: p.sourceRow.sourcePage,
+            sourceRow: p.sourceRow.sourceRow,
+            sourceCardOrdinal: p.sourceRow.sourceCardOrdinal,
+            sourceDescription: p.sourceRow.description || "",
+            programmeTokens: p.prog.sourceTokens
+        },
+        existing: {
+            recordId: p.record.id,
+            brandAsset: cellText(p.record, f.brand),
+            molecule: cellText(p.record, f.molecule),
+            developmentCode: cellText(p.record, f.devCode),
+            indication: cellText(p.record, f.indication),
+            phase: selectText(p.record, f.phase),
+            portfolioStatus: selectText(p.record, f.status),
+            linkedTrials: linkNames(p.record, f.clinicalTrials)
+        },
+        score: p.score,
+        margin,
+        indicationSimilarity: Number(p.indicationSimilarity.toFixed(3)),
+        sourceQualifiers: p.qual.sourceQualifiers,
+        existingQualifiers: p.qual.existingQualifiers,
+        programmeMatch: p.prog.programmeMatch,
+        phaseComparable: p.phase.comparable,
+        broadStageChanged: p.phase.broadChanged,
+        broadSourceStage: p.phase.sourceStage || p.phase.source || "",
+        wholeIdentityExact: p.whole.exactWholeIdentity,
+        reasons: p.reasons
+    });
+}
+/* ------------------------------------------------------------
+   7) Classify remaining source rows
+   ------------------------------------------------------------ */
+const distinctProgrammeCandidates = [];
+const approvedSourceMatches = [];
+const sourceRowGrainReviews = [];
+const contextPairs = [];
+for (let si = 0; si < sourceRows.length; si++) {
+    const sourceRow = sourceRows[si];
+    for (const record of existingAll) {
+        const scored = scorePair(sourceRow, record);
+        contextPairs.push({sourceIndex: si, sourceRow, ...scored});
+    }
+}
+function portfolioState(record) {
+    return norm(selectText(record, f.status));
+}
+function isMarketedContext(record) {
+    const s = portfolioState(record);
+    const p = norm(selectText(record, f.phase));
+    return s === "marketed" || p === "approved";
+}
+for (let i = 0; i < sourceRows.length; i++) {
+    if (assignedSource.has(i)) continue;
+    const row = sourceRows[i];
+    const identityCandidates = contextPairs
+        .filter(p => p.sourceIndex === i && hasAnyIdentity(p))
+        .sort((a,b) => {
+            const ap = pIdentityPriority(a);
+            const bp = pIdentityPriority(b);
+            if (bp !== ap) return bp - ap;
+            return b.score - a.score;
+        });
+    const genericCandidates = contextPairs
+        .filter(p => p.sourceIndex === i)
+        .sort((a,b) => b.score - a.score);
+    const bestIdentity = identityCandidates[0] || null;
+    const bestGeneric = genericCandidates[0] || null;
+    let classification = "NEW OFFICIAL PROGRAMME";
+    let reason = "No identity-bearing existing target-company Portfolio record matches this official programme.";
+    // Identity overlap is not evidence of a distinct programme. Exact approved
+    // source-to-Portfolio matches may be closed; all other overlaps need review.
+    if (bestIdentity) {
+        const sourceApproved = norm(row.phase) === "approved";
+        const existingApproved =
+            norm(selectText(bestIdentity.record, f.phase)) === "approved";
+        const exactApprovedMatch =
+            sourceApproved &&
+            existingApproved &&
+            isMarketedContext(bestIdentity.record) &&
+            bestIdentity.whole.exactWholeIdentity &&
+            bestIdentity.indicationSimilarity >= 0.98 &&
+            !bestIdentity.qual.lineConflict &&
+            !bestIdentity.qual.keyConflict &&
+            (!bestIdentity.variant.required || bestIdentity.variant.exact);
+        const implicatedExistingRecordIds = unique([
+            bestIdentity.record.id,
+            ...identityCandidates
+                .filter(p => hasStrongIdentity(p))
+                .map(p => p.record.id)
+        ]);
+        const overlap = {
+            sourceIndex: i,
+            asset: row.asset,
+            developmentCode: row.developmentCode || "",
+            programmeIndication: row.indication,
+            phase: row.phase || row.sourceStage || "",
+            existingRecordId: bestIdentity.record.id,
+            implicatedExistingRecordIds,
+            existingAsset: cellText(bestIdentity.record, f.brand),
+            existingIndication: cellText(bestIdentity.record, f.indication),
+            existingPhase: selectText(bestIdentity.record, f.phase),
+            existingPortfolioStatus: selectText(bestIdentity.record, f.status),
+            score: bestIdentity.score,
+            identityExact: bestIdentity.whole.exactWholeIdentity,
+            indicationSimilarity: Number(bestIdentity.indicationSimilarity.toFixed(3)),
+            sourceUrl: external.sourceUrl || ""
+        };
+        if (exactApprovedMatch) {
+            approvedSourceMatches.push({
+                classification: "MATCHED - EXISTING APPROVED PROGRAMME",
+                ...overlap
+            });
+        } else {
+            heldSourceIndexes.add(i);
+            for (const recordId of implicatedExistingRecordIds) {
+                heldExistingIds.add(recordId);
+            }
+            sourceRowGrainReviews.push({
+                reviewType: "EXISTING ASSET / PROGRAMME GRAIN REVIEW",
+                ...overlap,
+                reviewReason:
+                    "Existing asset identity overlaps this source row, but a distinct " +
+                    "indication, population, formulation, treatment setting or study programme " +
+                    "has not been proven. Check all indication-specific Portfolio records " +
+                    "and official trial evidence before creating any new programme. " +
+                    "Combined-indication source rows may cover multiple existing records."
+            });
+        }
+        continue;
+    }
+    const diagnostic = bestIdentity || bestGeneric;
+    distinctProgrammeCandidates.push({
+        sourceIndex: i,
+        classification,
+        reason,
+        external: {
+            asset: row.asset,
+            developmentCode: row.developmentCode,
+            indication: row.indication,
+            phase: row.phase,
+            sourceStage: row.sourceStage || "",
+            mechanismOfAction: row.mechanismOfAction,
+            submissionType: row.submissionType,
+            sourcePage: row.sourcePage,
+            sourceRow: row.sourceRow,
+            sourceCardOrdinal: row.sourceCardOrdinal,
+            sourceDescription: row.description || "",
+            programmeTokens: programmeTokensFromSource(row.indication)
+        },
+        bestIdentityCandidate: bestIdentity ? {
+            recordId: bestIdentity.record.id,
+            brandAsset: cellText(bestIdentity.record, f.brand),
+            molecule: cellText(bestIdentity.record, f.molecule),
+            indication: cellText(bestIdentity.record, f.indication),
+            phase: selectText(bestIdentity.record, f.phase),
+            portfolioStatus: selectText(bestIdentity.record, f.status),
+            linkedTrials: linkNames(bestIdentity.record, f.clinicalTrials),
+            score: bestIdentity.score,
+            wholeIdentityExact: bestIdentity.whole.exactWholeIdentity,
+            wholeIdentitySimilarity: Number(bestIdentity.whole.wholeIdentitySimilarity.toFixed(3)),
+            reasons: bestIdentity.reasons
+        } : null,
+        genericBestForDiagnostics: diagnostic ? {
+            recordId: diagnostic.record.id,
+            brandAsset: cellText(diagnostic.record, f.brand),
+            score: diagnostic.score,
+            reasons: diagnostic.reasons
+        } : null
+    });
+}
+function pIdentityPriority(p) {
+    if (p.prog.programmeMatch) return 5;
+    if (p.whole.exactWholeIdentity) return 4;
+    if (p.id.codeMatch && p.whole.sourceCodeCoverage >= 0.5) return 3;
+    if (p.id.codeMatch) return 2;
+    if (p.id.exactIdentity) return 1;
+    return 0;
+}
+/* ------------------------------------------------------------
+   7b) Alias / renamed-code review candidates
+   ------------------------------------------------------------ */
+const aliasReviewCandidates = [];
+for (const existing of existingDevelopment) {
+    if (assignedExisting.has(existing.id)) continue;
+    if (splitExistingIds.has(existing.id)) continue;
+    const candidatesForExisting = allPairs
+        .filter(p => p.record.id === existing.id)
+        .filter(p => !assignedSource.has(p.sourceIndex))
+        .filter(p => !hasAnyIdentity(p))
+        .filter(p =>
+            p.indicationSimilarity >= 0.70 &&
+            (
+                p.phase.exact ||
+                p.phase.existingAhead ||
+                p.phase.broadExact ||
+                p.phase.broadChanged ||
+                stageRank(p.phase.source) >= 3
+            )
+        )
+        .sort((a,b) => {
+            if (b.indicationSimilarity !== a.indicationSimilarity) {
+                return b.indicationSimilarity - a.indicationSimilarity;
+            }
+            return b.score - a.score;
+        })
+        .slice(0,5);
+    if (!candidatesForExisting.length) continue;
+    heldExistingIds.add(existing.id);
+    for (const p of candidatesForExisting) {
+        heldSourceIndexes.add(p.sourceIndex);
+    }
+    aliasReviewCandidates.push({
+        existing: {
+            recordId: existing.id,
+            brandAsset: cellText(existing, f.brand),
+            molecule: cellText(existing, f.molecule),
+            developmentCode: cellText(existing, f.devCode),
+            aliases: cellText(existing, f.aliases),
+            indication: cellText(existing, f.indication),
+            phase: selectText(existing, f.phase),
+            portfolioStatus: selectText(existing, f.status),
+            linkedTrials: linkNames(existing, f.clinicalTrials)
+        },
+        reviewReason:
+            "Similar indication/stage without direct drug identity is NOT evidence of an alias or rename. Confirm molecule and development codes from authoritative sources; never merge or add aliases based on clinical similarity alone.",
+        possibleOfficialRows: candidatesForExisting.map(p => ({
+            sourceIndex: p.sourceIndex,
+            asset: p.sourceRow.asset,
+            developmentCode: p.sourceRow.developmentCode,
+            indication: p.sourceRow.indication,
+            phase: p.sourceRow.phase,
+            sourceStage: p.sourceRow.sourceStage || "",
+            indicationSimilarity: Number(p.indicationSimilarity.toFixed(3)),
+            sourcePage: p.sourceRow.sourcePage,
+            sourceRow: p.sourceRow.sourceRow
+        }))
+    });
+}
+/* ------------------------------------------------------------
+   8) Existing current-development rows not represented
+   ------------------------------------------------------------ */
+const unmatchedExisting = existingDevelopment
+    .filter(r =>
+        !assignedExisting.has(r.id) &&
+        !heldExistingIds.has(r.id) &&
+        !splitExistingIds.has(r.id)
+    )
+    .map(r => ({
+        recordId: r.id,
+        brandAsset: cellText(r, f.brand),
+        molecule: cellText(r, f.molecule),
+        developmentCode: cellText(r, f.devCode),
+        indication: cellText(r, f.indication),
+        phase: selectText(r, f.phase),
+        portfolioStatus: selectText(r, f.status),
+        linkedTrials: linkNames(r, f.clinicalTrials),
+        sourceUrl: cellText(r, f.sourceUrl),
+        action: "REVIEW ONLY - never auto-delete/archive from one source refresh"
+    }));
+/* ------------------------------------------------------------
+   9) Generic recurring delta classification
+   ------------------------------------------------------------ */
+function materiallyDifferentProgramme(match) {
+    if (match.indicationSimilarity >= 0.55) return false;
+    if (match.programmeMatch) return false;
+    return true;
+}
+function sourceLocator(row) {
+    const locator = {};
+    if (row.sourcePage !== undefined && row.sourcePage !== null) {
+        locator.sourcePage = row.sourcePage;
+    }
+    if (row.sourceRow !== undefined && row.sourceRow !== null) {
+        locator.sourceRow = row.sourceRow;
+    }
+    if (row.sourceCardOrdinal !== undefined && row.sourceCardOrdinal !== null) {
+        locator.sourceCardOrdinal = row.sourceCardOrdinal;
+    }
+    if (row.sourceDescription) {
+        locator.sourceDescription = row.sourceDescription;
+    }
+    return locator;
+}
+const phaseChanges = [];
+const programmeChanges = [];
+const noChange = [];
+for (const match of confirmed) {
+    const sourcePhase = norm(match.external.phase);
+    const existingPhase = norm(match.existing.phase);
+    if (match.phaseComparable === false && match.broadStageChanged) {
+        programmeChanges.push({
+            classification: "INDICATION / PROGRAMME CHANGE",
+            existingRecordId: match.existing.recordId,
+            asset: match.external.asset,
+            previousIndication: match.existing.indication,
+            sourceIndication: match.external.indication,
+            phase: match.broadSourceStage || match.external.sourceStage || "",
+            indicationSimilarity: match.indicationSimilarity,
+            ...sourceLocator(match.external),
+            sourceUrl: external.sourceUrl || "",
+            confidence: "Review",
+            evidence: [...(match.reasons || []), "BROAD STAGE SIGNAL - verify exact phase via trial layer; do not infer numeric phase"]
+        });
+        continue;
+    }
+    if (match.phaseComparable !== false && sourcePhase !== existingPhase) {
+        phaseChanges.push({
+            classification: "PHASE CHANGE",
+            existingRecordId: match.existing.recordId,
+            asset: match.external.asset,
+            programmeIndication: match.external.indication,
+            previousPhase: match.existing.phase,
+            sourcePhase: match.external.phase,
+            ...sourceLocator(match.external),
+            sourceUrl: external.sourceUrl || "",
+            confidence: "High",
+            evidence: match.reasons
+        });
+        continue;
+    }
+    if (materiallyDifferentProgramme(match)) {
+        programmeChanges.push({
+            classification: "INDICATION / PROGRAMME CHANGE",
+            existingRecordId: match.existing.recordId,
+            asset: match.external.asset,
+            previousIndication: match.existing.indication,
+            sourceIndication: match.external.indication,
+            phase: match.external.phase,
+            indicationSimilarity: match.indicationSimilarity,
+            ...sourceLocator(match.external),
+            sourceUrl: external.sourceUrl || "",
+            confidence: "Review",
+            evidence: match.reasons
+        });
+        continue;
+    }
+    noChange.push({
+        classification: "NO CHANGE",
+        existingRecordId: match.existing.recordId,
+        asset: match.external.asset,
+        programmeIndication: match.external.indication,
+        phase: match.external.phase
+    });
+}
+const laterStagePreserved = stageConflictReview.map(x => ({
+    classification: "LATER STAGE PRESERVED",
+    existingRecordId: x.existing.recordId,
+    asset: x.external.asset,
+    programmeIndication: x.external.indication,
+    sourcePhase: x.external.phase,
+    airtablePhase: x.existing.phase,
+    decision: x.decision
+}));
+const newProgrammeCandidates = distinctProgrammeCandidates.map(x => ({
+    sourceIndex: x.sourceIndex,
+    classification: "NEW PROGRAMME",
+    subtype: x.classification,
+    asset: x.external.asset,
+    developmentCode: x.external.developmentCode,
+    programmeIndication: x.external.indication,
+    phase: x.external.phase || x.external.sourceStage || "",
+    mechanismOfAction: x.external.mechanismOfAction,
+    ...sourceLocator(x.external),
+    sourceUrl: external.sourceUrl || "",
+    identityContext: x.bestIdentityCandidate || null,
+    reason: x.reason
+}));
+const newProgrammes = newProgrammeCandidates.filter(
+    x => !heldSourceIndexes.has(x.sourceIndex)
+);
+const heldNewProgrammeCandidates = newProgrammeCandidates.filter(
+    x => heldSourceIndexes.has(x.sourceIndex)
+);
+const sourceDisappearances = unmatchedExisting.map(x => ({
+    classification: "SOURCE DISAPPEARANCE",
+    ...x,
+    decision:
+        "Review only. Absence from one official pipeline snapshot is not proof of discontinuation."
+}));
+const matchReview = [
+    ...portfolioSplitRequired.map(x => ({
+        reviewType: "PROGRAMME GRAIN / SPLIT REVIEW",
+        ...x
+    })),
+    ...sourceRowGrainReviews,
+    ...aliasReviewCandidates.map(x => ({
+        reviewType: "CLINICAL OVERLAP - ALIAS NOT ESTABLISHED",
+        ...x
+    }))
+];
+const materialDeltaCount =
+    newProgrammes.length +
+    phaseChanges.length +
+    programmeChanges.length +
+    sourceDisappearances.length;
+const matchedCoverage =
+    confirmed.length +
+    stageConflictReview.length;
+const existingDevelopmentIds = new Set(existingDevelopment.map(r => r.id));
+
+
+/* ------------------------------------------------------------
+   STEP 4 R1) Focused Candidate evidence + disposition ledger
+   ------------------------------------------------------------ */
+const hcf = {
+    id: candidateTable.getField("Discovery Candidate ID"),
+    company: candidateTable.getField("Company"),
+    sourceWatch: candidateTable.getField("Source Watch"),
+    family: candidateTable.getField("Discovery Source Family"),
+    classification: candidateTable.getField("Discovery Classification"),
+    reviewStatus: candidateTable.getField("Review Status"),
+    asset: candidateTable.getField("Source Asset Name"),
+    molecule: candidateTable.getField("Source Molecule / INN"),
+    indication: candidateTable.getField("Source Indication"),
+    phase: candidateTable.getField("Source Phase"),
+    programStatus: candidateTable.getField("Source Program Status"),
+    sourceRecord: candidateTable.getField("Source Record ID / Key"),
+    sourceUrl: candidateTable.getField("Source URL"),
+    existingMatch: candidateTable.getField("Existing Portfolio Match"),
+    matchMethod: candidateTable.getField("Match Method"),
+    matchConfidence: candidateTable.getField("Match Confidence"),
+    exception: candidateTable.getField("Reconciliation Exception Type"),
+    programmeGate: candidateTable.getField("Programme Reconciliation Gate"),
+    nextAction: candidateTable.getField("Programme Review Next Action"),
+    sourceScope: candidateTable.getField("Source Scope Granularity"),
+    latestStagingEvidence: candidateTable.getField("Latest Staging Evidence")
+};
+const candidateQuery = await candidateTable.selectRecordsAsync({
+    fields: Object.values(hcf)
+});
+function linkedIds(record, fieldObj) {
+    const raw = record.getCellValue(fieldObj) || [];
+    return Array.isArray(raw)
+        ? raw.map(x => x && x.id).filter(Boolean)
+        : [];
+}
+const currentSourceCandidatesByStableKey = new Map();
+const supersededSourceCandidatesByStableKey = new Map();
+const candidatesByDiscoveryId = new Map();
+for (const candidate of candidateQuery.records) {
+    const discoveryCandidateId = clean(candidate.getCellValueAsString(hcf.id));
+    if (discoveryCandidateId) {
+        if (!candidatesByDiscoveryId.has(discoveryCandidateId)) {
+            candidatesByDiscoveryId.set(discoveryCandidateId, []);
+        }
+        candidatesByDiscoveryId.get(discoveryCandidateId).push(candidate);
+    }
+    const watchIds = linkedIds(candidate, hcf.sourceWatch);
+    if (!watchIds.includes(sourceWatchRecordId)) continue;
+    const key = clean(candidate.getCellValueAsString(hcf.sourceRecord));
+    if (!key) continue;
+    const reviewStatus = clean(
+        candidate.getCellValueAsString(hcf.reviewStatus)
+    );
+    const targetMap = reviewStatus === "Superseded"
+        ? supersededSourceCandidatesByStableKey
+        : currentSourceCandidatesByStableKey;
+    if (!targetMap.has(key)) targetMap.set(key, []);
+    targetMap.get(key).push(candidate);
+}
+function holdTypesForSourceIndex(sourceIndex) {
+    const holdTypes = [];
+    if (sourceRowGrainReviews.some(x => x.sourceIndex === sourceIndex)) {
+        holdTypes.push("PROGRAMME_GRAIN");
+    }
+    if (aliasReviewCandidates.some(x =>
+        (x.possibleOfficialRows || []).some(y => y.sourceIndex === sourceIndex)
+    )) {
+        holdTypes.push("ALIAS_IDENTITY");
+    }
+    return holdTypes;
+}
+function sortedUniqueIds(values) {
+    return [...new Set((values || []).filter(Boolean))].sort();
+}
+function candidateSnapshot(record, historical) {
+    return {
+        candidateRecordId: record.id,
+        discoveryCandidateId: clean(record.getCellValueAsString(hcf.id)),
+        reviewStatus: clean(record.getCellValueAsString(hcf.reviewStatus)),
+        discoveryClassification: clean(record.getCellValueAsString(hcf.classification)),
+        matchMethod: clean(record.getCellValueAsString(hcf.matchMethod)),
+        matchConfidence: clean(record.getCellValueAsString(hcf.matchConfidence)),
+        existingPortfolioMatchIds: linkedIds(record, hcf.existingMatch),
+        reconciliationException: clean(record.getCellValueAsString(hcf.exception)),
+        programmeGate: clean(record.getCellValueAsString(hcf.programmeGate)),
+        sourceScopeGranularity: clean(record.getCellValueAsString(hcf.sourceScope)),
+        historicalSuperseded: historical === true
+    };
+}
+function candidateLedgerSnapshotForStableKey(stableKey) {
+    return {
+        current: (currentSourceCandidatesByStableKey.get(stableKey) || [])
+            .map(r => candidateSnapshot(r, false)),
+        superseded: (supersededSourceCandidatesByStableKey.get(stableKey) || [])
+            .map(r => candidateSnapshot(r, true))
+    };
+}
+function matchedSubtypeForSourceIndex(sourceIndex) {
+    const later = stageConflictReview.find(x => x.sourceIndex === sourceIndex);
+    if (later) return "LATER_STAGE_PRESERVED";
+    const match = confirmed.find(x => x.sourceIndex === sourceIndex);
+    if (!match) return "APPROVED_EXISTING_MATCH";
+    const sourcePhase = norm(match.external.phase);
+    const existingPhase = norm(match.existing.phase);
+    if (match.phaseComparable === false && match.broadStageChanged) {
+        return "PROGRAMME_CHANGE_BROAD_STAGE";
+    }
+    if (match.phaseComparable !== false && sourcePhase !== existingPhase) {
+        return "PHASE_CHANGE";
+    }
+    if (materiallyDifferentProgramme(match)) return "PROGRAMME_CHANGE";
+    return "NO_CHANGE";
+}
+
+const accountedSourceIndexes = new Set([
+    ...assignedSource,
+    ...approvedSourceMatches.map(x => x.sourceIndex),
+    ...heldSourceIndexes,
+    ...newProgrammes.map(x => x.sourceIndex)
+]);
+const accountedExistingIds = new Set([
+    ...[...assignedExisting].filter(id => existingDevelopmentIds.has(id)),
+    ...[...heldExistingIds].filter(id => existingDevelopmentIds.has(id)),
+    ...sourceDisappearances
+        .map(x => x.recordId)
+        .filter(id => existingDevelopmentIds.has(id)),
+    ...[...splitExistingIds].filter(id => existingDevelopmentIds.has(id))
+]);
+const sourceCoverageBalanced =
+    accountedSourceIndexes.size === sourceRows.length;
+const existingCoverageBalanced =
+    accountedExistingIds.size === existingDevelopment.length;
+
+const heldAddressability = [...heldSourceIndexes].map(sourceIndex => {
+    const stableKey = stableSourceRecordKey(sourceRows[sourceIndex], sourceIndex);
+    const current = currentSourceCandidatesByStableKey.get(stableKey) || [];
+    const superseded = supersededSourceCandidatesByStableKey.get(stableKey) || [];
+    return {
+        sourceIndex,
+        stableSourceRecordKey: stableKey,
+        currentCandidateCount: current.length,
+        supersededCandidateCount: superseded.length,
+        addressable: current.length === 1
+    };
+});
+const holdLedgerAddressabilityReady =
+    heldAddressability.every(x => x.addressable);
+
+const approvedMatchBySourceIndex = new Map(
+    approvedSourceMatches.map(x => [x.sourceIndex, x])
+);
+const newProgrammeBySourceIndex = new Map(
+    newProgrammes.map(x => [x.sourceIndex, x])
+);
+const stableKeyCounts = new Map();
+
+const sourceDispositionLedger = sourceRows.map((sourceRow, sourceIndex) => {
+    const stableKey = stableSourceRecordKey(sourceRow, sourceIndex);
+    stableKeyCounts.set(stableKey, (stableKeyCounts.get(stableKey) || 0) + 1);
+    const candidateLedger = candidateLedgerSnapshotForStableKey(stableKey);
+    const assignedPortfolioRecordId =
+        assignedSourceToExisting.get(sourceIndex) || "";
+    const approvedMatch = approvedMatchBySourceIndex.get(sourceIndex) || null;
+    const newProgramme = newProgrammeBySourceIndex.get(sourceIndex) || null;
+
+    let currentDisposition = "UNACCOUNTED";
+    let dispositionSubtype = "UNACCOUNTED";
+    let canonicalPortfolioRecordIds = [];
+    let possiblePortfolioRecordIds = [];
+    let holdTypes = [];
+
+    if (heldSourceIndexes.has(sourceIndex)) {
+        currentDisposition = "HELD";
+        dispositionSubtype = "ROW_LEVEL_RECONCILIATION_HOLD";
+        holdTypes = holdTypesForSourceIndex(sourceIndex);
+        possiblePortfolioRecordIds = sortedUniqueIds(
+            candidateLedger.current.flatMap(x => x.existingPortfolioMatchIds)
+        );
+    } else if (assignedPortfolioRecordId) {
+        currentDisposition = "MATCHED";
+        dispositionSubtype = matchedSubtypeForSourceIndex(sourceIndex);
+        canonicalPortfolioRecordIds = [assignedPortfolioRecordId];
+    } else if (approvedMatch) {
+        currentDisposition = "MATCHED";
+        dispositionSubtype = "APPROVED_EXISTING_MATCH";
+        canonicalPortfolioRecordIds =
+            approvedMatch.existingRecordId ? [approvedMatch.existingRecordId] : [];
+    } else if (newProgramme) {
+        currentDisposition = "NEW";
+        dispositionSubtype = clean(
+            newProgramme.subtype ||
+            newProgramme.classification ||
+            "NEW_PROGRAMME"
+        );
+    }
+
+    return {
+        sourceIndex,
+        stableSourceRecordKey: stableKey,
+        asset: clean(sourceRow.asset),
+        indication: clean(sourceRow.indication),
+        phase: clean(sourceRow.phase || sourceRow.sourceStage || ""),
+        currentDisposition,
+        dispositionSubtype,
+        canonicalPortfolioRecordIds,
+        possiblePortfolioRecordIds,
+        holdTypes,
+        candidateLedger
+    };
+});
+
+const duplicateSourceStableKeys = [...stableKeyCounts.entries()]
+    .filter(([, count]) => count !== 1)
+    .map(([stableSourceRecordKey, count]) => ({
+        stableSourceRecordKey,
+        count
+    }));
+const unaccountedSourceRows = sourceDispositionLedger.filter(
+    x => x.currentDisposition === "UNACCOUNTED"
+);
+const dispositionCounts = sourceDispositionLedger.reduce((acc, row) => {
+    acc[row.currentDisposition] =
+        (acc[row.currentDisposition] || 0) + 1;
+    return acc;
+}, {});
+const reconciliationStatus =
+    !sourceCoverageBalanced || !existingCoverageBalanced || !holdLedgerAddressabilityReady
+        ? "BLOCK"
+        : heldSourceIndexes.size > 0
+            ? "PASS WITH ROW HOLDS"
+            : "PASS";
+const auditReady =
+    guardrail === true &&
+    sourceCoverageBalanced === true &&
+    sourceDispositionLedger.length === sourceRows.length &&
+    duplicateSourceStableKeys.length === 0 &&
+    unaccountedSourceRows.length === 0 &&
+    holdLedgerAddressabilityReady === true;
+
+/* ------------------------------------------------------------
+   STEP 4 R1B) Durable Candidate persistence preflight (READ ONLY)
+   ------------------------------------------------------------ */
+function selectChoiceNames(fieldObj) {
+    return fieldObj && fieldObj.options && Array.isArray(fieldObj.options.choices)
+        ? fieldObj.options.choices.map(x => clean(x && x.name)).filter(Boolean)
+        : [];
+}
+function splitLedgerTerms(value) {
+    return clean(value)
+        .split(/[;\n,|]/g)
+        .map(clean)
+        .filter(Boolean);
+}
+async function postJson(path, payload) {
+    const retryableStatuses = new Set([408, 429, 500, 502, 503, 504]);
+    let lastError = null;
+    for (let attempt = 1; attempt <= 2; attempt++) {
+        try {
+            const res = await fetch(ADAPTER_BASE_URL + path, {
+                method: "POST",
+                headers: {
+                    "Accept": "application/json",
+                    "Content-Type": "application/json",
+                    "X-Adapter-Key": adapterApiKey
+                },
+                body: JSON.stringify(payload)
+            });
+            const body = await res.text();
+            let data;
+            try { data = JSON.parse(body); }
+            catch (_) {
+                throw new Error(
+                    "Comparator returned non-JSON. status=" + res.status +
+                    "; body=" + body.slice(0,500)
+                );
+            }
+            if (res.ok) return data;
+            const err = new Error(
+                "Comparator request failed. status=" + res.status +
+                "; detail=" + JSON.stringify(data).slice(0,700)
+            );
+            if (!retryableStatuses.has(res.status) || attempt === 2) throw err;
+            lastError = err;
+            await sleep(1500);
+        } catch (error) {
+            lastError = error;
+            if (attempt === 2) throw error;
+            await sleep(1500);
+        }
+    }
+    throw lastError || new Error("Comparator request failed after retry.");
+}
+
+const durableMissingRows = sourceDispositionLedger.filter(row =>
+    row.currentDisposition === "NEW" &&
+    row.candidateLedger.current.length === 0 &&
+    row.candidateLedger.superseded.length === 0
+);
+const durableSupersededOnly = sourceDispositionLedger.filter(row =>
+    row.currentDisposition === "NEW" &&
+    row.candidateLedger.current.length === 0 &&
+    row.candidateLedger.superseded.length > 0
+);
+const durableAmbiguousActive = sourceDispositionLedger.filter(row =>
+    row.candidateLedger.current.length > 1
+);
+
+const comparatorPortfolioRows = existingAll.map(record => ({
+    recordId: record.id,
+    company: companyName,
+    asset: cellText(record, f.brand) || null,
+    molecule: cellText(record, f.molecule) || null,
+    developmentCode: cellText(record, f.devCode) || null,
+    brand: cellText(record, f.brand) || null,
+    aliases: unique([
+        ...splitLedgerTerms(cellText(record, f.aliases)),
+        cellText(record, f.molecule),
+        cellText(record, f.devCode)
+    ]),
+    indication: cellText(record, f.indication) || null,
+    controlledIndication: null,
+    indicationAliases: [],
+    treatmentSettingLine: splitLedgerTerms(cellText(record, f.setting)),
+    biomarkerPatientSegment: cellText(record, f.segment) || null,
+    portfolioStatus: selectText(record, f.status) || null,
+    phase: selectText(record, f.phase) || null
+}));
+let companyAliasesForPersistence = [companyName];
+try {
+    const aliasesField = companiesTable.getField("Aliases / Former Names");
+    companyAliasesForPersistence = unique([
+        companyName,
+        ...splitLedgerTerms(targetCompany.getCellValueAsString(aliasesField))
+    ]);
+} catch (_) {}
+
+function comparatorSourceRowForPersistence(ledgerRow) {
+    const sourceRow = sourceRows[ledgerRow.sourceIndex] || {};
+    const phase = clean(sourceRow.phase || sourceRow.sourceStage || "");
+    return {
+        company: companyName,
+        sourceFamily: "Company Pipeline",
+        sourceRecordId: ledgerRow.stableSourceRecordKey,
+        sourceUrl: clean(sourceRow.sourceUrl || external.sourceUrl || sourceUrl),
+        sourceWatchRecordId,
+        asset: clean(sourceRow.asset) || null,
+        molecule: clean(sourceRow.molecule) || null,
+        developmentCode: clean(sourceRow.developmentCode) || null,
+        brand: clean(sourceRow.brand) || null,
+        indication: clean(sourceRow.indication) || null,
+        controlledIndicationCandidate:
+            clean(sourceRow.controlledIndicationCandidate) || null,
+        phase: phase || null,
+        programStatus: clean(sourceRow.programStatus || sourceRow.status || "Active"),
+        sponsorOwner: clean(sourceRow.sponsorOwner || companyName),
+        partners: Array.isArray(sourceRow.partners)
+            ? sourceRow.partners.map(clean).filter(Boolean)
+            : [],
+        sourceUnavailable: false,
+        ownershipResolved: true,
+        strategicPhase1: false,
+        importantLabelExpansion: false,
+        marketedStrategicRx: /approved|marketed/i.test(phase),
+        genericCommodity: false
+    };
+}
+
+const persistenceComparatorCandidates = [];
+const persistenceConflicts = [];
+let persistenceComparatorVersion = "";
+if (durableMissingRows.length > 0) {
+    const sourceRowsForComparator =
+        durableMissingRows.map(comparatorSourceRowForPersistence);
+    const batchRunId =
+        "R1B_PERSISTENCE_PLAN|" +
+        sourceWatchRecordId + "|" +
+        new Date().toISOString();
+
+    for (let offset = 0; offset < sourceRowsForComparator.length; offset += 24) {
+        const part = sourceRowsForComparator.slice(offset, offset + 24);
+        const response = await postJson(
+            "/compare/portfolio-discovery",
+            {
+                company: companyName,
+                sourceRows: part,
+                portfolioRows: comparatorPortfolioRows,
+                companyAliases: companyAliasesForPersistence,
+                batchRunId
+            }
+        );
+        if (
+            !response ||
+            response.readOnly !== true ||
+            !Array.isArray(response.candidates) ||
+            response.candidates.length !== part.length ||
+            Number(response.sourceRowCount) !== part.length ||
+            !response.version ||
+            (
+                persistenceComparatorVersion &&
+                response.version !== persistenceComparatorVersion
+            ) ||
+            response.candidates.some(
+                (candidate, index) =>
+                    clean(candidate.sourceRecordId) !==
+                    clean(part[index].sourceRecordId)
+            )
+        ) {
+            throw new Error(
+                "R1B_COMPARATOR_CONTRACT_FAILED offset=" + offset
+            );
+        }
+        persistenceComparatorVersion = response.version;
+        persistenceComparatorCandidates.push(...response.candidates);
+    }
+}
+
+const missingByKey = new Map(
+    durableMissingRows.map(row => [row.stableSourceRecordKey, row])
+);
+const allowedClassifications = selectChoiceNames(hcf.classification);
+const plannedDiscoveryIds = new Set();
+const candidatePersistenceCreates = [];
+
+for (const comparatorCandidate of persistenceComparatorCandidates) {
+    const stableKey = clean(comparatorCandidate.sourceRecordId);
+    const ledgerRow = missingByKey.get(stableKey);
+    if (!ledgerRow) {
+        persistenceConflicts.push({
+            stableSourceRecordKey: stableKey,
+            reason: "COMPARATOR_RETURNED_UNKNOWN_SOURCE_KEY"
+        });
+        continue;
+    }
+
+    const discoveryCandidateId = clean(
+        comparatorCandidate.discoveryCandidateId
+    );
+    const classification = clean(
+        comparatorCandidate.classification
+    );
+    const existingIdRecords =
+        candidatesByDiscoveryId.get(discoveryCandidateId) || [];
+    const suggestedIds = Array.isArray(
+        comparatorCandidate.existingPortfolioRecordIds
+    )
+        ? comparatorCandidate.existingPortfolioRecordIds
+            .filter(id => /^rec[A-Za-z0-9]{14}$/.test(id))
+        : [];
+
+    if (
+        !discoveryCandidateId ||
+        !classification ||
+        !allowedClassifications.includes(classification) ||
+        existingIdRecords.length > 0 ||
+        plannedDiscoveryIds.has(discoveryCandidateId)
+    ) {
+        persistenceConflicts.push({
+            stableSourceRecordKey: stableKey,
+            discoveryCandidateId,
+            classification,
+            existingCandidateRecordIds:
+                existingIdRecords.map(x => x.id),
+            reason:
+                !discoveryCandidateId
+                    ? "MISSING_DISCOVERY_CANDIDATE_ID"
+                    : !classification
+                        ? "MISSING_DISCOVERY_CLASSIFICATION"
+                        : !allowedClassifications.includes(classification)
+                            ? "UNSUPPORTED_DISCOVERY_CLASSIFICATION"
+                            : existingIdRecords.length > 0
+                                ? "DISCOVERY_CANDIDATE_ID_ALREADY_EXISTS"
+                                : "DUPLICATE_DISCOVERY_CANDIDATE_ID_IN_PLAN"
+        });
+        continue;
+    }
+
+    plannedDiscoveryIds.add(discoveryCandidateId);
+    const sourceRow = sourceRows[ledgerRow.sourceIndex] || {};
+    candidatePersistenceCreates.push({
+        action: "CREATE_CANDIDATE_ONLY_PREVIEW",
+        sourceIndex: ledgerRow.sourceIndex,
+        stableSourceRecordKey: stableKey,
+        comparatorVersion: persistenceComparatorVersion,
+        comparatorSuggestedExistingPortfolioRecordIds: suggestedIds,
+        proposedFields: {
+            "Discovery Candidate ID": discoveryCandidateId,
+            "Company": [{id: targetCompany.id, name: companyName}],
+            "Source Watch": [{id: sourceWatchRecord.id, name: sourceWatchName}],
+            "Discovery Source Family": "Company Pipeline",
+            "Source Record ID / Key": stableKey,
+            "Source Asset Name": clean(sourceRow.asset),
+            "Source Molecule / INN": clean(sourceRow.molecule),
+            "Source Indication": clean(sourceRow.indication),
+            "Source Phase": clean(sourceRow.phase || sourceRow.sourceStage || ""),
+            "Source Program Status": clean(
+                sourceRow.programStatus || sourceRow.status || "Active"
+            ),
+            "Source URL": clean(
+                sourceRow.sourceUrl || external.sourceUrl || sourceUrl
+            ),
+            "Existing Portfolio Match": [],
+            "Review Status": "New",
+            "Discovery Classification": classification,
+            "Programme Reconciliation Gate": "Unassessed",
+            "Programme Review Next Action":
+                "R1_NEW_SOURCE_ROW | Durable source-row identity captured. Review comparator classification and authoritative programme evidence before any Portfolio promotion. No Portfolio write authorised.",
+            "Latest Staging Evidence":
+                "V2.61.3_SOURCE_DISPOSITION|sourceKey=" + stableKey +
+                "|disposition=NEW|candidateLedgerWriteMode=PREVIEW_ONLY" +
+                "|queueEligible=false|portfolioWriteEligible=false"
+        }
+    });
+}
+
+const candidatePersistencePlanReady =
+    auditReady === true &&
+    duplicateSourceStableKeys.length === 0 &&
+    durableSupersededOnly.length === 0 &&
+    durableAmbiguousActive.length === 0 &&
+    persistenceConflicts.length === 0 &&
+    candidatePersistenceCreates.length === durableMissingRows.length;
+
+const candidatePersistencePreflight = {
+    version: VERSION,
+    mode: "READ ONLY - ZERO AIRTABLE WRITES",
+    company: companyName,
+    companyRecordId: targetCompany.id,
+    sourceWatchRecordId: sourceWatchRecord.id,
+    sourceWatchName,
+    officialSourceRows: sourceRows.length,
+    currentSourceRowsWithActiveCandidate:
+        sourceDispositionLedger.filter(
+            row => row.candidateLedger.current.length === 1
+        ).length,
+    sourceRowsMissingActiveCandidate: durableMissingRows.length,
+    supersededOnlyMissingActiveCandidate: durableSupersededOnly.length,
+    ambiguousActiveCandidateMappings: durableAmbiguousActive.length,
+    plannedCandidateCreates: candidatePersistenceCreates.length,
+    plannedCandidateUpdates: 0,
+    comparatorVersion: persistenceComparatorVersion,
+    conflictCount: persistenceConflicts.length,
+    planReady: candidatePersistencePlanReady,
+    candidateWrites: 0,
+    queueWrites: 0,
+    sourceWatchWrites: 0,
+    portfolioWrites: 0,
+    masterDataWrites: 0,
+    status: candidatePersistencePlanReady
+        ? "PASS - EXACT CANDIDATE-ONLY PERSISTENCE PLAN READY"
+        : "BLOCK - CANDIDATE PERSISTENCE PLAN NOT SAFE",
+    conflicts: persistenceConflicts,
+    supersededOnlyRows: durableSupersededOnly.map(row => ({
+        sourceIndex: row.sourceIndex,
+        stableSourceRecordKey: row.stableSourceRecordKey,
+        asset: row.asset
+    })),
+    ambiguousRows: durableAmbiguousActive.map(row => ({
+        sourceIndex: row.sourceIndex,
+        stableSourceRecordKey: row.stableSourceRecordKey,
+        activeCandidateRecordIds:
+            row.candidateLedger.current.map(x => x.candidateRecordId)
+    })),
+    safeguards: [
+        "No existing Candidate record is updated by this preflight.",
+        "Only NEW source rows with zero active and zero superseded Candidate mappings are eligible for CREATE preview.",
+        "Discovery Candidate ID and Discovery Classification come from the existing shared /compare/portfolio-discovery contract.",
+        "Comparator-suggested Portfolio matches remain diagnostic only; Existing Portfolio Match is proposed blank.",
+        "Review Status remains New and Programme Reconciliation Gate remains Unassessed.",
+        "No Portfolio, Intelligence Update Queue or Source Watch write is authorised."
+    ]
+};
+
+const candidatePersistencePlan = {
+    mode: "READ ONLY - ZERO AIRTABLE WRITES",
+    planReady: candidatePersistencePlanReady,
+    creates: candidatePersistenceCreates
+};
+
+const sourceDispositionAudit = {
+    version: VERSION,
+    mode: "READ ONLY - ZERO AIRTABLE WRITES",
+    company: companyName,
+    companyRecordId: targetCompany.id,
+    sourceWatchRecordId: sourceWatchRecord.id,
+    sourceWatchName,
+    adapterProfile,
+    officialSourceRows: sourceRows.length,
+    existingDevelopmentRows: existingDevelopment.length,
+    sourceCoverageBalanced,
+    existingCoverageBalanced,
+    holdLedgerAddressabilityReady,
+    reconciliationStatus,
+    dispositionCounts,
+    ledgerRowCount: sourceDispositionLedger.length,
+    duplicateSourceStableKeyCount: duplicateSourceStableKeys.length,
+    unaccountedSourceRowCount: unaccountedSourceRows.length,
+    heldAddressabilityFailures: heldAddressability.filter(x => !x.addressable),
+    auditReady,
+    candidateWrites: 0,
+    queueWrites: 0,
+    sourceWatchWrites: 0,
+    portfolioWrites: 0,
+    masterDataWrites: 0,
+    status: auditReady
+        ? "PASS - EVERY CURRENT SOURCE ROW HAS ONE EXPLICIT DISPOSITION"
+        : "BLOCK - SOURCE ROW DISPOSITION LEDGER NOT COMPLETE",
+    duplicateSourceStableKeys,
+    unaccountedSourceRows
+};
+
+output.set("sourceDispositionAudit", JSON.stringify(sourceDispositionAudit, null, 2));
+output.set("candidatePersistencePreflight", JSON.stringify(candidatePersistencePreflight, null, 2));
+output.set("candidatePersistencePlan", JSON.stringify(candidatePersistencePlan, null, 2));
+
+} catch (__sourceError) {
+    const errorText = String(
+        __sourceError && (__sourceError.message || __sourceError) || "Unknown error"
+    ).replace(/[\r\n]+/g, " ").slice(0, 1000);
+    output.set("sourceDispositionAudit", JSON.stringify({
+        version: VERSION,
+        mode: "READ ONLY - ZERO AIRTABLE WRITES",
+        sourceWatchRecordId,
+        auditReady: false,
+        status: "FAIL CLOSED - R1 AUDIT ERROR",
+        error: errorText,
+        candidateWrites: 0,
+        queueWrites: 0,
+        sourceWatchWrites: 0,
+        portfolioWrites: 0,
+        masterDataWrites: 0
+    }, null, 2));
+    output.set("candidatePersistencePreflight", JSON.stringify({
+        version: VERSION,
+        mode: "READ ONLY - ZERO AIRTABLE WRITES",
+        sourceWatchRecordId,
+        planReady: false,
+        status: "FAIL CLOSED - R1B PREFLIGHT ERROR",
+        error: errorText,
+        candidateWrites: 0,
+        queueWrites: 0,
+        sourceWatchWrites: 0,
+        portfolioWrites: 0,
+        masterDataWrites: 0
+    }, null, 2));
+    output.set("candidatePersistencePlan", JSON.stringify({
+        mode: "READ ONLY - ZERO AIRTABLE WRITES",
+        planReady: false,
+        creates: []
+    }, null, 2));
+}

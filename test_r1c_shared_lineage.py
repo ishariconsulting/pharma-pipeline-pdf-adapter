@@ -100,6 +100,70 @@ class SafetyTests(unittest.TestCase):
         self.assertEqual(a["rows"][0]["familyStatus"]["REGULATORY"], "NOT_ASSESSED")
         self.assertNotIn("TREATMENT_LANDSCAPE", a["downstreamImpacts"][0]["derivedEvidenceFamilies"])
 
+    def test_unlinked_proposal_can_be_evidence_supported_without_pass(self):
+        self.data["candidates"][0]["portfolioIds"] = []
+        self.data["portfolio"][0]["candidateIds"] = []
+        before = deepcopy(self.data)
+        r = run(self.data)
+        relation = r["rows"][0]["relations"][0]
+        self.assertEqual(relation["readOnlyEvidenceAssessment"], "SUPPORTED_FOR_READ_ONLY_REVIEW")
+        self.assertEqual(relation["evidenceReasonCodes"], [])
+        self.assertEqual(relation["persistedLinkageAssessment"], "NOT_PERSISTED")
+        self.assertIn("NO_PERSISTED_CANDIDATE_CANONICAL_LINK", relation["persistenceReasonCodes"])
+        self.assertNotIn("NO_PERSISTED_CANDIDATE_CANONICAL_LINK", relation["evidenceReasonCodes"])
+        self.assertEqual(r["rows"][0]["status"], "HOLD")
+        self.assertEqual(r["status"], "HOLD")
+        self.assertEqual(r["cases"][0]["status"], "HOLD")
+        self.assertFalse(r["rows"][0]["queueEligible"])
+        self.assertFalse(r["rows"][0]["portfolioWriteEligible"])
+        self.assertEqual(before, self.data)
+
+    def test_unlinked_proposal_scope_conflict_cannot_be_supported(self):
+        self.data["candidates"][0]["portfolioIds"] = []
+        self.data["portfolio"][0]["candidateIds"] = []
+        self.data["arms"][0]["scope"]["line"] = "2L"
+        relation = run(self.data)["rows"][0]["relations"][0]
+        self.assertEqual(relation["readOnlyEvidenceAssessment"], "EVIDENCE_HELD")
+        self.assertIn("CONFLICT_LINE", relation["evidenceReasonCodes"])
+
+    def test_unlinked_proposal_parent_trial_is_not_focal_arm_proof(self):
+        self.data["candidates"][0]["portfolioIds"] = []
+        self.data["portfolio"][0]["candidateIds"] = []
+        self.data["arms"] = []
+        self.data["trials"][0]["armIds"] = []
+        relation = run(self.data)["rows"][0]["relations"][0]
+        self.assertEqual(relation["readOnlyEvidenceAssessment"], "EVIDENCE_HELD")
+        self.assertIn("NCT_WITHOUT_FOCAL_ARM_PROOF", relation["evidenceReasonCodes"])
+
+    def test_unlinked_proposal_without_official_source_nct_proof_holds(self):
+        self.data["candidates"][0]["portfolioIds"] = []
+        self.data["portfolio"][0]["candidateIds"] = []
+        self.data["sources"][0]["trialReferences"] = {}
+        relation = run(self.data)["rows"][0]["relations"][0]
+        self.assertEqual(relation["readOnlyEvidenceAssessment"], "EVIDENCE_HELD")
+        self.assertIn("OFFICIAL_SOURCE_NCT_RELATION_UNPROVEN", relation["evidenceReasonCodes"])
+
+    def test_r1a_held_with_unlinked_proposal_does_not_promote(self):
+        self.data["candidates"][0]["portfolioIds"] = []
+        self.data["portfolio"][0]["candidateIds"] = []
+        self.data["sources"][0].update(baselineDisposition="HELD", baselineReason="Unresolved grain")
+        self.data["expectedDispositionCounts"] = {"HELD": 1}
+        r = run(self.data)
+        self.assertEqual(r["rows"][0]["relations"][0]["readOnlyEvidenceAssessment"], "SUPPORTED_FOR_READ_ONLY_REVIEW")
+        self.assertIn("R1A_HELD_PRESERVED:Unresolved grain", r["rows"][0]["reasonCodes"])
+        self.assertEqual(r["rows"][0]["status"], "HOLD")
+        self.assertFalse(r["rows"][0]["queueEligible"])
+        self.assertFalse(r["rows"][0]["portfolioWriteEligible"])
+
+    def test_one_sided_candidate_link_is_integrity_failure_not_evidence_failure(self):
+        self.data["portfolio"][0]["candidateIds"] = []
+        r = run(self.data)
+        relation = r["rows"][0]["relations"][0]
+        self.assertEqual(relation["readOnlyEvidenceAssessment"], "SUPPORTED_FOR_READ_ONLY_REVIEW")
+        self.assertEqual(relation["persistedLinkageAssessment"], "NONRECIPROCAL")
+        self.assertEqual(r["status"], "FAIL")
+        self.assertFalse(r["rows"][0]["portfolioWriteEligible"])
+
     def test_missing_candidate(self):
         self.data["candidates"] = []
         self.held("ACTIVE_CANDIDATE_COUNT_0")

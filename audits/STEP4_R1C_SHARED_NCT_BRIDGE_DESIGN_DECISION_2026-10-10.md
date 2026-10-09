@@ -1,0 +1,26 @@
+# R1C shared source-to-trial linkage design decision — 2026-10-10
+
+**Status: DESIGN REVIEW COMPLETE; ONE BOUNDED READ-ONLY CODE CHANGE IS JUSTIFIED. R1C NOT PASSED.** No source, code, production, automation or master data change in this assessment.
+
+## Evidence already proven
+- User's one-request official Gilead Sitecore SXA source read: 53 structurally valid rows, 53 distinct IDs, zero explicit ClinicalTrials.gov URLs, zero NCT mentions anywhere in raw Sitecore JSON and zero writes. Re-running the same source for NCTs would not help.
+- Prior 55-row Gilead Portfolio evidence derivation reproducibly proposed `Needs review` on all 55 because exact authority/scope/clinical focal-arm connections were not proven. Six clinical test cases remain held, not new workstreams.
+- The bounded `source_evidence_contract.py` / opt-in Sitecore provenance preservation change has user-executed 93/93 Codespaces regression PASS. Evidence capture is not evidence reconciliation.
+
+## Existing architecture reviewed
+1. `r1c_shared_lineage.py`, Source.trialReferences and Evidence validation: every TRIAL_REGISTRY corroboration currently requires `source.trialReferences[t.nct]` (approx. lines 652-675) and verified focal experimental Arm, reciprocal trial links, correct originating authority, exact indication/regimen/setting/population and provenance. This is a defensible fail-closed default but has no separate independently verified alternative bridge path when the pipeline publisher supplies no NCT.
+2. `ctgov_portfolio_seed_extension.py`: already reads sponsor-scoped CT.gov trials, experimental interventions and NCT IDs, and emits `trialIds` plus asset/indication Candidate seeds. It groups rows by asset + **first registry condition**, potentially merging distinct NCTs and carrying the highest phase: useful for fallback discovery, **not** exact per-arm, per-population/indication programme corroboration. Reuse verified extraction/registry data, not aggregated seeds as exact evidence.
+3. Existing OFF Airtable clinical audit canaries: `CT.gov Module-Aware Programme Recon V1.0.1` and `CT.gov Protocol Assignment Preflight V1.0` are read-only and preserve distinction between cohort grouping and actual nested treatment arm. `CT.gov Live Arm-to-Cohort Verification V1.2` is OFF, company/NCT-scoped, writes to *audit* if run, and must not be activated as a zero-write preview. Their source logic should inform a common fail-closed evidence contract; no new Airtable automation.
+4. `portfolio_discovery_extension_v16.py` opt-in asset-presence assessment preserves classification and never claims programme approval. Do not bypass it or change default comparator output.
+
+## Minimal accepted design proposal — no implementation yet
+A generic, **opt-in READ-ONLY independent programme-to-NCT bridge preview** within the existing R1C resolver/composition:
+- Input is immutable original **official** pipeline source key, provenance, asset/regimen, indication and scope, plus a distinct official CT.gov NCT registry study and verified focal experimental arm records and any independent official sponsor protocol/product reference used to establish aliases/co-development role.
+- Distinguish `PIPELINE_DIRECT_NCT` (the existing direct-source pathway), `INDEPENDENT_AUTHORITY_BRIDGE` (new explicitly evidenced path), `NO_BRIDGE_EVIDENCE`, `AMBIGUOUS`. Do not add these as Airtable select choices.
+- Never infer a bridge from asset name alone, sponsor alone, NCT parent link, study title or same indication. Require unambiguous evidence-backed exact programme scope: focal arm vs comparator/placebo/background, components, patient population, line, setting, dose/route where material, company role, and source/version/as-of; hold ambiguous cross-company/multi-indication or date cases.
+- A third source/protocol is required when CT.gov's own sponsor, interventions and detailed arm/scope data cannot independently establish exact identity. Retain original authority IDs and no republication double-counting.
+- Emit proposed evidence relationship IDs, provenance, verified/held reason codes and missing prerequisites; zero Candidate, Queue, Portfolio, Source Watch or automation writes; no auto-link/auto-promote.
+- Tests: keep default and existing source.trialReferences pathway unchanged; one synthetic verified positive bridge and negative controls covering unrelated sponsor, wrong indication/population/line, mixed experimental arms, placebo/comparator, unproven alias, mismatch of time/version, duplicated or independently republished evidence, existing HELD R1A row. No fabricated live Gilead positive.
+- Gate: before progress on R1C, produce read-only replay of actual Gilead official source/CT.gov evidence with per-key supported/held reasons; use existing six-case oracle and 53-key denominator; unresolved remain held. Passing code-level tests alone is not Gate 3/7 approval. Follow user stop rule if evidence mostly 'cannot determine'.
+
+**Next decision:** approval for exactly this one bounded read-only code change, ideally a Codex task on existing `recovery/step4-r1c-gilead-readonly` branch. No deployment, new automation or production writes. Framework v2.23 ordering unchanged; R1C remains BLOCKED, Gilead Gate 3/Gate 7 GAP, R2-R5 and 39-company scale audit parked.

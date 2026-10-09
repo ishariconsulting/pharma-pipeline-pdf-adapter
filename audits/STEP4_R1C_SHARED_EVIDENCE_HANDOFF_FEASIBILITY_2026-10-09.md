@@ -1,0 +1,18 @@
+# R1C shared evidence-handoff feasibility — 2026-10-09 (read-only)
+
+**Gate decision: R1C BLOCKED — specific shared evidence-contract deficiency confirmed.** No official-source replay, automations, master or Candidate writes, and no unapproved repair-order change.
+
+Inspected existing live Airtable Source Watch and Adapter Registry contracts, deployed weekly Clinical Trials – CT.gov automation, OFF reusable Clinical Cohort Reconciliation audit, OFF CT.gov Official Cohort Verification audit, and repository Sitecore SXA extractor / read-only R1C resolver on `recovery/step4-r1c-gilead-readonly`.
+
+## Existing verified components
+
+1. Source Watch GILD-SW-003 is Active, adapter/binding Validated and baseline Established; Last Checked 2026-10-02. `PIPELINE_SITECORE_SXA_JSON_V1` was validated 2026-09-21 against 53 structurally complete official programme rows (from 56 results). Structural validation is **not** evidence of programme-to-trial identity.
+2. The existing `sitecore_sxa_pipeline_extension.py` produces official `sourceRecordId`, asset/indication/phase, source URL and basic parser provenance. Crucially **it explicitly emits `study: ""` and `trialIds: []` for every row** (lines 139–154), and does not include original item HTML, source as-of date, source-to-NCT relationship or focal arm proof in row outputs. No such relationship can be recovered by the downstream R1C resolver solely from that normalised feed. Do not invent NCT linkage from programme names.
+3. Deployed weekly `Clinical Trials - CT.gov` stores registry descriptions in `CT.gov Arm / Cohort Raw`, not verified focal-arm links. Existing OFF, reusable official cohort verification and reconciliation audit scripts can fetch CT.gov registry arm groups and preserve source posting evidence, but their saved scopes are ORCHARD canaries. They write exclusively to the cohort *audit* table and should **not** be turned on as a zero-write preview. They do not independently derive source-pipeline-key ↔ NCT/arm scope.
+4. Direct Gilead read-only assessment confirms 53 unique active keyed Candidates, 55 Portfolio rows, all eight trial parents present, 0/8 structured focal-arm children, empty Cross-source Status and Evidence Families for all 55. Full 55-row read-only status preview proposed `Needs review` for every row; replay reproducible; stopped by the explicit cannot-determine rule. Reg/TL/Signal record links are context until exact independent authority, indication, geography and date verified.
+
+## Required bounded solution / acceptance boundary
+
+The issue is **provenance and programme-scope evidence handoff**, not a need for another source-monitoring automation. A shared code-only proposal (if authorised) should (a) preserve original official item fields, stable key, official as-of/retrieval/version and any **actually present** trial reference evidence, (b) use existing CT.gov raw-arm and OFF official-verification logic to propose focal-arm assertions in read-only form, and (c) connect only exact source-key / source-assertion ↔ NCT ↔ focal experimental arm ↔ Portfolio programme; fail closed where the official source cannot establish NCT relationship or authority at exact scope. Do not assume the Sitecore source carries NCT identifiers unless inspected and proven; may require a second independent authorised source. Reuse R1C generic resolver; avoid new automations or Gilead-specific logic.
+
+**Next decision requiring user approval:** keep R1 blocker active and authorise a *bounded shared-code read-only evidence contract* change on the existing recovery branch, OR explicitly park R1C and amend step order to begin R2 with the known Gate 3 / 7 gaps. Neither is authorised by a casual acknowledgement; no production writes/deployment are allowed.

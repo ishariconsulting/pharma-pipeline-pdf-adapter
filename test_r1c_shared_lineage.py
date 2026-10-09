@@ -125,11 +125,14 @@ class SafetyTests(unittest.TestCase):
         self.data["sources"][0].update(baselineDisposition="UNVERIFIED", baselineProof="")
         self.data["arms"] = []
         self.data["trials"][0]["armIds"] = []
+        self.data["cases"][0]["expectedDisposition"] = "SUPPORTED_RELATIONSHIP_WITH_SCOPE_HOLD"
         r = run(self.data)
         rel = r["rows"][0]["relations"][0]
         self.assertEqual(rel["readOnlyEvidenceAssessment"], "EVIDENCE_HELD")
         self.assertIn("NCT_WITHOUT_FOCAL_ARM_PROOF", rel["evidenceReasonCodes"])
         self.assertEqual(r["rows"][0]["status"], "HOLD")
+        self.assertEqual(r["cases"][0]["status"], "HOLD")
+        self.assertEqual(r["status"], "HOLD")
         self.assertFalse(r["rows"][0]["portfolioWriteEligible"])
 
     def test_missing_source_as_of_is_not_fabricated(self):

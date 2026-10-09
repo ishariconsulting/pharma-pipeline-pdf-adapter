@@ -31,3 +31,26 @@ PYTHONDONTWRITEBYTECODE=1 .venv/bin/python -m unittest -v test_source_evidence_c
 **PASS — 93 tests in 5.738 seconds; terminal returned `OK`.** The user supplied a screenshot from their Codespaces terminal, displaying the current working directory `/workspaces/pharma-pipeline-pdf-adapter` and branch `recovery/step4-r1c-gilead-readonly`. This is the follow-up to the requested `python -m unittest -v test_source_evidence_contract test_sitecore_source_evidence test_r1c_shared_lineage` suite on the committed read-only evidence handoff. No failures or errors were reported. The nonfatal Python `DeprecationWarning` about built-in type `swigvarlink` lacking `__module__` did not fail the tests.
 
 **Decision:** bounded *source-evidence-preservation code regression gate PASS* for the user-reported branch run. This is *not* a production release, current Gilead Sitecore source capture, per-programme arm verification, Candidate→Portfolio master reconciliation, or a R1C Gate 3/7 PASS. R1C remains **BLOCKED** and Gilead Golden Company Gate 3 / Gate 7 remain **GAP** pending independently authoritative live source→NCT→focal arm→exact Portfolio programme assertions. Neither production automation, Source Watch, Candidate, Portfolio, queue, nor deployed service was changed to obtain this result. No extra company-specific script or new automation is needed.
+
+
+## Codespaces single-request live official Gilead pipeline evidence capture — user receipt
+
+The user ran the approved **one-request, read-only** `extract_sitecore_sxa(..., include_source_evidence=True)` check in Codespaces on branch `recovery/step4-r1c-gilead-readonly`, using the official machine URL retained in `STEP4_R1C_GILEAD_COMPARATOR_OBSERVED_INPUT.json`. The user supplied terminal output:
+
+```json
+{
+  "status": "READ ONLY - EVIDENCE CAPTURED",
+  "sourceRows": 53,
+  "structuralValidationPass": true,
+  "distinctSourceKeys": 53,
+  "sourceFields": ["Html", "Id", "Language", "Name", "Path", "Url"],
+  "rowsWithExplicitRegistryLinks": 0,
+  "rowsWithUnverifiedNctMentions": 0,
+  "programmeLinksVerified": false,
+  "writes": 0
+}
+```
+
+**Decision:** official machine endpoint returned 53 structurally valid, distinct stable-key source rows and the new read-only provenance envelope functioned successfully. **No clinicaltrials.gov hyperlinks and no NCT tokens were seen anywhere in the captured original source-item JSON**. This is negative source-content evidence, not an indication that ClinicalTrials.gov or a different official source has no data. Do not repeat Sitecore extraction hoping to reveal NCT links, infer NCT from programme name, or count structural source identity as programme-level reconciliation.
+
+**R1C source-verification subquestion closed, but R1C remains BLOCKED** on a *shared independent evidence-to-programme reconciliation contract*: authoritative cross-source identification of exact asset, clinical protocol, focal arm, indication, population/line, joint owner and temporal scope. Existing 55-row `Needs review` preview, Gilead Gate 3 GAP / Gate 7 GAP and review holds remain unchanged. No platform write, service deployment, automation or Client release. A decision to park R1C and move to R2 would explicitly amend the locked Step 4 order and needs user approval.

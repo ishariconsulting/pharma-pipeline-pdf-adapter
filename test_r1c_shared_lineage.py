@@ -103,6 +103,14 @@ class SafetyTests(unittest.TestCase):
     def test_unlinked_proposal_can_be_evidence_supported_without_pass(self):
         self.data["candidates"][0]["portfolioIds"] = []
         self.data["portfolio"][0]["candidateIds"] = []
+        # The positive fixture's original SUPPORTED_EXACT oracle is deliberately
+        # stale after removing both persisted links. It must still fail closed.
+        stale = run(self.data)
+        self.assertEqual(stale["status"], "FAIL")
+        self.assertIn("CASE_DISPOSITION_DIFFERS_FROM_ORACLE", stale["cases"][0]["reasonCodes"])
+        # The independent oracle for this unlinked synthetic scenario is HOLD,
+        # not the positive linked fixture's SUPPORTED_EXACT.
+        self.data["cases"][0]["expectedDisposition"] = "HELD_AMBIGUOUS"
         before = deepcopy(self.data)
         r = run(self.data)
         relation = r["rows"][0]["relations"][0]

@@ -24,3 +24,10 @@ PYTHONDONTWRITEBYTECODE=1 .venv/bin/python -m unittest -v test_source_evidence_c
 - After tests, any read-only evidence capture should be separately controlled, source-access safe (rate limits / IP reputation), and limited to already authorised sources. Do not turn on OFF audit scripts or deploy a new route without user approval.
 
 **Only GitHub recovery branch files updated.** No master-data writes or production deployment were performed.
+
+
+## User-executed Codespaces regression receipt — 9 October 2026
+
+**PASS — 93 tests in 5.738 seconds; terminal returned `OK`.** The user supplied a screenshot from their Codespaces terminal, displaying the current working directory `/workspaces/pharma-pipeline-pdf-adapter` and branch `recovery/step4-r1c-gilead-readonly`. This is the follow-up to the requested `python -m unittest -v test_source_evidence_contract test_sitecore_source_evidence test_r1c_shared_lineage` suite on the committed read-only evidence handoff. No failures or errors were reported. The nonfatal Python `DeprecationWarning` about built-in type `swigvarlink` lacking `__module__` did not fail the tests.
+
+**Decision:** bounded *source-evidence-preservation code regression gate PASS* for the user-reported branch run. This is *not* a production release, current Gilead Sitecore source capture, per-programme arm verification, Candidate→Portfolio master reconciliation, or a R1C Gate 3/7 PASS. R1C remains **BLOCKED** and Gilead Golden Company Gate 3 / Gate 7 remain **GAP** pending independently authoritative live source→NCT→focal arm→exact Portfolio programme assertions. Neither production automation, Source Watch, Candidate, Portfolio, queue, nor deployed service was changed to obtain this result. No extra company-specific script or new automation is needed.

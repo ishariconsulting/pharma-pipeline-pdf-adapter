@@ -1,0 +1,36 @@
+{
+  "archiveType": "READ_ONLY_REDACTED_AUTOMATION_CONFIGURATION",
+  "captureDate": "2026-10-09",
+  "baseId": "appzteNR0u0ywm9Zz",
+  "automationId": "wflN5LyvqN8flQPkE",
+  "automationName": "US Marketed Product Identity Result Collector V1",
+  "description": "Scheduled collector for completed background U.S. marketed-product identity jobs. Checks one pending company job per run, collects paged results only after completion, validates against the canonical MKT1 catalogue, and writes identity evidence only. Never writes Portfolio, queue, or scope decisions.",
+  "deploymentStatus": "undeployed",
+  "configurationStatus": "valid",
+  "trigger": {
+    "type": "cron",
+    "inputs": {
+      "type": "minutely",
+      "config": {
+        "obj": {
+          "width": 5
+        }
+      },
+      "start": "2026-09-28T18:55:00Z"
+    }
+  },
+  "nodes": [
+    {
+      "key": "wacircGETK0WojSCd",
+      "type": "customScript",
+      "description": "Collect one completed U.S. identity background job",
+      "inputs": {
+        "script": "throw new Error('Paste US_Marketed_Product_Identity_Result_Collector_V1.txt into this script before turning the automation on.');"
+      },
+      "credentialReferences": "REDACTED"
+    }
+  ],
+  "deployedVersion": null,
+  "source": "Airtable get_automation; original credential bindings deliberately excluded",
+  "retirementStatus": "NOT APPROVED - NO AUTOMATION MUTATED"
+}

@@ -654,7 +654,8 @@ class AssetPresenceSafetyTests(unittest.TestCase):
             observed_classification=classification)
 
     def test_cross_field_whole_identity_flags_false_new_asset_without_link(self):
-        result = self.assess()
+        result = self.assess(targets=[self.target(asset="Branded therapy",
+                                                  molecule="ALPHAMAB")])
         self.assertEqual(result["assetExistenceAssessment"],
                          "EXISTING_ASSET_IDENTITY_OBSERVED")
         self.assertEqual(result["classificationReview"],

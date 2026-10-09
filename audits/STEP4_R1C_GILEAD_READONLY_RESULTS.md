@@ -223,3 +223,22 @@ Source Watch current data is not evidence of a successful end-to-end product ref
 The user-observed 73/73 passing R1C suite establishes a safe standalone **read-only asset-presence function**. The existing six×55 comparator preview establishes a live-data **identity false-negative** (\`V1.6: 6 NEW ASSET\`, \`R1C asset preflight: 6 known target IDs found\`). **Neither validates the unimplemented endpoint integration, actual Candidate persistence, full Gilead 53/53 reconciliation nor customer-report release**.
 
 The next work item is a **single bounded additive comparator-output integration and test** on this existing recovery branch, not another source/clinical trial investigation or Airtable automation. Any production deployment or Candidate data edits require explicit user approval. R1C remains production HOLD.
+
+
+## 2026-10-09 — Optional read-only asset-presence comparator response integrated (RECOVERY BRANCH ONLY)
+
+**STATUS: CODE COMMITTED; NEW REGRESSION RUN PENDING. NO PRODUCTION DEPLOYMENT.**
+
+Recovery branch commit: \`3d2517bdf9c8bd2470662f11f48b491bd21edcad\`. Files changed: \`portfolio_discovery_extension_v11.py\`, \`portfolio_discovery_extension_v16.py\` and \`test_r1c_shared_lineage.py\`. The existing R1C generic resolver, Source Watch, Adapter Registry, Airtable automations and production Portfolio data were **not changed**.
+
+- The current authenticated \`POST /compare/portfolio-discovery\` request adds optional \`includeAssetPresence: bool = False\`. **Default is False; all existing clients retain the existing response**, classification, match targets and summary.
+- With explicit \`includeAssetPresence: true\`, existing V1.6 classification executes **first and unmodified**. Only rows with original classification \`NEW ASSET\` receive a nested \`assetPresence\` diagnostic computed by the already-tested shared \`assess_asset_presence\` function. Excluded, unavailable, ownership-held and already-matched rows receive no diagnostic.
+- The nested result can report exact whole name, whole regimen, development-code cross-field identity and weaker code-in-display review. It **never** changes \`classification\`, \`existingPortfolioRecordIds\`, \`matchMethod\`, \`matchConfidence\`, \`matchEvidence\`, \`fieldDeltas\`, \`reviewReason\` or \`summary\`. The nested \`programmeIdentity\` is always \`NOT_ASSESSED\`; \`canonicalPortfolioMatch\` and \`proposedDiscoveryClassification\` remain \`null\`; \`autoLink\`, Candidate writes, Queue and Portfolio writes remain false.
+- Company ownership and mismatched route scopes fail closed; unknown Portfolio company attribution does not become a match. Duplicate in-scope Portfolio record IDs fail closed, not arbitrarily choose a first target. Output remains read-only; this code adds no route, automation, trigger, external network fetch, record update or queue mutation.
+- Existing V1.7.2 shadow script is **OFF** and has hard-coded Regeneron/AstraZeneca diagnostics. Its tiered review intent is compatible with keeping selected matches separate from alternative/held possible identities. It has not been copied or activated.
+
+**Regression status:** seven new tests added to the existing safety suite (73 previously passing + 8 new = **81 test methods**, subject to actual unittest discovery). New tests cover default response parity, opt-in 6 real Gilead Candidates versus 55 Portfolio rows, original comparator-field parity, already-MATCHED programme preservation, excluded/unavailable no-overlay, source/company mismatch ownership hold, foreign Portfolio exclusion and duplicate Portfolio IDs. **Do not claim 81/81 PASS until a Codespaces run actually confirms it.** The previously observed 73/73 PASS pertains to the standalone function, not this newly committed API integration.
+
+**Bounded next gate:** Run once in the existing Codespaces environment:
+\`git pull --ff-only && .venv/bin/python -m unittest -v test_r1c_shared_lineage\`.
+Record exact output, fix any fail-closed regression on the recovery branch only. Then decide whether to run additional **read-only** cross-company API contract canaries or require fuller source snapshots. Do not activate the OFF Candidate staging automations, switch Gilead from Established baseline, merge, deploy, or write Candidate/Portfolio/master data without separate explicit approval. Full 53/53 Gilead source-key and commercial release gates remain unproven.

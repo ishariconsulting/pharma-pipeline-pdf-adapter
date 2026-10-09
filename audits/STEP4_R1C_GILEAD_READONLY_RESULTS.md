@@ -242,3 +242,23 @@ Recovery branch commit: \`3d2517bdf9c8bd2470662f11f48b491bd21edcad\`. Files chan
 **Bounded next gate:** Run once in the existing Codespaces environment:
 \`git pull --ff-only && .venv/bin/python -m unittest -v test_r1c_shared_lineage\`.
 Record exact output, fix any fail-closed regression on the recovery branch only. Then decide whether to run additional **read-only** cross-company API contract canaries or require fuller source snapshots. Do not activate the OFF Candidate staging automations, switch Gilead from Established baseline, merge, deploy, or write Candidate/Portfolio/master data without separate explicit approval. Full 53/53 Gilead source-key and commercial release gates remain unproven.
+
+
+## 2026-10-09 — Completed optional API comparator integration regression (USER-EXECUTED)
+
+**PASS: 81 / 81 tests; 0 failures and 0 errors, 8.311 seconds.** User provided a Codespaces terminal screenshot after executing \`git pull --ff-only && .venv/bin/python -m unittest -v test_r1c_shared_lineage\` on \`recovery/step4-r1c-gilead-readonly\`. Terminal footer was:
+
+\`\`\`text
+Ran 81 tests in 8.311s
+
+OK
+sys:1: DeprecationWarning: builtin type swigvarlink has no __module__ attribute
+\`\`\`
+
+The \`swigvarlink\` warning did not fail the tests. The recovered branch's optional \`includeAssetPresence\` comparator response has now passed its bounded **code-level integration regressions**: default callers retain existing V1.6 classifications/response; opted-in \`NEW ASSET\` rows contain read-only identity evidence from shared R1C; six observed Gilead Candidates find their preidentified asset representations in 55 Gilead Portfolio rows without programme promotions; ownership, foreign company, duplicates and exclusions remain fail-closed. Original R1A holds and customer release remain unchanged.
+
+**Completed/closed for now:** R1C **asset-presence comparator API code integration and its 81-test regression gate**. No additional isolated Gilead identity tests are needed unless that code changes.
+
+**Not accepted / separate gates:** no live Render service deployment or endpoint canary; full 53/53 official Gilead source-key acceptance not proven; no candidate-staging persistence, Portfolio link, 39-company coverage acceptance, or Gilead customer report release claimed. Full clinical/line/indication programme mapping still requires evidence. Existing Airtable automations (96 as inventoried), Source Watch, Adapter Registry, Portfolio, Candidates, Queue and company release gates were unchanged.
+
+**Next product-level focus:** validate the shared comparator contract and source-to-Candidate flow against existing cross-company source/Portfolio evidence and negative controls, then select one **existing** staging/worker path for a read-only end-to-end impact plan. Do not create new automations, resume one-off Gilead trial research, delete workflows, or deploy/write without explicit approval.

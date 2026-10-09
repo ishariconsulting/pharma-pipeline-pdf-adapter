@@ -138,3 +138,21 @@ Each of the **96 full automation configurations** was read individually via Airt
 - Maintain status transitions in the existing Monday Step 4 tracker; if a formal Automation Registry table is desired, seek separate approval to add one rather than casually adding another table/automation.
 
 **Next decision gate:** request user approval for a *specific* cleanup batch only after backup and dependency verification. No automation deletion was performed.
+
+
+## Priority retirement-candidate run-history check (9 October 2026)
+
+Queried Airtable's retained automation-run history for **all eight** \`PRIORITY_RETIRE_REVIEW\` configurations. **Seven returned no runs** in the available history; this is **not proof they never executed**, since historical execution retention is limited. The exception was the AstraZeneca V4.4.14 tiered shadow, with **two successful runs on 2026-10-06 (00:27 and 00:50 UTC)**; preserve the AZ case output and regression baseline before considering retirement. Its byte-identical Regeneron V4.4.14 counterpart returned no runs in the retained history.
+
+| Prioritised candidate | Automation ID | Accessible recorded runs | Deletion prerequisite |
+|---|---|---:|---|
+| Company New Watch - HTML | \`wfl3uecTFXNWu7KQz\` | 0 | Prove current Company News Watch covers required HTML-only sources; backup script |
+| Resolver V2 - READ ONLY (actual Sobi live writer) | \`wflVhuHWz1V4Q5CNC\` | 0 | Archive exact Sobi write/delete flow and approved output history |
+| Portfolio Discovery Staging V4.0 | \`wfl5OiUr7cgHR7iYx\` | 0 | Verify shared Staging V4.4.8 and Worker replace its inputs/field handling; backup canary endpoint contract |
+| Portfolio Promotion Writer V5.2 | \`wflChY1hes56Q5A6e\` | 0 | Verify all writer gates and approved operational cases are retained by Controlled Promotion Writer V1.9.12; backup |
+| AZ Final-7 Preflight (actual live writer) | \`wflLw6ztKchtl6xOP\` | 0 | Preserve AZ acceptance evidence and any authorized historical changes |
+| Company 360 AI enrichment | \`wfllYSi0EXLMDrCx8\` | 0 | Check source/field parity with active Company 360 Bootstrap; preserve provenance |
+| US Identity Result Collector shell | \`wflN5LyvqN8flQPkE\` | 0 | Check no external pending jobs point to it; save 129-character placeholder and metadata |
+| AstraZeneca Staging V4.4.14 tiered shadow | \`wflPaYD5JeS0l4XFJ\` | **2 successful (6 Oct)** | Save AZ run findings and scope-specific input values; compare to identical Regeneron code; do not assume redundant output |
+
+**Disposition unchanged:** \`PRIORITY_RETIRE_REVIEW\` is a proposed cleanup category, **not an approval to delete**. Script-level identity, trigger scope and stored audit results must be preserved. Current deployment, queues and master data unchanged.

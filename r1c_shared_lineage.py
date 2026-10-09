@@ -334,6 +334,29 @@ class Case(Model):
     oracleProvenance: str = Field(min_length=1)
 
 
+class AuthorityBridge(Model):
+    """Offline reviewer-verified assertion; never discovery or an automatic link.
+
+    Proofs are verbatim excerpts from the original registry/protocol text. The
+    original pipeline envelope and registry versions bind this assertion to one
+    immutable observation. Aggregated CT.gov seed rows are not accepted here.
+    """
+    recordId: str = Field(min_length=1)
+    relationId: str = Field(min_length=1)
+    evidenceId: str = Field(min_length=1)
+    stableKey: str = Field(min_length=1)
+    trialRecordId: str = Field(min_length=1)
+    armId: str = Field(min_length=1)
+    sourceProvenance: Provenance
+    trialProvenance: Provenance
+    armProvenance: Provenance
+    verified: bool
+    # Optional original official publisher protocol, not a news republication.
+    protocol: Provenance | None = None
+    proofExcerpts: dict[str, str]
+    aliasProof: str = ""
+
+
 class Snapshot(Model):
     schemaVersion: Literal["R1C_SNAPSHOT_V1"]
     snapshotId: str = Field(min_length=1)
@@ -355,6 +378,96 @@ class Snapshot(Model):
     evidence: list[Evidence]
     landscape: list[Landscape]
     cases: list[Case]
+    enableIndependentAuthorityBridge: bool = False
+    authorityBridges: list[AuthorityBridge] = Field(default_factory=list)
+
+
+def assess_authority_bridge(s, source, rel, e, t, a):
+    """Conservative independent path; all existing scope/comparator gates remain.
+
+    No semantic extraction is inferred from these excerpts: a reviewer must
+    supply verified exact scope records. Equal as-of dates are deliberately
+    required until a separate evidence-backed temporal contract is available.
+    """
+    found = [b for b in s.authorityBridges
+             if b.relationId == rel.recordId and b.evidenceId == e.recordId]
+    reasons = []
+    b = found[0] if len(found) == 1 else None
+    if len(found) != 1:
+        reasons.append("BRIDGE_AMBIGUOUS" if found else "NO_BRIDGE_EVIDENCE")
+    if b:
+        if not b.verified or not e.verified or not e.independent:
+            reasons.append("BRIDGE_NOT_INDEPENDENTLY_VERIFIED")
+        if (b.stableKey != source.stableKey or b.trialRecordId != t.recordId or
+                b.armId != a.recordId):
+            reasons.append("BRIDGE_IDENTITY_BINDING_MISMATCH")
+        if (b.sourceProvenance != source.provenance or
+                b.trialProvenance != t.provenance or b.armProvenance != a.provenance):
+            reasons.append("BRIDGE_STALE_PROVENANCE")
+        if len({t.provenance.version, a.provenance.version, e.provenance.version}) != 1:
+            reasons.append("BRIDGE_REGISTRY_VERSION_MISMATCH")
+        for prov in (t.provenance, a.provenance, e.provenance):
+            parsed = urlparse(prov.url)
+            if (parsed.hostname not in {"clinicaltrials.gov", "www.clinicaltrials.gov"} or
+                    parsed.path.rstrip("/") not in {"/study/" + t.nct, "/ct2/show/" + t.nct} or
+                    parsed.username or parsed.password):
+                reasons.append("BRIDGE_REGISTRY_URL_UNPROVEN")
+        provs = [source.provenance, t.provenance, a.provenance, e.provenance]
+        if b.protocol:
+            provs.append(b.protocol)
+            if (b.protocol.authorityId != source.provenance.authorityId or
+                    urlparse(b.protocol.url).hostname != urlparse(source.provenance.url).hostname):
+                reasons.append("BRIDGE_PROTOCOL_AUTHORITY_UNPROVEN")
+        for prov in provs:
+            reasons.extend(provenance_reasons(prov))
+            if any(not getattr(prov, field).strip() for field in
+                   ("version", "authorityId", "sourceRecordId", "originalText")):
+                reasons.append("BRIDGE_PROVENANCE_INCOMPLETE")
+        if len({p.asOf for p in provs}) != 1:
+            reasons.append("BRIDGE_TEMPORAL_ALIGNMENT_UNPROVEN")
+        if source.provenance.authorityId == t.nct or t.provenance.authorityId != t.nct:
+            reasons.append("BRIDGE_ORIGINATING_AUTHORITY_UNPROVEN")
+        texts = [t.provenance.originalText, a.provenance.originalText]
+        if b.protocol:
+            texts.append(b.protocol.originalText)
+        for field in ("programme", "trial", "experimentalArm", "companyRole", *SCOPE_FIELDS):
+            excerpt = b.proofExcerpts.get(field, "").strip()
+            if not excerpt or not any(excerpt in text for text in texts):
+                reasons.append("BRIDGE_UNPROVEN_" + field.upper())
+        # Sponsor association is insufficient: role and exact arm must be
+        # independently asserted and then checked against the typed scope.
+        role = b.proofExcerpts.get("companyRole", "")
+        if source.company not in role or source.scope.companyRole not in role:
+            reasons.append("BRIDGE_COMPANY_ROLE_UNPROVEN")
+        if t.nct not in b.proofExcerpts.get("trial", ""):
+            reasons.append("BRIDGE_TRIAL_ID_UNPROVEN")
+        if (a.armRef not in b.proofExcerpts.get("experimentalArm", "") or
+                "experimental" not in b.proofExcerpts.get("experimentalArm", "").casefold()):
+            reasons.append("BRIDGE_FOCAL_ARM_UNPROVEN")
+        asset = str(source.comparison.get("asset") or "").strip()
+        arm_asset = str(a.comparison.get("asset") or "").strip()
+        programme = b.proofExcerpts.get("programme", "")
+        if not asset or asset not in programme or not arm_asset or arm_asset not in programme:
+            reasons.append("BRIDGE_PROGRAMME_IDENTITY_UNPROVEN")
+        if asset != arm_asset and (not b.protocol or not b.aliasProof.strip() or
+                b.aliasProof not in b.protocol.originalText or
+                asset not in b.aliasProof or arm_asset not in b.aliasProof):
+            reasons.append("BRIDGE_ALIAS_UNPROVEN")
+        for field in SCOPE_FIELDS:
+            value = getattr(a.scope, field)
+            values = value if isinstance(value, list) else [value]
+            excerpt = b.proofExcerpts.get(field, "")
+            if any(v is None or not str(v).strip() or str(v) not in excerpt for v in values):
+                reasons.append("BRIDGE_SCOPE_EXCERPT_MISMATCH_" + field.upper())
+        if a.interventionRole != "experimental":
+            reasons.append("NON_FOCAL_INTERVENTION_ROLE")
+    return {"pathway": "AMBIGUOUS" if len(found) > 1 else
+            "INDEPENDENT_AUTHORITY_BRIDGE" if b else "NO_BRIDGE_EVIDENCE",
+            "bridgeId": b.recordId if b else None,
+            "status": "HELD" if reasons else "SUPPORTED_FOR_READ_ONLY_REVIEW",
+            "reasonCodes": sorted(set(reasons)),
+            "provenance": b.model_dump() if b else None,
+            "autoLink": False, "writeEligible": False}
 
 
 def comparator():
@@ -408,6 +521,10 @@ def provenance_reasons(p: Provenance) -> list[str]:
 def validate(s: Snapshot) -> dict:
     base = comparator()
     issues = []
+    if s.enableIndependentAuthorityBridge:
+        bridge_ids = [b.recordId for b in s.authorityBridges]
+        if len(bridge_ids) != len(set(bridge_ids)):
+            issues.append("DUPLICATE_AUTHORITY_BRIDGE_IDS")
     missing = {"sources", "candidates", "portfolio", "trials", "arms", "relations", "evidence", "landscape"} - set(s.completeTables)
     if missing:
         return blocked(["Incomplete exports: " + ", ".join(sorted(missing))], s.expectedSourceCount)
@@ -635,6 +752,7 @@ def validate(s: Snapshot) -> dict:
                 e = indexes["evidence"].get(eid)
                 er = []
                 t, a = None, None
+                bridge = None
                 if e is None:
                     rr.append("MISSING_EVIDENCE:" + eid)
                     continue
@@ -671,7 +789,16 @@ def validate(s: Snapshot) -> dict:
                         if rel.sharedStudyIdentity != t.nct:
                             er.append("SHARED_STUDY_IDENTITY_MISMATCH")
                         if not source.trialReferences.get(t.nct, "").strip():
-                            er.append("OFFICIAL_SOURCE_NCT_RELATION_UNPROVEN")
+                            if s.enableIndependentAuthorityBridge:
+                                bridge = assess_authority_bridge(s, source, rel, e, t, a)
+                                er.extend(bridge["reasonCodes"])
+                                if bridge["reasonCodes"]:
+                                    er.append("OFFICIAL_SOURCE_NCT_RELATION_UNPROVEN")
+                            else:
+                                er.append("OFFICIAL_SOURCE_NCT_RELATION_UNPROVEN")
+                        elif s.enableIndependentAuthorityBridge:
+                            bridge = {"pathway": "PIPELINE_DIRECT_NCT", "autoLink": False,
+                                      "writeEligible": False}
                         er.extend(relation_scope_reasons(a.scope, p.scope))
                         try:
                             er.extend(match(a.comparison, p, a.provenance, joint_view)[0])
@@ -690,6 +817,14 @@ def validate(s: Snapshot) -> dict:
                                       "trialVersion": t.provenance.version if t else None,
                                       "trialStatus": t.status if t else None,
                                       "scopeAssertion": e.scope.model_dump()})
+                if s.enableIndependentAuthorityBridge and e.family == "TRIAL_REGISTRY":
+                    if bridge is not None:
+                        bridge.update(status="HELD" if er else "SUPPORTED_FOR_READ_ONLY_REVIEW",
+                                      reasonCodes=sorted(set(er)))
+                    evidence_rows[-1]["bridgeAssessment"] = bridge or {
+                        "pathway": "NO_BRIDGE_EVIDENCE", "status": "HELD",
+                        "reasonCodes": ["NCT_WITHOUT_FOCAL_ARM_PROOF"],
+                        "autoLink": False, "writeEligible": False}
             valid = [e for e in evidence_rows if not e["reasonCodes"]]
             # A link or parent NCT alone is a positive relationship, not exact proof.
             if not valid:

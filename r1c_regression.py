@@ -5,7 +5,8 @@ from pathlib import Path
 import unittest
 
 from r1c_shared_lineage import blocked
-from test_r1c_shared_lineage import SafetyTests
+import test_r1c_shared_lineage
+import test_r1c_authority_bridge
 
 
 class RecordingResult(unittest.TextTestResult):
@@ -20,7 +21,10 @@ class RecordingResult(unittest.TextTestResult):
 
 def main():
     specs = json.loads((Path(__file__).parent / "audits/R1C_GILEAD_CASES.json").read_text())
-    suite = unittest.defaultTestLoader.loadTestsFromTestCase(SafetyTests)
+    suite = unittest.TestSuite([
+        unittest.defaultTestLoader.loadTestsFromModule(test_r1c_shared_lineage),
+        unittest.defaultTestLoader.loadTestsFromModule(test_r1c_authority_bridge),
+    ])
     output = io.StringIO()
     result = unittest.TextTestRunner(stream=output, verbosity=2, resultclass=RecordingResult).run(suite)
     report = blocked(["No official row-level Gilead snapshot was supplied"], 53, specs)

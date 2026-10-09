@@ -868,6 +868,93 @@
       ],
       "title": "Trial",
       "type": "object"
+    },
+    "AuthorityBridge": {
+      "additionalProperties": false,
+      "description": "Offline reviewer-verified assertion; never discovery or an automatic link.\n\nProofs are verbatim excerpts from the original registry/protocol text. The\noriginal pipeline envelope and registry versions bind this assertion to one\nimmutable observation. Aggregated CT.gov seed rows are not accepted here.",
+      "properties": {
+        "recordId": {
+          "minLength": 1,
+          "title": "Recordid",
+          "type": "string"
+        },
+        "relationId": {
+          "minLength": 1,
+          "title": "Relationid",
+          "type": "string"
+        },
+        "evidenceId": {
+          "minLength": 1,
+          "title": "Evidenceid",
+          "type": "string"
+        },
+        "stableKey": {
+          "minLength": 1,
+          "title": "Stablekey",
+          "type": "string"
+        },
+        "trialRecordId": {
+          "minLength": 1,
+          "title": "Trialrecordid",
+          "type": "string"
+        },
+        "armId": {
+          "minLength": 1,
+          "title": "Armid",
+          "type": "string"
+        },
+        "sourceProvenance": {
+          "$ref": "#/$defs/Provenance"
+        },
+        "trialProvenance": {
+          "$ref": "#/$defs/Provenance"
+        },
+        "armProvenance": {
+          "$ref": "#/$defs/Provenance"
+        },
+        "verified": {
+          "title": "Verified",
+          "type": "boolean"
+        },
+        "protocol": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Provenance"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "proofExcerpts": {
+          "additionalProperties": {
+            "type": "string"
+          },
+          "title": "Proofexcerpts",
+          "type": "object"
+        },
+        "aliasProof": {
+          "default": "",
+          "title": "Aliasproof",
+          "type": "string"
+        }
+      },
+      "required": [
+        "recordId",
+        "relationId",
+        "evidenceId",
+        "stableKey",
+        "trialRecordId",
+        "armId",
+        "sourceProvenance",
+        "trialProvenance",
+        "armProvenance",
+        "verified",
+        "proofExcerpts"
+      ],
+      "title": "AuthorityBridge",
+      "type": "object"
     }
   },
   "additionalProperties": false,
@@ -996,6 +1083,18 @@
         "$ref": "#/$defs/Case"
       },
       "title": "Cases",
+      "type": "array"
+    },
+    "enableIndependentAuthorityBridge": {
+      "default": false,
+      "title": "Enableindependentauthoritybridge",
+      "type": "boolean"
+    },
+    "authorityBridges": {
+      "items": {
+        "$ref": "#/$defs/AuthorityBridge"
+      },
+      "title": "Authoritybridges",
       "type": "array"
     }
   },

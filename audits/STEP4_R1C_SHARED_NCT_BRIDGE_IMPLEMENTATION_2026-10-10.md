@@ -85,3 +85,20 @@ not a synthetic-test failure. Code-level success is not Gilead Gate 3/7 approval
 Recommendation: ready for a controlled offline read-only evidence assessment
 with independently reviewed inputs; R1C/customer release remains HOLD. No live
 source calls, Airtable writes, commits, pushes, deployment or production merge.
+
+
+## Controlled Gilead live Airtable evidence readiness decision — 10 October 2026
+
+**Read-only evidence gate: BLOCKED — no verified real independent-authority programme bridge.** This follows the GitHub branch commit `9cd8fb6b09e54578948071a79abaa8224758da95` and its user-reported 117/117 passing synthetic regressions. This is an evidence inspection, not an execution of `validate()` on a complete authoritative 53-key `R1C_SNAPSHOT_V1` snapshot; do not report 53 source keys semantically tested.
+
+**Observed directly by the current scoped Airtable read:**
+- Company `rec60nNJ7EvlHlt0v`; Gilead pipeline Source Watch `recCyELG6w7TZKwQZ` last checked `2026-10-02`; Source Snapshot Imports link empty.
+- 62 linked pipeline Candidates: **55 active** (53 nonempty distinct source keys plus two resolved, keyless historical Portfolio-completeness Candidates), **7 Superseded**. Zero duplicate distinct-key identities among active source-keyed Candidates. The 53 count agrees numerically with the user's separate official-source 53-row Codespaces capture, but exact keyed per-row equality was not rerun in this assessment.
+- 55 Company-linked Portfolio records. **Zero** currently populated `Cross-source Status` and **zero** populated `Evidence Families` fields.
+- All six held programme Candidates remain without a direct approved `Existing Portfolio Match` link: `recOGc2QkKjGiXhk8` (iMMagine-1), `recLd0O4DDoSUICO0` (iMMagine-3), `recUaxfv5urojBewZ` (ISLEND-1/2), `recj50kAokdSo6REw` (NAPISTAR 1-01), `recfWkIVpdJboItRp` (PALISADES-1), `rectOd70xCzPWfkls` (ARTISTRY-1/2). Their statuses remain New or Needs Review, and scope-gate evidence is absent/unresolved.
+- All **eight** scoped Clinical Trial parents (NCT05396885, NCT06413498, NCT06630286, NCT06630299, NCT06303505, NCT04989803, NCT05502341, NCT06333808) retain one or more Portfolio links and contain a raw `CT.gov Arm / Cohort Raw` description, but **none** has a structured `Clinical Trial Arms & Cohorts` child. Gilead Company has no linked structured cohort or CT.gov Arm Evidence record. A parent/NCT/arm-description is not a verified focal experimental arm.
+- Existing 55-row baseline remains `Needs review` for all rows on strict evidence-scope requirements; no master data edited.
+
+**Boundary conclusion:** Evidence intake/validation, not the opt-in resolver code, is the currently missing R1C acceptance ingredient: source-key/issuer-as-of provenance, verified official trial-arm/version assertion, programme/indication/population/role/temporal match, and correct Candidate↔Portfolio persistence. The existing Gilead Sitecore source includes zero NCT tokens or registry anchors in the user-captured 53 raw items, so the independent bridge is the only designed option; **do not infer links** or repeat source retrieval hoping for hidden NCT references. Without independently reviewed authority bridge assertions and a complete 53-key closure snapshot, no actual R1C source row is positively certified. Six cases remain HOLD. No Gate 3/Gate 7 status change.
+
+**Stop decision:** Do not undertake more generic code tasks, re-run synthetic tests, create company-specific automations, trigger OFF CT.gov audit writers, or claim production release. Retain this R1C evidence blocker as a named gate. To proceed within the currently locked Step 4 priority order requires a separately approved, finite *source/arm evidence acquisition and attestation* task using the existing authenticated source and clinical data contracts (with every unsupported programme HELD). Alternatively, moving to R2 while keeping R1C BLOCKED changes the recovery work order and requires explicit user approval. No new code or production action authorised here.

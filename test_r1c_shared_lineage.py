@@ -100,6 +100,102 @@ class SafetyTests(unittest.TestCase):
         self.assertEqual(a["rows"][0]["familyStatus"]["REGULATORY"], "NOT_ASSESSED")
         self.assertNotIn("TREATMENT_LANDSCAPE", a["downstreamImpacts"][0]["derivedEvidenceFamilies"])
 
+    def test_unverified_history_preserves_evidence_but_never_passes(self):
+        self.data["sources"][0].update(baselineDisposition="UNVERIFIED",
+                                       baselineReason="", baselineProof="")
+        self.data["cases"][0]["expectedDisposition"] = "SUPPORTED_RELATIONSHIP_WITH_SCOPE_HOLD"
+        before = deepcopy(self.data)
+        r = run(self.data)
+        self.assertEqual(r["rows"][0]["relations"][0]["readOnlyEvidenceAssessment"],
+                         "SUPPORTED_FOR_READ_ONLY_REVIEW")
+        self.assertIn("R1A_HISTORICAL_DISPOSITION_UNVERIFIED", r["rows"][0]["reasonCodes"])
+        self.assertEqual(r["rows"][0]["status"], "HOLD")
+        self.assertEqual(r["cases"][0]["status"], "HOLD")
+        self.assertEqual(r["status"], "HOLD")
+        self.assertEqual(r["historicalDispositionCoverage"]["unverifiedPerKey"], 1)
+        self.assertEqual(r["historicalDispositionCoverage"]["recordedPerKey"], 0)
+        self.assertEqual(r["historicalDispositionCoverage"]["reportedR1AAggregate"], {"MATCHED": 1})
+        self.assertEqual(r["historicalDispositionCoverage"]["historicalKeyedReplay"],
+                         "NOT_REPLAYED_PARTIAL_EVIDENCE")
+        self.assertFalse(r["rows"][0]["queueEligible"])
+        self.assertFalse(r["rows"][0]["portfolioWriteEligible"])
+        self.assertEqual(self.data, before)
+
+    def test_unverified_history_preserves_missing_focal_arm_hold(self):
+        self.data["sources"][0].update(baselineDisposition="UNVERIFIED", baselineProof="")
+        self.data["arms"] = []
+        self.data["trials"][0]["armIds"] = []
+        r = run(self.data)
+        rel = r["rows"][0]["relations"][0]
+        self.assertEqual(rel["readOnlyEvidenceAssessment"], "EVIDENCE_HELD")
+        self.assertIn("NCT_WITHOUT_FOCAL_ARM_PROOF", rel["evidenceReasonCodes"])
+        self.assertEqual(r["rows"][0]["status"], "HOLD")
+        self.assertFalse(r["rows"][0]["portfolioWriteEligible"])
+
+    def test_missing_source_as_of_is_not_fabricated(self):
+        self.data["sources"][0]["provenance"]["asOf"] = ""
+        self.data["relations"][0]["sourceProvenance"]["asOf"] = ""
+        self.data["cases"][0]["expectedDisposition"] = "SUPPORTED_RELATIONSHIP_WITH_SCOPE_HOLD"
+        r = run(self.data)
+        self.assertIn("MISSING_PROVENANCE_ASOF", r["rows"][0]["reasonCodes"])
+        self.assertEqual(r["rows"][0]["status"], "HOLD")
+        self.assertEqual(r["status"], "HOLD")
+
+    def test_known_historical_disposition_requires_real_proof(self):
+        self.data["sources"][0]["baselineProof"] = ""
+        r = run(self.data)
+        self.assertIn("MISSING_R1A_DISPOSITION_PROOF", r["rows"][0]["reasonCodes"])
+        self.assertEqual(r["status"], "FAIL")
+        self.assertFalse(r["rows"][0]["portfolioWriteEligible"])
+
+    def synthetic_partial_history_53(self):
+        """Entirely invented fixtures: 20 keyed NEW, 33 unknown; not Gilead data."""
+        template = fixture()
+        self.data["sources"] = []
+        self.data["candidates"] = []
+        for table in ("portfolio", "trials", "arms", "relations", "evidence", "landscape", "cases"):
+            self.data[table] = []
+        self.data["expectedSourceCount"] = 53
+        self.data["expectedDispositionCounts"] = {"MATCHED": 11, "HELD": 16, "NEW": 26}
+        for i in range(53):
+            source, candidate = deepcopy(template["sources"][0]), deepcopy(template["candidates"][0])
+            key, source_id = "SYNTHETIC-KEY-" + str(i), "SYNTHETIC-ROW-" + str(i)
+            source["stableKey"] = key
+            source["provenance"]["sourceRecordId"] = source_id
+            source["comparison"]["sourceRecordId"] = source_id
+            source["baselineDisposition"] = "NEW" if i < 20 else "UNVERIFIED"
+            source["baselineProof"] = "synthetic-new-proof" if i < 20 else ""
+            source["relationIds"], source["trialReferences"] = [], {}
+            candidate.update(recordId="SYNTHETIC-CANDIDATE-" + str(i), stableKey=key,
+                             sourceRecordId=source_id, portfolioIds=[],
+                             reviewStatus="New", programmeGate="Unassessed")
+            self.data["sources"].append(source)
+            self.data["candidates"].append(candidate)
+
+    def test_20_new_33_unverified_never_replay_historical_aggregate(self):
+        self.synthetic_partial_history_53()
+        before = deepcopy(self.data)
+        r = run(self.data)
+        self.assertEqual(r["status"], "HOLD")
+        self.assertEqual(r["testedSourceKeys"], 53)
+        self.assertEqual(r["sourceCoverage"]["activeCandidateAddressable"], 53)
+        self.assertEqual(r["historicalDispositionCoverage"]["verifiedPerKeyCounts"], {"NEW": 20})
+        self.assertEqual(r["historicalDispositionCoverage"]["unverifiedPerKey"], 33)
+        self.assertEqual(r["historicalDispositionCoverage"]["historicalKeyedReplay"],
+                         "NOT_REPLAYED_PARTIAL_EVIDENCE")
+        self.assertNotIn("R1A_DISPOSITION_TOTAL_MISMATCH", r["issues"])
+        self.assertTrue(all(row["status"] == "HOLD" for row in r["rows"]))
+        self.assertTrue(all(not row["queueEligible"] and not row["portfolioWriteEligible"]
+                            for row in r["rows"]))
+        self.assertEqual(self.data, before)
+
+    def test_partial_historical_disposition_overcount_fails(self):
+        self.synthetic_partial_history_53()
+        self.data["expectedDispositionCounts"]["NEW"] = 19
+        r = run(self.data)
+        self.assertEqual(r["status"], "FAIL")
+        self.assertIn("R1A_PARTIAL_DISPOSITION_OVERCOUNT", r["issues"])
+
     def test_unlinked_proposal_can_be_evidence_supported_without_pass(self):
         self.data["candidates"][0]["portfolioIds"] = []
         self.data["portfolio"][0]["candidateIds"] = []

@@ -33,7 +33,8 @@ class Model(BaseModel):
 class Provenance(Model):
     url: str = Field(min_length=1)
     sourceRecordId: str = Field(min_length=1)
-    asOf: str = Field(min_length=1)
+    # Absent official publication dates are explicitly held, not invented.
+    asOf: str = ""
     retrievedAt: str = Field(min_length=1)
     version: str = Field(min_length=1)
     authorityId: str = Field(min_length=1)
@@ -68,9 +69,10 @@ class Source(Model):
     comparison: dict
     scope: Scope
     # R1A disposition is distinct from discovery classification/review status.
-    baselineDisposition: Literal["MATCHED", "HELD", "NEW", "EXCLUDED"]
+    baselineDisposition: Literal["MATCHED", "HELD", "NEW", "EXCLUDED", "UNVERIFIED"]
     baselineReason: str
-    baselineProof: str = Field(min_length=1)
+    # Only an UNVERIFIED historical decision may have no baseline proof.
+    baselineProof: str = ""
     assessedFamilies: list[Literal["PIPELINE", "TRIAL_REGISTRY", "REGULATORY", "SIGNAL"]]
     relationIds: list[str]
     trialReferences: dict[str, str]
@@ -238,6 +240,9 @@ def provenance_reasons(p: Provenance) -> list[str]:
     for field in ("asOf", "retrievedAt"):
         try:
             value = getattr(p, field)
+            if not value.strip():
+                reasons.append("MISSING_PROVENANCE_" + field.upper())
+                continue
             if field == "asOf" and len(value) == 10:
                 datetime.strptime(value, "%Y-%m-%d")
             elif datetime.fromisoformat(value.replace("Z", "+00:00")).tzinfo is None:
@@ -272,7 +277,14 @@ def validate(s: Snapshot) -> dict:
     if any(v != 1 for v in key_counts.values()):
         issues.append("DUPLICATE_OFFICIAL_SOURCE_KEYS")
     counts = Counter(r.baselineDisposition for r in s.sources)
-    if dict(counts) != {k: v for k, v in s.expectedDispositionCounts.items() if v}:
+    unverified_history = counts.get("UNVERIFIED", 0)
+    known_history = {k: v for k, v in counts.items() if k != "UNVERIFIED"}
+    # A historical aggregate is not a per-key ledger: only compare complete keyed
+    # totals; for partial proof, detect overcounts without inventing classifications.
+    if unverified_history:
+        if any(v > s.expectedDispositionCounts.get(k, 0) for k, v in known_history.items()):
+            issues.append("R1A_PARTIAL_DISPOSITION_OVERCOUNT")
+    elif known_history != {k: v for k, v in s.expectedDispositionCounts.items() if v}:
         issues.append("R1A_DISPOSITION_TOTAL_MISMATCH")
     if any(p.company not in allowed_companies for p in s.portfolio):
         issues.append("UNDECLARED_RELATED_COMPANY_VIEW")
@@ -396,6 +408,10 @@ def validate(s: Snapshot) -> dict:
                 reasons.append("PERSISTED_CANDIDATE_HOLD:" + c.holdReason)
             if any(x in c.programmeGate.lower() for x in ("unassessed", "unresolved", "hold", "review")):
                 reasons.append("PERSISTED_PROGRAMME_GATE_UNRESOLVED")
+        if source.baselineDisposition == "UNVERIFIED":
+            reasons.append("R1A_HISTORICAL_DISPOSITION_UNVERIFIED")
+        elif not source.baselineProof.strip():
+            failures.append("MISSING_R1A_DISPOSITION_PROOF")
         if source.baselineDisposition == "HELD":
             reasons.append("R1A_HELD_PRESERVED:" + source.baselineReason)
             if not source.baselineReason.strip():
@@ -651,6 +667,13 @@ def validate(s: Snapshot) -> dict:
                       "HOLD" if any(r["status"] == "HOLD" for r in rows) or
                       any(c["status"] == "HOLD" for c in cases) else "PASS",
             "issues": issues, "testedSourceKeys": len(s.sources), "sourceDispositionCounts": dict(counts),
+            "historicalDispositionCoverage": {
+                "recordedPerKey": len(s.sources) - unverified_history,
+                "unverifiedPerKey": unverified_history,
+                "reportedR1AAggregate": dict(s.expectedDispositionCounts),
+                "verifiedPerKeyCounts": known_history,
+                "historicalKeyedReplay": ("NOT_REPLAYED_PARTIAL_EVIDENCE" if unverified_history else "FULL_KEYED_COUNTS_COMPARED"),
+            },
             "sourceCoverage": {"expected": s.expectedSourceCount, "observed": len(s.sources),
                                "unique": len(key_counts), "activeCandidateAddressable": sum(len(active[k]) == 1 for k in key_counts)},
             "evidenceCoverage": {"supportedExact": sum(r["disposition"] == "SUPPORTED_EXACT" for r in rows)},

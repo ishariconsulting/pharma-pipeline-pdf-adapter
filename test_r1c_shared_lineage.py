@@ -813,5 +813,158 @@ class AssetPresenceSafetyTests(unittest.TestCase):
 
 
 
+class ComparatorAssetPresenceIntegrationTests(unittest.TestCase):
+    """Actual comparator contract tests: additive opt-in, no write decisions."""
+
+    @staticmethod
+    def inputs():
+        import service_entrypoint  # noqa: F401 - supported extension import order
+        import portfolio_discovery_extension_v16  # noqa: F401
+        import portfolio_discovery_extension_v11 as v
+        from pathlib import Path
+        observed = json.loads((Path(__file__).parent /
+            "audits/STEP4_R1C_GILEAD_COMPARATOR_OBSERVED_INPUT.json").read_text())
+        sources = [v.DiscoverySourceRow(**row["source"])
+                   for row in observed["candidateRows"]]
+        portfolio = [v.PortfolioSnapshotRow(**row)
+                     for row in observed["portfolioRows"]]
+        return v, observed, sources, portfolio
+
+    def compare(self, requested=False):
+        v, observed, sources, portfolio = self.inputs()
+        result = v.compare_discovery(v.DiscoveryCompareRequest(
+            company="Gilead Sciences", sourceRows=sources,
+            portfolioRows=portfolio, includeAssetPresence=requested,
+            batchRunId="R1C_OPTIONAL_ASSET_PRESENCE_READ_ONLY"))
+        return observed, result
+
+    def test_default_request_retains_existing_response_contract(self):
+        observed, output = self.compare()
+        self.assertEqual(output.summary["NEW ASSET"], 6)
+        self.assertTrue(output.readOnly)
+        self.assertFalse(output.guardrails["masterWrites"])
+        self.assertNotIn("assetPresenceOptIn", output.guardrails)
+        for candidate in output.candidates:
+            self.assertNotIn("assetPresence", candidate)
+            self.assertEqual(candidate["classification"], "NEW ASSET")
+            self.assertEqual(candidate["existingPortfolioRecordIds"], [])
+
+    def test_optin_six_real_cases_find_expected_assets_without_approval(self):
+        observed, output = self.compare(requested=True)
+        self.assertEqual(output.summary["NEW ASSET"], 6)
+        self.assertTrue(output.guardrails["assetPresenceOptIn"])
+        self.assertFalse(output.guardrails["assetPresenceCandidateWrites"])
+        self.assertFalse(output.guardrails["assetPresencePortfolioWrites"])
+        self.assertFalse(output.guardrails["assetPresenceProgrammeApproval"])
+        for source_row, candidate in zip(observed["candidateRows"], output.candidates):
+            self.assertEqual(candidate["classification"], "NEW ASSET")
+            self.assertEqual(candidate["existingPortfolioRecordIds"], [])
+            a = candidate["assetPresence"]
+            expected = set(observed["proposedProgrammeTargets"][
+                source_row["candidateRecordId"]])
+            got = {item["recordId"] for item in a["candidatePortfolioIdentities"]}
+            self.assertTrue(expected.issubset(got), source_row["candidateRecordId"])
+            self.assertEqual(a["classificationReview"],
+                             "REASSESS_NEW_ASSET_CLASSIFICATION")
+            self.assertEqual(a["programmeIdentity"], "NOT_ASSESSED")
+            self.assertIsNone(a["canonicalPortfolioMatch"])
+            self.assertIsNone(a["proposedDiscoveryClassification"])
+            self.assertFalse(a["autoLink"])
+            self.assertFalse(a["queueEligible"])
+            self.assertFalse(a["portfolioWriteEligible"])
+            self.assertEqual(a["masterWrites"], 0)
+
+    def test_optin_is_strictly_additive_to_all_existing_decisions(self):
+        _, default = self.compare()
+        _, optin = self.compare(requested=True)
+        self.assertEqual(optin.summary, default.summary)
+        self.assertEqual(optin.version, default.version)
+        self.assertEqual(optin.company, default.company)
+        self.assertEqual(optin.sourceRowCount, default.sourceRowCount)
+        self.assertEqual(optin.portfolioRowCount, default.portfolioRowCount)
+        for before, after in zip(default.candidates, optin.candidates):
+            self.assertEqual(before,
+                             {k: v for k, v in after.items() if k != "assetPresence"})
+        for k, value in default.guardrails.items():
+            self.assertEqual(optin.guardrails[k], value)
+
+    def test_already_matched_programme_is_not_reclassified(self):
+        v, _, _, _ = self.inputs()
+        source = v.DiscoverySourceRow(
+            company="Example Pharma", sourceFamily="Company Pipeline",
+            asset="ALPHAMAB", indication="Ovarian cancer", phase="Phase 3")
+        target = v.PortfolioSnapshotRow(
+            recordId="p1", company="Example Pharma", asset="ALPHAMAB",
+            molecule="alphamab", indication="Ovarian cancer", phase="Phase 3")
+        result = v.compare_discovery(v.DiscoveryCompareRequest(
+            company="Example Pharma", sourceRows=[source],
+            portfolioRows=[target], includeAssetPresence=True))
+        self.assertEqual(result.candidates[0]["classification"], "MATCHED")
+        self.assertEqual(result.candidates[0]["existingPortfolioRecordIds"], ["p1"])
+        self.assertNotIn("assetPresence", result.candidates[0])
+
+    def test_excluded_or_unavailable_source_never_gets_asset_presence(self):
+        v, _, _, _ = self.inputs()
+        src = v.DiscoverySourceRow(
+            company="Example Pharma", sourceFamily="Company Pipeline",
+            asset="ALPHAMAB", phase="Phase 3", programStatus="Discontinued")
+        unavailable = src.model_copy(update={"programStatus": "Active",
+                                              "sourceUnavailable": True})
+        for s in [src, unavailable]:
+            result = v.compare_discovery(v.DiscoveryCompareRequest(
+                company="Example Pharma", sourceRows=[s],
+                portfolioRows=[], includeAssetPresence=True))
+            self.assertIn(result.candidates[0]["classification"],
+                          {"EXCLUDED BY RULE", "SOURCE UNAVAILABLE"})
+            self.assertNotIn("assetPresence", result.candidates[0])
+
+    def test_cross_company_source_and_portfolio_disallowed(self):
+        v, _, _, _ = self.inputs()
+        source = v.DiscoverySourceRow(
+            company="Wrong Pharma", sourceFamily="Company Pipeline",
+            asset="ALPHAMAB", indication="Test indication", phase="Phase 3")
+        # Wrong-company source must not use Example Pharma Portfolio even if
+        # asset strings overlap.
+        target = v.PortfolioSnapshotRow(
+            recordId="p1", company="Example Pharma", asset="ALPHAMAB")
+        result = v.compare_discovery(v.DiscoveryCompareRequest(
+            company="Example Pharma", sourceRows=[source],
+            portfolioRows=[target], includeAssetPresence=True))
+        # The base comparator already fails closed on ownership, so the
+        # optional overlay must not evaluate or downgrade that hold.
+        self.assertEqual(result.candidates[0]["classification"], "OWNERSHIP REVIEW")
+        self.assertNotIn("assetPresence", result.candidates[0])
+
+    def test_foreign_portfolio_not_included_as_asset_identity(self):
+        v, _, _, _ = self.inputs()
+        source = v.DiscoverySourceRow(
+            company="Example Pharma", sourceFamily="Company Pipeline",
+            asset="ALPHAMAB", phase="Phase 3")
+        foreign = v.PortfolioSnapshotRow(
+            recordId="foreign", company="Partner Pharma", asset="ALPHAMAB")
+        result = v.compare_discovery(v.DiscoveryCompareRequest(
+            company="Example Pharma", sourceRows=[source],
+            portfolioRows=[foreign], includeAssetPresence=True))
+        self.assertEqual(result.candidates[0]["classification"], "NEW ASSET")
+        a = result.candidates[0]["assetPresence"]
+        self.assertEqual(a["candidatePortfolioIdentityCount"], 0)
+        self.assertEqual(a["programmeIdentity"], "NOT_ASSESSED")
+        self.assertIsNone(a["canonicalPortfolioMatch"])
+
+    def test_duplicate_in_scope_portfolio_ids_fail_closed(self):
+        v, _, _, _ = self.inputs()
+        source = v.DiscoverySourceRow(
+            company="Example Pharma", sourceFamily="Company Pipeline",
+            asset="OMEGAMAB", indication="Test indication", phase="Phase 3")
+        duplicate = v.PortfolioSnapshotRow(
+            recordId="p1", company="Example Pharma", asset="ALPHAMAB")
+        request = v.DiscoveryCompareRequest(
+            company="Example Pharma", sourceRows=[source],
+            portfolioRows=[duplicate, duplicate], includeAssetPresence=True)
+        with self.assertRaisesRegex(ValueError, "Duplicate in-scope"):
+            v.compare_discovery(request)
+
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

@@ -149,6 +149,38 @@ def _compare_discovery_v16(
     result.guardrails["biologicSuffixBaseVariant"] = True
     result.guardrails["componentInferenceFromCompositeIdentity"] = False
     result.guardrails["fuzzyMatching"] = False
+
+    # Explicit opt-in ONLY: inspect possible pre-existing asset identities.
+    # Existing comparator decisions, match fields, summary and default API
+    # output are unchanged. This never establishes exact programme scope.
+    if request.includeAssetPresence:
+        from r1c_shared_lineage import assess_asset_presence
+
+        if len(result.candidates) != len(request.sourceRows):
+            raise RuntimeError(
+                "Asset-presence assessment blocked: source/result count mismatch"
+            )
+        portfolio_snapshot = [p.model_dump() for p in request.portfolioRows]
+        for source, candidate in zip(request.sourceRows, result.candidates):
+            # Exclusions, missing sources, ownership-review cases and actual
+            # matches must not be weakened by a parallel identity diagnostic.
+            if candidate["classification"] != "NEW ASSET":
+                continue
+            source_snapshot = source.model_dump()
+            if base._norm(source.company) != base._norm(request.company):
+                # Reject inconsistent source→request company routing rather
+                # than silently aliasing different company views.
+                source_snapshot["company"] = ""
+            candidate["assetPresence"] = assess_asset_presence(
+                source_snapshot,
+                portfolio_snapshot,
+                observed_classification=candidate["classification"],
+            )
+        result.guardrails["assetPresenceOptIn"] = True
+        result.guardrails["assetPresenceProgrammeApproval"] = False
+        result.guardrails["assetPresenceCandidateWrites"] = False
+        result.guardrails["assetPresencePortfolioWrites"] = False
+        result.guardrails["assetPresenceVersion"] = "R1C_ASSET_PRESENCE_V1_READ_ONLY"
     return result
 
 

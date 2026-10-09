@@ -223,6 +223,8 @@ class DiscoveryCompareRequest(BaseModel):
     portfolioRows: List[PortfolioSnapshotRow]
     companyAliases: List[str] = Field(default_factory=list)
     batchRunId: Optional[str] = None
+    # Opt-in only. Existing staging callers and comparator semantics unchanged.
+    includeAssetPresence: bool = False
 
 
 class DiscoveryCompareResponse(BaseModel):

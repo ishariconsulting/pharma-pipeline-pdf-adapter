@@ -90,6 +90,77 @@ class SafetyTests(unittest.TestCase):
             self.assertIn(code, row["reasonCodes"])
         return result
 
+
+    def test_observed_gilead_six_identity_preflight_never_promotes(self):
+        # These named input fields were inspected read-only from the existing
+        # Gilead Candidate and Portfolio records on 9 October 2026.
+        # They prove only identity candidates, NOT focal arms or full R1C.
+        targets = [
+            {"recordId": "recJ6Gw3qoSQRi2x9", "asset": "Anito-cel", "molecule": "anitocabtagene autoleucel"},
+            {"recordId": "recSPdCh4UJgdQVGd", "asset": "Anito-cel", "molecule": "anitocabtagene autoleucel"},
+            {"recordId": "recAMZGRRM6BC0Haq", "asset": "Islatravir + lenacapavir", "molecule": "islatravir + lenacapavir"},
+            {"recordId": "recOx6PWK0MJ4rJHy", "asset": "Islatravir/Lenacapavir", "molecule": "islatravir/lenacapavir"},
+            {"recordId": "recD3oDxpTGvWbNSd", "asset": "GS-8824 / TUB-040", "molecule": "NaPi2b-directed topoisomerase-I ADC"},
+            {"recordId": "recTOUCjUJMUhVjuq", "asset": "GS-8824 / TUB-040", "molecule": "NaPi2b-directed topoisomerase-I ADC"},
+            {"recordId": "recBiCP8FUS5E4qBG", "asset": "KITE-753", "molecule": "bicistronic CD19/CD20 autologous CAR T"},
+            {"recordId": "recnTXAC84OeTnZp0", "asset": "BIXLENVO", "molecule": "bictegravir/lenacapavir"},
+            {"recordId": "recPzHmWJVzevncvC", "asset": "IDVYNSO", "molecule": "doravirine / islatravir"},
+        ]
+        cases = [
+            ("iMMagine-1", "Anitocabtagene autoleucel (iMMagine-1)",
+             ["recJ6Gw3qoSQRi2x9", "recSPdCh4UJgdQVGd"]),
+            ("iMMagine-3", "Anitocabtagene autoleucel (iMMagine-3)",
+             ["recJ6Gw3qoSQRi2x9", "recSPdCh4UJgdQVGd"]),
+            ("ISLEND-1/2", "Islatravir/lenacapavir oral combination (ISLEND-1 & ISLEND-2)",
+             ["recAMZGRRM6BC0Haq", "recOx6PWK0MJ4rJHy"]),
+            ("NAPISTAR 1-01", "NaPi2b ADC (GS-8824) (NAPISTAR 1-01)",
+             ["recD3oDxpTGvWbNSd", "recTOUCjUJMUhVjuq"]),
+            ("PALISADES-1", "CD19/CD20 bicistronic (KITE-753) (PALISADES-1)",
+             ["recBiCP8FUS5E4qBG"]),
+            ("ARTISTRY-1/2", "Bictegravir/lenacapavir oral combination (ARTISTRY-1 & ARTISTRY-2)",
+             ["recnTXAC84OeTnZp0"]),
+        ]
+        from r1c_shared_lineage import identity_preflight
+        for name, asset, expected in cases:
+            with self.subTest(programme=name):
+                source = {"asset": asset, "developmentCode": "CD19" if name == "PALISADES-1" else ""}
+                assessment = identity_preflight(source, targets)
+                self.assertEqual(sorted(row["recordId"] for row in assessment["assetIdentityCandidates"]),
+                                 sorted(expected))
+                self.assertEqual(assessment["programmeIdentity"], "NOT_ASSESSED")
+                self.assertFalse(assessment["autoLink"])
+                self.assertFalse(assessment["portfolioWriteEligible"])
+                self.assertFalse(assessment["queueEligible"])
+
+    def test_cross_field_identity_negative_controls_fail_closed(self):
+        from r1c_shared_lineage import identity_methods
+        negatives = [
+            ("CD19 target", {"asset": "CD19", "developmentCode": "CD19"}, {"asset": "KITE-753"}),
+            ("different CAR-T code", {"asset": "KITE-363"}, {"asset": "KITE-753"}),
+            ("wrong regimen partner", {"asset": "doravirine/islatravir"}, {"molecule": "islatravir/lenacapavir"}),
+            ("single component", {"asset": "lenacapavir"}, {"molecule": "islatravir/lenacapavir"}),
+            ("study label", {"asset": "Anitocabtagene autoleucel (iMMagine-3)"}, {"asset": "iMMagine-3"}),
+            ("partial regimen", {"asset": "bictegravir/lenacapavir"}, {"asset": "bictegravir"}),
+            ("target biomarker", {"asset": "CD19/CD20 bicistronic (KITE-753)"}, {"asset": "CD19"}),
+            ("nonidentical code", {"asset": "NaPi2b ADC (GS-8824)"}, {"asset": "GS-8825"}),
+            ("additional regimen component", {"asset": "islatravir + lenacapavir"},
+             {"molecule": "islatravir + lenacapavir + doravirine"}),
+        ]
+        for name, source, target in negatives:
+            with self.subTest(control=name):
+                self.assertEqual(identity_methods(source, target), [])
+
+    def test_shared_sitecore_parser_prefer_drug_code_over_biomarker(self):
+        # Generic extraction rule; neither the function nor production parser
+        # contains a Gilead-specific conditional.
+        import service_entrypoint  # noqa: F401
+        from sitecore_sxa_pipeline_extension import identity_parts
+        self.assertEqual(
+            identity_parts("CD19/CD20 bicistronic (KITE-753) (PALISADES-1)")["developmentCode"],
+            "KITE-753")
+        self.assertEqual(identity_parts("CD19/CD20 directed CAR T")["developmentCode"], "")
+        self.assertEqual(identity_parts("NaPi2b ADC (GS-8824)")["developmentCode"], "GS-8824")
+
     def test_positive_and_replay_without_mutation(self):
         before = deepcopy(self.data)
         a, b = run(self.data), run(self.data)

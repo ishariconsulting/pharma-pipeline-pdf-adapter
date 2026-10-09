@@ -68,11 +68,14 @@ def identity_parts(raw_asset:str)->Dict[str,str]:
     brand=""
     molecule=""
     development=""
-    # First code-like token containing digits is safe as a development-code
-    # candidate without assuming a company prefix.
-    m=re.search(r"\b([A-Z]{2,10}-?\d{2,7})\b",asset)
-    if m:
-        development=m.group(1)
+    # Distinguish receptor/target labels from asset development codes.
+    # A target such as CD19 must never eclipse a later KITE-753 token.
+    # This remains generic and does not presume any company prefix.
+    tokens=re.findall(r"\b([A-Z]{2,10}-?\d{2,7})\b",asset)
+    tokens=[token for token in tokens
+            if not re.fullmatch(r"(?:CD\d{1,3}|HER\d|PD-?1|PD-?L1)",token,re.I)]
+    if tokens:
+        development=tokens[0]
     # Parenthetical lowercase/proper-name identity often carries INN; preserve
     # only when it is not the extracted code/study token.
     parens=re.findall(r"\(([^()]{2,80})\)",asset)

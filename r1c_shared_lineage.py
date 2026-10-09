@@ -10,6 +10,8 @@ import argparse
 from collections import Counter, defaultdict
 from datetime import datetime
 import json
+import re
+import unicodedata
 from pathlib import Path
 from typing import Literal
 from urllib.parse import urlparse
@@ -24,6 +26,85 @@ GUARDRAILS = dict(readOnly=True, candidateMutation=False, portfolioMutation=Fals
                   automationMutation=False, fuzzyMatching=False,
                   queueEligible=False, portfolioWriteEligible=False,
                   systemProgrammeKeyMutation=False, pfk1Mutation=False)
+
+
+# Candidate-level exact-identity discovery is a read-only aid to R1C review.
+# It is deliberately independent of the existing production V1.6 comparator:
+# neither a cross-field hit nor a shared asset can establish programme scope.
+_ID_CODE = re.compile(r"(?<![A-Z0-9])([A-Z]{2,12}-\d{2,7}[A-Z0-9-]*)(?![A-Z0-9])", re.I)
+_ID_TARGET = re.compile(r"^(?:CD\d{1,3}|HER\d|PD-?1|PD-?L1|EGFR|BCMA)$", re.I)
+
+
+def _id_clean(value):
+    return re.sub(r"\s+", " ", unicodedata.normalize("NFKC", str(value or ""))).strip()
+
+
+def _id_name(value):
+    raw = _id_clean(value).casefold()
+    raw = re.sub(r"(?:\s*\([^()]*\))+$", "", raw).strip()
+    raw = re.sub(r"\s+(?:oral\s+)?combination$", "", raw)
+    return re.sub(r"\s+", " ", raw).strip()
+
+
+def _id_simple(value):
+    return re.sub(r"[^a-z0-9]+", " ", _id_name(value)).strip()
+
+
+def _id_regimen(value):
+    raw = _id_name(value)
+    if not re.search(r"\s+\+\s+|\s*/\s*|\s+and\s+", raw):
+        return ()
+    parts = re.split(r"\s+\+\s+|\s*/\s*|\s+and\s+", raw)
+    names = [_id_simple(part) for part in parts]
+    if len(names) < 2 or len(names) > 5 or any(len(x) < 3 for x in names):
+        return ()
+    # A slash between development codes may denote aliases, not components.
+    if all(_ID_CODE.fullmatch(_id_clean(x).replace(" ", "-")) for x in names):
+        return ()
+    return tuple(sorted(names))
+
+
+def _id_codes(value):
+    return {x.casefold() for x in _ID_CODE.findall(_id_clean(value))
+            if not _ID_TARGET.fullmatch(x)}
+
+
+def identity_methods(source: dict, target: dict) -> list[str]:
+    """Identify possible *assets*, never declare exact programme or writes."""
+    source_names = [source.get(k, "") for k in ("asset", "molecule", "brand")]
+    target_names = [target.get(k, "") for k in ("asset", "molecule", "brand")]
+    source_single = {_id_simple(v) for v in source_names if _id_simple(v) and not _id_regimen(v)}
+    target_single = {_id_simple(v) for v in target_names if _id_simple(v) and not _id_regimen(v)}
+    methods = []
+    if source_single & target_single:
+        methods.append("EXACT_CROSS_FIELD_WHOLE_NAME")
+    source_regimen = {_id_regimen(v) for v in source_names if _id_regimen(v)}
+    target_regimen = {_id_regimen(v) for v in target_names if _id_regimen(v)}
+    if source_regimen & target_regimen:
+        methods.append("EXACT_WHOLE_REGIMEN")
+    source_codes = _id_codes(source.get("developmentCode", ""))
+    for value in source_names:
+        source_codes.update(_id_codes(value))
+    target_code = _id_codes(target.get("developmentCode", ""))
+    target_aliases = set()
+    for value in target.get("aliases", []):
+        target_aliases.update(_id_codes(value))
+    if source_codes & (target_code | target_aliases):
+        methods.append("EXACT_CROSS_FIELD_DEVELOPMENT_CODE")
+    elif source_codes & _id_codes(target.get("asset", "")):
+        # A code in a compound display label is NOT verified alias provenance.
+        methods.append("CODE_IN_PORTFOLIO_ASSET_REVIEW")
+    return sorted(set(methods))
+
+
+def identity_preflight(source: dict, targets: list[dict]) -> dict:
+    """Read-only plausible target set; caller must prove each programme dimension."""
+    hits = [{"recordId": p["recordId"], "methods": identity_methods(source, p)}
+            for p in targets]
+    hits = [x for x in hits if x["methods"]]
+    return {"assetIdentityCandidates": hits, "assetIdentityCandidateCount": len(hits),
+            "programmeIdentity": "NOT_ASSESSED", "autoLink": False,
+            "queueEligible": False, "portfolioWriteEligible": False}
 
 
 class Model(BaseModel):
@@ -548,6 +629,8 @@ def validate(s: Snapshot) -> dict:
             # The legacy disposition still includes persistence and fail-closed
             # requirements, keeping production acceptance unchanged.
             relations.append({"relationId": rid, "portfolioId": p.recordId,
+                               "assetIdentityPreflight": identity_preflight(source.comparison,
+                                     [target.comparison for target in s.portfolio if target.company == p.company]),
                               "relationType": rel.relationType, "company": p.company,
                               "sharedStudyIdentity": rel.sharedStudyIdentity,
                               "sourceScopeAssertion": rel.sourceScope.model_dump(),

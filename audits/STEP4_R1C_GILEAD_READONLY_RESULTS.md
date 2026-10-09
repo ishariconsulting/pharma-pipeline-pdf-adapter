@@ -115,3 +115,34 @@ Supply a read-only export with these fields and independently sourced case mappi
 2. Reuse the existing read-only shared resolver with the **actual source-row original provenance / source-to-NCT proof** and **existing official saved CT.gov arm evidence**, rather than fabricating `Arm` records. For each exact candidate/target/NCT, require independent source scope, experimental arm, regimen, indication, line/population, company role and official version/date before `SUPPORTED_EXACT`. The existing Candidate → Portfolio link being absent remains a separate persistence hold even if identity proof is established.
 3. No full 53-key R1C PASS can be claimed until full source-row/R1A keyed snapshot and its linked-record closure are supplied and validated by the current contract. The six-case ledger is a bounded acceptance preflight, **not** a substitute or test rerun.
 4. No merge, deployment, workflow trigger, master update, Candidate edit, clinical-arm/cohort creation or Portfolio linkage is approved. If production changes are ever proposed, ask the user first.
+
+
+## 2026-10-09 — Real six-Candidate × 55-Portfolio V1.6 comparator preview
+
+**OBSERVED RUN SUCCESS — NO PRODUCTION WRITES.** This section supersedes the old “actual Gilead comparator 0/53” statement for **only this bounded six-Case / 55-Portfolio preview**. Full 53-key end-to-end source/R1A/arm/persistence acceptance is still not performed.
+
+Read-only inputs were retrieved from Airtable on 2026-10-09 and frozen on this recovery branch as [STEP4_R1C_GILEAD_COMPARATOR_OBSERVED_INPUT.json](STEP4_R1C_GILEAD_COMPARATOR_OBSERVED_INPUT.json): six current Candidate source rows, 55 distinct Gilead Portfolio records, six externally proposed programme targets, original keys/fields and explicit no-write guardrails. This snapshot is **not** all 53 Gilead source rows.
+
+User ran the existing comparator in Codespaces with \`import service_entrypoint\` first (to avoid the documented pre-existing AstraZeneca module cycle), then \`portfolio_discovery_extension_v16\`, \`portfolio_discovery_extension_v11\`, and the existing R1C \`identity_preflight\`.
+
+**Actual terminal result**: \`PREVIEW COMPLETE - NO PRODUCTION WRITES\`.
+
+- Comparator: \`V1.6.0 PORTFOLIO DISCOVERY READ ONLY - DETERMINISTIC IDENTITY VARIANTS\`.
+- V1.6 summary: \`MATCHED=0; NEW ASSET=6; NEW INDICATION=0; POSSIBLE DUPLICATE=0; OWNERSHIP REVIEW=0; EXCLUDED BY RULE=0; SOURCE UNAVAILABLE=0\`.
+- **All six V1.6 rows** returned \`existingPortfolioRecordIds=[]\`.
+- **All six R1C read-only asset preflights** found the pre-identified existing Portfolio target (\`Expected target identified: True\`). Each independently reports \`programmeIdentity=NOT_ASSESSED\`, \`autoLink=False\`, \`queueEligible=False\`, \`portfolioWriteEligible=False\`.
+
+| Source programme | V1.6 observed | R1C asset identity candidate record IDs (NOT programme-approved) | Expected existing target |
+|---|---|---|---|
+| iMMagine-1 | NEW ASSET, [] | \`recSPdCh4UJgdQVGd\`; \`recJ6Gw3qoSQRi2x9\` | \`recSPdCh4UJgdQVGd\` |
+| iMMagine-3 | NEW ASSET, [] | \`recSPdCh4UJgdQVGd\`; \`recJ6Gw3qoSQRi2x9\` | \`recJ6Gw3qoSQRi2x9\` |
+| ISLEND-1/2 | NEW ASSET, [] | \`recOx6PWK0MJ4rJHy\` | \`recOx6PWK0MJ4rJHy\` |
+| NAPISTAR 1-01 | NEW ASSET, [] | \`recTOUCjUJMUhVjuq\`; \`recD3oDxpTGvWbNSd\` | ovarian \`recTOUCjUJMUhVjuq\` |
+| PALISADES-1 | NEW ASSET, [] | \`recBiCP8FUS5E4qBG\` | \`recBiCP8FUS5E4qBG\` |
+| ARTISTRY-1/2 | NEW ASSET, [] | \`recnTXAC84OeTnZp0\` | \`recnTXAC84OeTnZp0\` |
+
+**Root cause and bounded shared design:** V1.6 \`_match_methods\` compares mainly *same named identity fields* (asset↔asset, molecule↔molecule, developmentCode↔developmentCode). Real Sitecore Candidate names are decorated with programme/study labels, molecule fields are often absent, and existing Portfolio entries may store the same identity in another field. V1.6's limited parenthesis stripping fails this cross-field identity scenario. The independently implemented R1C exact cross-field whole-name, whole-regimen and development-code preflight demonstrates an existing asset representation, but cannot prove indication-specific programme identity. PALISADES has an upstream CD19 target-vs-KITE-753 code parsing problem; the recovery branch contains a generic extractor correction, not deployed.
+
+**Proposed shared fix for review (not implemented or authorised for production):** integrate the existing R1C generic identity-preflight methods as an independent asset-presence assessment before programme disposition, report method/targets/hold reasons, and leave exact source-to-Portfolio link and classification promotion contingent on indication/line/population/focal-arm/owner/source-version proof and R1A holds. Do not collapse iMMagine line programmes or NAPISTAR ovarian/NSCLC indications, infer Merck programme ownership from Gilead-only comparisons, or treat combo-component overlap as entire regimen. Do **not** reclassify all six to \`MATCHED\`, \`NEW INDICATION\` or \`POSSIBLE DUPLICATE\` from identity presence alone.
+
+**Next acceptance check:** bounded code proposal on this recovery branch using existing workers, and generic negative controls (same asset/different programme, ovarian vs NSCLC, monotherapy vs combination, placebo/comparator, biomarker vs development code, sponsor/company ownership). Then **separate explicit user approval** before deployment, Candidate edits, queue write, Portfolio link or master-data mutation. R1C remains production HOLD.

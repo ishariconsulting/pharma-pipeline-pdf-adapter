@@ -411,12 +411,14 @@ def validate(s: Snapshot) -> dict:
                 failures.append("RELATION_SOURCE_KEY_MISMATCH:" + rid)
                 continue
             p = indexes["portfolio"].get(rel.portfolioId)
-            rr, evidence_rows = [], []
+            # Evidence and persistence are separate gates. A proposed relation
+            # may be assessed before a Candidate link is approved or written.
+            rr, evidence_rows, persistence_reasons = [], [], []
             if p is None:
                 failures.append("DANGLING_CANONICAL_TARGET:" + rel.portfolioId)
                 continue
-            if c is None or p.recordId not in c.portfolioIds:
-                rr.append("NO_PERSISTED_CANDIDATE_CANONICAL_LINK")
+            if c is None or p.recordId not in c.portfolioIds or c.recordId not in p.candidateIds:
+                persistence_reasons.append("NO_PERSISTED_CANDIDATE_CANONICAL_LINK")
             if not rel.companyRoleProof.strip():
                 rr.append("UNPROVEN_RELATION_COMPANY_ROLE")
             joint_view = (rel.relationType == "JOINT_DEVELOPMENT_VIEW" and
@@ -455,7 +457,11 @@ def validate(s: Snapshot) -> dict:
                 rr.extend(mr)
             except (ValueError, ValidationError) as exc:
                 rr.append(str(exc))
-            rr.extend(edge_issues[p.recordId])
+            for edge_issue in edge_issues[p.recordId]:
+                if edge_issue.startswith("NONRECIPROCAL_CANDIDATES:"):
+                    persistence_reasons.append(edge_issue)
+                else:
+                    rr.append(edge_issue)
             for eid in rel.evidenceIds:
                 e = indexes["evidence"].get(eid)
                 er = []
@@ -521,13 +527,22 @@ def validate(s: Snapshot) -> dict:
                 rr.append("NO_EXACT_CORROBORATING_EVIDENCE")
             for e in evidence_rows:
                 rr.extend(e["reasonCodes"])
+            # A positive evidence assessment is NOT an approved link, R1C PASS,
+            # queue instruction, or permission to bypass R1A programme holds.
+            # The legacy disposition still includes persistence and fail-closed
+            # requirements, keeping production acceptance unchanged.
             relations.append({"relationId": rid, "portfolioId": p.recordId,
                               "relationType": rel.relationType, "company": p.company,
                               "sharedStudyIdentity": rel.sharedStudyIdentity,
                               "sourceScopeAssertion": rel.sourceScope.model_dump(),
                               "portfolioScopeAssertion": p.scope.model_dump(),
-                              "reasonCodes": sorted(set(rr)), "comparison": comparison,
-                              "evidence": evidence_rows})
+                              "readOnlyEvidenceAssessment": ("SUPPORTED_FOR_READ_ONLY_REVIEW" if not rr else "EVIDENCE_HELD"),
+                              "evidenceReasonCodes": sorted(set(rr)),
+                              "persistedLinkageAssessment": ("NONRECIPROCAL" if any(x.startswith("NONRECIPROCAL_CANDIDATES:") for x in persistence_reasons)
+                                                             else "NOT_PERSISTED" if persistence_reasons else "PERSISTED_RECIPROCAL"),
+                              "persistenceReasonCodes": sorted(set(persistence_reasons)),
+                              "reasonCodes": sorted(set(rr + persistence_reasons)),
+                              "comparison": comparison, "evidence": evidence_rows})
         if c and set(c.portfolioIds) != {r["portfolioId"] for r in relations}:
             reasons.append("CANONICAL_LINK_RELATION_SET_UNASSESSED")
         reasons.extend(x for r in relations for x in r["reasonCodes"])

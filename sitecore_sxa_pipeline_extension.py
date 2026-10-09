@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import html as html_lib
 import re
+from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
 import httpx
@@ -17,6 +18,7 @@ from pydantic import BaseModel
 from main import _auth, app
 from html_fetch_extension import _assert_public_http_url
 from generic_pipeline_interpreter_canary import phase_canonical
+from source_evidence_contract import original_item_evidence
 
 
 ADAPTER_PROFILE="PIPELINE_SITECORE_SXA_JSON_V1"
@@ -90,7 +92,7 @@ def identity_parts(raw_asset:str)->Dict[str,str]:
     return {"asset":asset,"brand":brand,"molecule":molecule,"developmentCode":development}
 
 
-async def extract_sitecore_sxa(company:str, source_url:str, timeout_seconds:float=35.0)->SitecorePipelineResponse:
+async def extract_sitecore_sxa(company:str, source_url:str, timeout_seconds:float=35.0, include_source_evidence:bool=False)->SitecorePipelineResponse:
     await _assert_public_http_url(source_url)
     headers={
       "User-Agent":"Mozilla/5.0 SitecorePipelineAdapter/1.0",
@@ -118,6 +120,8 @@ async def extract_sitecore_sxa(company:str, source_url:str, timeout_seconds:floa
     if not isinstance(results,list):
         raise HTTPException(status_code=422,detail="Sitecore JSON does not contain Results[]")
 
+    # Retrieval time records observation only; it is NOT an official as-of date.
+    retrieved_at=datetime.now(timezone.utc).isoformat().replace("+00:00","Z")
     rows=[]
     rejected=0
     for idx,item in enumerate(results,1):
@@ -153,6 +157,15 @@ async def extract_sitecore_sxa(company:str, source_url:str, timeout_seconds:floa
           "parserMethod":"SITECORE_SXA_SEMANTIC_FIELDS",
           "sourceAdapter":ADAPTER_PROFILE,
         }
+        # Opt-in evidence preservation is diagnostic only. Do not populate
+        # `study` or `trialIds`: a registry hyperlink is not focal-arm proof.
+        if include_source_evidence:
+            row["sourceEvidence"]=original_item_evidence(
+                item, source_record_id=row["sourceRecordId"],
+                official_url=final_url, retrieved_at=retrieved_at,
+                original_text=text_only(raw),
+                stable_id_present=bool(clean(item.get("Id"))),
+            )
         rows.append(row)
 
     # Exact source-grain duplicate check.
@@ -216,7 +229,8 @@ async def sitecore_route(
   company:str=Query(...,min_length=1,max_length=160),
   source_url:str=Query(...,min_length=8),
   timeout_seconds:float=Query(default=35.0,ge=5.0,le=35.0),
+  include_source_evidence:bool=Query(default=False,description="Opt-in original official-source item evidence. No programme/arm match is inferred."),
   x_adapter_key:Optional[str]=Header(default=None),
 )->SitecorePipelineResponse:
     _auth(x_adapter_key)
-    return await extract_sitecore_sxa(company,source_url,timeout_seconds)
+    return await extract_sitecore_sxa(company,source_url,timeout_seconds,include_source_evidence)

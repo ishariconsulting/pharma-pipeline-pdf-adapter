@@ -107,6 +107,78 @@ def identity_preflight(source: dict, targets: list[dict]) -> dict:
             "queueEligible": False, "portfolioWriteEligible": False}
 
 
+def assess_asset_presence(source: dict, portfolio: list[dict],
+                          observed_classification: str | None = None) -> dict:
+    """Read-only asset-existence assessment, NOT a programme comparator or link.
+
+    Reuses the existing exact-identity preflight; rejects cross-company targets,
+    does not interpret absent identities as a genuinely new asset, and never
+    changes the observed discovery classification, R1A disposition or records.
+    """
+    company = _id_simple(source.get("company"))
+    in_scope = []
+    if company:
+        for target in portfolio:
+            if _id_simple(target.get("company")) != company:
+                continue  # A commercial partner needs independently proven role.
+            if not str(target.get("recordId") or "").strip():
+                raise ValueError("In-scope Portfolio identity has no recordId")
+            in_scope.append(target)
+    ids = [p["recordId"] for p in in_scope]
+    if len(ids) != len(set(ids)):
+        raise ValueError("Duplicate in-scope Portfolio record IDs")
+
+    found = identity_preflight(source, in_scope)["assetIdentityCandidates"]
+    exact_methods = {
+        "EXACT_CROSS_FIELD_WHOLE_NAME",
+        "EXACT_WHOLE_REGIMEN",
+        "EXACT_CROSS_FIELD_DEVELOPMENT_CODE",
+    }
+    candidates = sorted(
+        [{"recordId": hit["recordId"], "methods": hit["methods"],
+          "evidenceStrength": ("DETERMINISTIC_IDENTITY" if
+                              exact_methods.intersection(hit["methods"])
+                              else "REVIEW_ONLY_CODE_IN_DISPLAY")}
+         for hit in found],
+        key=lambda item: item["recordId"])
+    strong = [item for item in candidates
+              if item["evidenceStrength"] == "DETERMINISTIC_IDENTITY"]
+    if not company:
+        assessment = "COMPANY_SCOPE_UNASSESSED"
+    elif strong:
+        assessment = "EXISTING_ASSET_IDENTITY_OBSERVED"
+    elif candidates:
+        assessment = "POSSIBLE_ASSET_IDENTITY_REVIEW"
+    else:
+        assessment = "NO_DETERMINISTIC_IDENTITY_OBSERVED"
+
+    # A preflight hit can justify review of NEW ASSET, not reclassification to
+    # MATCHED/NEW INDICATION, nor a source→Portfolio persistence instruction.
+    recheck = observed_classification == "NEW ASSET" and bool(candidates)
+    return {
+        "sourceRecordId": source.get("sourceRecordId"),
+        "sourceCompany": source.get("company"),
+        "originalDiscoveryClassification": observed_classification,
+        "classificationReview": ("REASSESS_NEW_ASSET_CLASSIFICATION" if recheck
+                                 else "NO_RECLASSIFICATION_PROPOSED"),
+        "assetExistenceAssessment": assessment,
+        "candidatePortfolioIdentities": candidates,
+        "candidatePortfolioIdentityCount": len(candidates),
+        "exactIdentityCandidateCount": len(strong),
+        "programmeIdentity": "NOT_ASSESSED",
+        "canonicalPortfolioMatch": None,
+        "proposedDiscoveryClassification": None,
+        "autoLink": False,
+        "candidateMutation": False,
+        "portfolioMutation": False,
+        "queueEligible": False,
+        "portfolioWriteEligible": False,
+        "sourceWatchMutation": False,
+        "automationMutation": False,
+        "masterWrites": 0,
+    }
+
+
 class Model(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True)
 

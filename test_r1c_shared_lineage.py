@@ -633,5 +633,184 @@ class SafetyTests(unittest.TestCase):
             self.assertEqual(json.loads(r.stdout)["status"], "BLOCKED — INPUT SNAPSHOT REQUIRED")
 
 
+class AssetPresenceSafetyTests(unittest.TestCase):
+    """Read-only generic identity checks; clinical programme approval excluded."""
+
+    @staticmethod
+    def src(**kwargs):
+        return {**dict(company="Example Pharma", sourceRecordId="row-1",
+                       asset="ALPHAMAB"), **kwargs}
+
+    @staticmethod
+    def target(record_id="p-1", **kwargs):
+        return {**dict(recordId=record_id, company="Example Pharma",
+                       asset="ALPHAMAB", molecule="alphamab"), **kwargs}
+
+    def assess(self, source=None, targets=None, classification="NEW ASSET"):
+        from r1c_shared_lineage import assess_asset_presence
+        return assess_asset_presence(
+            source or self.src(),
+            targets if targets is not None else [self.target()],
+            observed_classification=classification)
+
+    def test_cross_field_whole_identity_flags_false_new_asset_without_link(self):
+        result = self.assess()
+        self.assertEqual(result["assetExistenceAssessment"],
+                         "EXISTING_ASSET_IDENTITY_OBSERVED")
+        self.assertEqual(result["classificationReview"],
+                         "REASSESS_NEW_ASSET_CLASSIFICATION")
+        self.assertEqual(result["candidatePortfolioIdentities"][0]["recordId"], "p-1")
+        self.assertEqual(result["originalDiscoveryClassification"], "NEW ASSET")
+        self.assertIsNone(result["proposedDiscoveryClassification"])
+        self.assertIsNone(result["canonicalPortfolioMatch"])
+        self.assertFalse(result["autoLink"])
+        self.assertFalse(result["queueEligible"])
+        self.assertFalse(result["portfolioWriteEligible"])
+        self.assertEqual(result["masterWrites"], 0)
+
+    def test_same_molecule_different_programmes_both_found_but_held(self):
+        targets = [self.target("later", indication="4L+ myeloma"),
+                   self.target("earlier", indication="2L myeloma")]
+        result = self.assess(targets=targets)
+        self.assertEqual(result["candidatePortfolioIdentityCount"], 2)
+        self.assertEqual(result["programmeIdentity"], "NOT_ASSESSED")
+        self.assertIsNone(result["canonicalPortfolioMatch"])
+
+    def test_indication_and_therapy_line_do_not_collapse(self):
+        targets = [self.target("ovarian", indication="Ovarian cancer"),
+                   self.target("lung", indication="NSCLC")]
+        result = self.assess(targets=targets)
+        self.assertEqual({x["recordId"] for x in result["candidatePortfolioIdentities"]},
+                         {"ovarian", "lung"})
+        self.assertEqual(result["programmeIdentity"], "NOT_ASSESSED")
+
+    def test_monotherapy_cannot_be_identity_matched_to_combination(self):
+        source = self.src(asset="OMEGAMAB")
+        targets = [self.target(asset="OMEGAMAB + DELTAMAB",
+                               molecule="omegamab + deltamab")]
+        self.assertEqual(self.assess(source, targets)["candidatePortfolioIdentityCount"], 0)
+
+    def test_entire_regimens_can_match_cross_field_without_approval(self):
+        source = self.src(asset="OMEGAMAB/DELTAMAB")
+        targets = [self.target(asset="Combination R", molecule="DELTAMAB + OMEGAMAB")]
+        result = self.assess(source, targets)
+        self.assertEqual(result["assetExistenceAssessment"],
+                         "EXISTING_ASSET_IDENTITY_OBSERVED")
+        self.assertIn("EXACT_WHOLE_REGIMEN",
+                      result["candidatePortfolioIdentities"][0]["methods"])
+        self.assertIsNone(result["canonicalPortfolioMatch"])
+
+    def test_similar_prefixes_not_fuzzy_matched(self):
+        result = self.assess(self.src(asset="ALPHAMAB XR"),
+                             [self.target()])
+        self.assertEqual(result["candidatePortfolioIdentityCount"], 0)
+        self.assertEqual(result["assetExistenceAssessment"],
+                         "NO_DETERMINISTIC_IDENTITY_OBSERVED")
+
+    def test_target_biomarker_not_used_as_drug_code(self):
+        source = self.src(asset="CD19/CD20 bicistronic",
+                          developmentCode="CD19")
+        targets = [self.target(asset="Another therapy", molecule="another",
+                               developmentCode="CD19")]
+        result = self.assess(source, targets)
+        self.assertEqual(result["candidatePortfolioIdentityCount"], 0)
+
+    def test_actual_development_code_can_match_cross_field(self):
+        source = self.src(asset="KITE-753 (PALISADES-1)",
+                          developmentCode="CD19")
+        targets = [self.target(asset="CAR T product", molecule="bicistronic CAR-T",
+                               developmentCode="KITE-753")]
+        result = self.assess(source, targets)
+        self.assertEqual(result["exactIdentityCandidateCount"], 1)
+        self.assertIn("EXACT_CROSS_FIELD_DEVELOPMENT_CODE",
+                      result["candidatePortfolioIdentities"][0]["methods"])
+
+    def test_code_only_in_target_display_is_review_not_exact(self):
+        source = self.src(asset="GS-8824 (NAPISTAR 1-01)", developmentCode="GS-8824")
+        targets = [self.target(asset="GS-8824 / TUB-040", molecule="ADC")]
+        result = self.assess(source, targets)
+        self.assertEqual(result["assetExistenceAssessment"],
+                         "POSSIBLE_ASSET_IDENTITY_REVIEW")
+        self.assertEqual(result["exactIdentityCandidateCount"], 0)
+        self.assertEqual(result["candidatePortfolioIdentities"][0]["evidenceStrength"],
+                         "REVIEW_ONLY_CODE_IN_DISPLAY")
+        self.assertIsNone(result["canonicalPortfolioMatch"])
+
+    def test_cross_company_is_not_a_verified_partner_programme(self):
+        source = self.src(asset="ALPHAMAB")
+        targets = [dict(self.target(), company="Partner Pharma")]
+        result = self.assess(source, targets)
+        self.assertEqual(result["candidatePortfolioIdentityCount"], 0)
+        self.assertEqual(result["programmeIdentity"], "NOT_ASSESSED")
+
+    def test_missing_source_company_fails_closed(self):
+        source = self.src()
+        source.pop("company")
+        result = self.assess(source)
+        self.assertEqual(result["assetExistenceAssessment"], "COMPANY_SCOPE_UNASSESSED")
+        self.assertEqual(result["candidatePortfolioIdentityCount"], 0)
+
+    def test_absence_is_not_proof_of_new_product(self):
+        result = self.assess(self.src(asset="UNSEENNAME"), [self.target()])
+        self.assertEqual(result["assetExistenceAssessment"],
+                         "NO_DETERMINISTIC_IDENTITY_OBSERVED")
+        self.assertEqual(result["classificationReview"], "NO_RECLASSIFICATION_PROPOSED")
+        self.assertEqual(result["originalDiscoveryClassification"], "NEW ASSET")
+
+    def test_duplicate_ids_hold_without_arbitrary_pick(self):
+        targets = [self.target(), self.target()]
+        with self.assertRaisesRegex(ValueError, "Duplicate in-scope"):
+            self.assess(targets=targets)
+
+    def test_observed_gilead_six_candidate_vs_55_portfolio_identity_preflight(self):
+        from pathlib import Path
+        observed = json.loads((Path(__file__).parent /
+            "audits/STEP4_R1C_GILEAD_COMPARATOR_OBSERVED_INPUT.json").read_text())
+        self.assertEqual(len(observed["candidateRows"]), 6)
+        self.assertEqual(len(observed["portfolioRows"]), 55)
+        self.assertEqual(len({x["recordId"] for x in observed["portfolioRows"]}), 55)
+        for row in observed["candidateRows"]:
+            result = self.assess(row["source"], observed["portfolioRows"],
+                                 row["liveClassification"])
+            expected = set(observed["proposedProgrammeTargets"][row["candidateRecordId"]])
+            actual = {x["recordId"] for x in result["candidatePortfolioIdentities"]}
+            self.assertTrue(expected.issubset(actual), row["candidateRecordId"])
+            self.assertIn(result["assetExistenceAssessment"],
+                          {"EXISTING_ASSET_IDENTITY_OBSERVED",
+                           "POSSIBLE_ASSET_IDENTITY_REVIEW"})
+            self.assertEqual(result["classificationReview"],
+                             "REASSESS_NEW_ASSET_CLASSIFICATION")
+            self.assertEqual(result["programmeIdentity"], "NOT_ASSESSED")
+            self.assertFalse(result["autoLink"])
+            self.assertIsNone(result["proposedDiscoveryClassification"])
+
+    def test_existing_v16_comparator_kept_unmodified_and_overlay_held(self):
+        # Supported service import order prevents the pre-existing AZ cycle.
+        import service_entrypoint  # noqa: F401
+        import portfolio_discovery_extension_v16  # noqa: F401
+        import portfolio_discovery_extension_v11 as v
+        from pathlib import Path
+        observed = json.loads((Path(__file__).parent /
+            "audits/STEP4_R1C_GILEAD_COMPARATOR_OBSERVED_INPUT.json").read_text())
+        sources = [v.DiscoverySourceRow(**x["source"])
+                   for x in observed["candidateRows"]]
+        targets = [v.PortfolioSnapshotRow(**x)
+                   for x in observed["portfolioRows"]]
+        compared = v.compare_discovery(v.DiscoveryCompareRequest(
+            company="Gilead Sciences", sourceRows=sources,
+            portfolioRows=targets, batchRunId="SIX_CASE_READ_ONLY_TEST"))
+        self.assertTrue(compared.readOnly)
+        self.assertFalse(compared.guardrails["masterWrites"])
+        self.assertEqual(len(compared.candidates), 6)
+        for row, compared_row in zip(observed["candidateRows"], compared.candidates):
+            assessment = self.assess(row["source"], observed["portfolioRows"],
+                                     compared_row["classification"])
+            self.assertFalse(assessment["autoLink"])
+            self.assertEqual(assessment["originalDiscoveryClassification"],
+                             compared_row["classification"])
+            self.assertIsNone(assessment["proposedDiscoveryClassification"])
+
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

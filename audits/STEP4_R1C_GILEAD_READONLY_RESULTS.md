@@ -146,3 +146,46 @@ User ran the existing comparator in Codespaces with \`import service_entrypoint\
 **Proposed shared fix for review (not implemented or authorised for production):** integrate the existing R1C generic identity-preflight methods as an independent asset-presence assessment before programme disposition, report method/targets/hold reasons, and leave exact source-to-Portfolio link and classification promotion contingent on indication/line/population/focal-arm/owner/source-version proof and R1A holds. Do not collapse iMMagine line programmes or NAPISTAR ovarian/NSCLC indications, infer Merck programme ownership from Gilead-only comparisons, or treat combo-component overlap as entire regimen. Do **not** reclassify all six to \`MATCHED\`, \`NEW INDICATION\` or \`POSSIBLE DUPLICATE\` from identity presence alone.
 
 **Next acceptance check:** bounded code proposal on this recovery branch using existing workers, and generic negative controls (same asset/different programme, ovarian vs NSCLC, monotherapy vs combination, placebo/comparator, biomarker vs development code, sponsor/company ownership). Then **separate explicit user approval** before deployment, Candidate edits, queue write, Portfolio link or master-data mutation. R1C remains production HOLD.
+
+
+## 2026-10-09 — Shared asset-presence regression validation (actual Codespaces result)
+
+**PASS: 73 of 73 tests; 0 failures; 0 errors.** User ran
+\`git pull --ff-only && .venv/bin/python -m unittest -v test_r1c_shared_lineage\`
+in their existing Codespaces Python 3.11 environment on the recovery branch. The
+terminal screenshot displayed \`Ran 73 tests in 5.952s\` and \`OK\`.
+A non-fatal \`DeprecationWarning\` about \`swigvarlink\` followed the test result.
+
+Recovery branch implementation at \`bf0763c5f2cc2f79452a463b7da93c27bfd08555\` changes only
+\`r1c_shared_lineage.py\` and \`test_r1c_shared_lineage.py\`.
+The new read-only \`assess_asset_presence\` contract remains separate from
+V1.6's unmodified programme comparator. It can identify exact whole names,
+whole regimens or verified development-code identities across fields and flag
+an original \`NEW ASSET\` classification for re-assessment. It returns candidate
+identity IDs and evidence strength, but \`programmeIdentity=NOT_ASSESSED\`,
+\`canonicalPortfolioMatch=null\`, \`proposedDiscoveryClassification=null\`,
+\`autoLink=False\`, queue/write eligibility false and \`masterWrites=0\`.
+
+15 newly added tests cover existing Gilead 6×55 snapshot asset-preflight
+presence, comparator output preservation, same molecule/different programmes,
+indication separation, whole combinations versus monotherapy, target biomarkers
+versus development codes, exact code versus display-only weak evidence,
+cross-company exclusion, missing company, duplicate record IDs and other
+fail-closed cases. They build on 58 prior regression methods.
+
+**Scope of PASS:** code-level regression safety and frozen observed-data
+asset-presence assertions only. These tests do **not** prove that the live
+production comparator now classifies any Candidate differently; V1.6 is
+intentionally unchanged and still returned 6 × \`NEW ASSET\` in the prior
+live-data read-only preview. They do not validate 53/53 official source keys,
+persisted Candidate→Portfolio links, all 39-company fixtures, business report
+release gates or end-to-end scheduled refreshes. All six Gilead programme links
+remain on R1C HOLD, with no production Airtable changes, automation changes,
+merges or deployment.
+
+**Next controlled step:** trace the existing Source Watch → Adapter Registry →
+shared comparator → Candidate staging boundaries and the current publication
+guardrails; prepare one explicit read-only integration and impact proposal
+without adding a new automation or overriding held historical dispositions.
+Require user approval before any production deployment, Candidate edits,
+Portfolio master writes, queues or automatic links.

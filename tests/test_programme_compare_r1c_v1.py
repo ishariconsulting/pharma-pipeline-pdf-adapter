@@ -116,6 +116,26 @@ class VerifiedComparatorTest(unittest.TestCase):
         with self.assertRaises(ProgrammeGrainHold):
             compare_verified(r)
 
+    def test_live_gilead_candidate_requires_independent_attestation(self):
+        # Production Candidate source key: 5eb1e386-d42a-4627-ac3b-0f42f3e45c81.
+        # A company pipeline row + existing Portfolio link cannot self-attest.
+        r = request([OVARIAN])
+        r.sourceRows[0].sourceRecordId = "5eb1e386-d42a-4627-ac3b-0f42f3e45c81"
+        r.evidenceAttestations = []
+        with self.assertRaisesRegex(ProgrammeGrainHold, "VERIFIED_PROGRAMME_EVIDENCE_REQUIRED"):
+            compare_verified(r)
+
+    def test_live_ionis_composite_candidate_stays_held(self):
+        # The live Candidate is still keyed to owned:1769806455 and has two
+        # existing Portfolio links. No split or Candidate creation is permitted.
+        r = request([OVARIAN, LUNG], ["owned:1769806455"])
+        r.sourceRows[0].sourceRecordId = "owned:1769806455"
+        r.sourceRows[0].asset = "TRYNGOLZA (olezarsen)"
+        for attestation in r.evidenceAttestations:
+            attestation["sourceRecordId"] = "owned:1769806455"
+        with self.assertRaisesRegex(ProgrammeGrainHold, "LEGACY_PARENT_CANDIDATE_MIGRATION_REQUIRED"):
+            compare_verified(r)
+
     def test_legacy_parent_collision_holds(self):
         with self.assertRaisesRegex(ProgrammeGrainHold, "MIGRATION_REQUIRED"):
             compare_verified(request([OVARIAN, LUNG], ["sitecore-source-47"]))

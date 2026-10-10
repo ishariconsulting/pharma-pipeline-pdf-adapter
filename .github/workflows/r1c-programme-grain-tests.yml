@@ -1,0 +1,37 @@
+name: R1C verified programme-grain regression
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - 'shared_programme_grain_v1.py'
+      - 'shared_programme_evidence_qualification_v1.py'
+      - 'shared_candidate_inventory_v1.py'
+      - 'tests/test_shared_programme_evidence_qualification_v1.py'
+      - 'programme_compare_r1c_v1.py'
+      - 'service_entrypoint_r1c_canary.py'
+      - 'tests/test_shared_programme_grain_v1.py'
+      - 'tests/test_programme_compare_r1c_v1.py'
+      - '.github/workflows/r1c-programme-grain-tests.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  offline-regression:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Install deployed dependencies
+        run: python -m pip install --disable-pip-version-check -r requirements.txt
+      - name: Verify programme identity and comparator integration (zero Airtable writes)
+        env:
+          ADAPTER_API_KEY: offline-test-only
+        run: |
+          python -m unittest discover -v -s tests -p 'test_shared_programme_grain_v1.py'
+          python -m unittest discover -v -s tests -p 'test_programme_compare_r1c_v1.py'
+          python -m unittest discover -v -s tests -p 'test_shared_programme_evidence_qualification_v1.py'

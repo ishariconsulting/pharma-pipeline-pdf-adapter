@@ -128,7 +128,11 @@ def candidate_action_plan(
             "action": (
                 "REUSE_EXISTING_CANDIDATE"
                 if source_id in existing_source_ids
-                else "STAGE_NEW_CANDIDATE_FOR_REVIEW"
+                else (
+                    "STAGE_NEW_CANDIDATE_FOR_REVIEW"
+                    if row.get("programmeIdentityKey")
+                    else "HOLD_UNVERIFIED_PROGRAMME_GRAIN"
+                )
             ),
         })
     return planned

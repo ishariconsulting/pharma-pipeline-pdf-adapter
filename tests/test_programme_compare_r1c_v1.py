@@ -11,6 +11,7 @@ import service_entrypoint  # noqa: F401
 from shared_programme_grain_v1 import ProgrammeGrainHold
 from programme_compare_r1c_v1 import (
     VerifiedCompareRequest, VerifiedSourceRow, compare_verified,
+    preview_verified_worker,
 )
 from portfolio_discovery_extension_v11 import PortfolioSnapshotRow
 
@@ -198,6 +199,101 @@ class VerifiedComparatorTest(unittest.TestCase):
         )
         self.assertTrue(all(not c["portfolioMasterWritesAllowed"]
                             for c in out.candidates))
+
+
+class ReadOnlyWorkerCompatibilityTests(unittest.TestCase):
+    """Future caller contract only; published Airtable worker is unchanged."""
+
+    def test_gilead_one_to_many_and_missing_parent_evidence_do_not_mix(self):
+        r = request([OVARIAN, LUNG])
+        second = r.sourceRows[0].model_copy(
+            update={"sourceRecordId": "gilead-second-unverified-parent"}
+        )
+        r.sourceRows.append(second)
+        out = preview_verified_worker(r)
+        self.assertTrue(out["readOnly"])
+        self.assertFalse(out["productionWorkerIntegrated"])
+        self.assertEqual(out["sourceRowCount"], 2)
+        self.assertEqual(out["verifiedProgrammePreviewCount"], 2)
+        self.assertEqual(out["parentHoldCount"], 1)
+        self.assertEqual(out["parentResults"][0]["candidateCount"], 2)
+        self.assertEqual(out["parentResults"][1]["result"], "HOLD")
+        self.assertIn("VERIFIED_PROGRAMME_EVIDENCE_REQUIRED",
+                      out["parentResults"][1]["holdReason"])
+        self.assertEqual(out["candidateWrites"], 0)
+        self.assertEqual(out["portfolioMasterWrites"], 0)
+        self.assertEqual(out["sourceWatchWrites"], 0)
+        self.assertEqual(out["queueWrites"], 0)
+        self.assertTrue(all(
+            not c["canWrite"] and
+            c["portfolioLinkAction"] == "HOLD_FOR_INDEPENDENT_VERIFICATION"
+            for p in out["parentResults"] for c in p["candidates"]
+        ))
+
+    def test_ionis_parent_collision_and_unkeyed_history_remain_row_held(self):
+        r = request([OVARIAN, LUNG], ["owned:1769806455"])
+        r.sourceRows[0].sourceRecordId = "owned:1769806455"
+        r.sourceRows[0].asset = "TRYNGOLZA (olezarsen)"
+        for item in r.evidenceAttestations:
+            item["sourceRecordId"] = "owned:1769806455"
+        second = r.sourceRows[0].model_copy(
+            update={"sourceRecordId": "owned:other-programme"}
+        )
+        r.sourceRows.append(second)
+        r.evidenceAttestations.append(dict(
+            sourceRecordId="owned:other-programme",
+            indication=OVARIAN["indication"],
+            controlledIndicationId=OVARIAN["controlledIndicationId"],
+            evidenceUrl=SRC, treatmentSetting="2L+",
+            reviewed=True, scopeVerified=True, assetVerified=True,
+        ))
+        r.existingCandidateInventory.append(dict(
+            discoveryCandidateId="ionis-unkeyed-history", sourceRecordId="",
+        ))
+        r.existingCandidateExpectedCount = 2
+        out = preview_verified_worker(r)
+        self.assertEqual(out["sourceRowCount"], 2)
+        self.assertEqual(out["parentHoldCount"], 0)
+        self.assertEqual(out["verifiedProgrammePreviewCount"], 3)
+        actions = [[c["candidateStagingActionPreview"] for c in p["candidates"]]
+                   for p in out["parentResults"]]
+        self.assertEqual(actions[0], ["HOLD_LEGACY_PARENT_CANDIDATE_MIGRATION"] * 2)
+        self.assertEqual(actions[1], ["HOLD_UNKEYED_LEGACY_CANDIDATE_REVIEW"])
+        self.assertEqual(out["candidateWrites"], 0)
+
+    def test_worker_preview_replay_reuses_existing_child_identity(self):
+        first = preview_verified_worker(request([OVARIAN, LUNG]))
+        ids = [c["sourceRecordId"] for c in first["parentResults"][0]["candidates"]]
+        second = preview_verified_worker(request([LUNG, OVARIAN], ids))
+        self.assertEqual(second["verifiedProgrammePreviewCount"], 2)
+        self.assertEqual(
+            [c["candidateStagingActionPreview"] for c
+             in second["parentResults"][0]["candidates"]],
+            ["REUSE_EXISTING_CANDIDATE"] * 2,
+        )
+        self.assertEqual(second["candidateWrites"], 0)
+
+    def test_worker_preview_requires_complete_source_scoped_inventory(self):
+        r = request([OVARIAN])
+        r.existingCandidateInventoryComplete = False
+        with self.assertRaisesRegex(
+            ProgrammeGrainHold, "COMPLETE_CANDIDATE_INVENTORY_REQUIRED"
+        ):
+            preview_verified_worker(r)
+
+    def test_worker_preview_rejects_duplicate_source_parent(self):
+        r = request([OVARIAN])
+        r.sourceRows.append(r.sourceRows[0].model_copy())
+        with self.assertRaisesRegex(
+            ProgrammeGrainHold, "DUPLICATE_OR_MISSING_PARENT_SOURCE_ID"
+        ):
+            preview_verified_worker(r)
+
+    def test_worker_preview_rejects_empty_snapshot(self):
+        r = request([OVARIAN])
+        r.sourceRows = []
+        with self.assertRaisesRegex(ProgrammeGrainHold, "SOURCE_ROWS_REQUIRED"):
+            preview_verified_worker(r)
 
 
 if __name__ == "__main__":

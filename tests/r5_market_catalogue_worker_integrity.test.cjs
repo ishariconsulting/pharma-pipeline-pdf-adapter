@@ -18,7 +18,7 @@ const code = [
     section("function sameHost(", "function brandLike("),
     section("// R5_CATALOGUE_ADMISSION_START", "// R5_CATALOGUE_ADMISSION_END"),
 ].join("\n");
-const {assess, brandKey} = new Function(code + "\nreturn {assess:r5CatalogueAdmission, brandKey};")();
+const {assess, brandKey, markerContract, markerHits} = new Function(code + "\nreturn {assess:r5CatalogueAdmission, brandKey, markerContract:r5MarkerContract, markerHits:r5SourceMarkerHits};")();
 
 const GILEAD = [
 "Atripla","Biktarvy","Complera","Descovy","Emtriva","Genvoya","Hepsera",
@@ -109,4 +109,37 @@ test("Published worker remains unchanged; draft has no portfolio writes",()=>{
     assert.ok(worker.includes("REVIEW COPY ONLY"));
     assert.ok(!worker.includes("portfolioTable.createRecordsAsync("));
     assert.ok(!worker.includes("portfolioTable.updateRecordsAsync("));
+});
+
+test("Trusted snapshot produces deterministic source markers for both companies",()=>{
+    for (const snap of [full,partial]) {
+        const first=markerContract(snap), replay=markerContract(snap);
+        assert.deepEqual(first,replay);
+        assert.equal(first.minHits,3);
+        assert.equal(first.markers.length,12);
+        for (const item of first.markers) assert.ok(snap.products.some(p=>p.brand===item));
+    }
+});
+test("Long navigation-only direct content is insufficient before transport selection",()=>{
+    const nav=("Home About News Investor Relations Contact " ).repeat(40);
+    assert.ok(nav.length>700);
+    const markers=markerContract(full);
+    assert.equal(markerHits({visibleText:nav,headings:[],anchors:[]},markers),0);
+    assert.ok(markerHits({visibleText:markers.markers.slice(0,3).join(" "),headings:[],anchors:[]},markers)>=3);
+});
+test("Astellas partial snapshot markers are opt-in but not a full-catalogue claim",()=>{
+    const terms=markerContract(partial);
+    assert.equal(markerHits({visibleText:terms.markers.slice(0,2).join(" "),headings:[],anchors:[]},terms),2);
+    assert.equal(assess(partial,candidates(ASTELLAS),asrc,asrc).fullCatalogueEligible,false);
+});
+test("Worker passes vetted markers to shared router, checks direct text, and guards before discovery writes",()=>{
+    const baseline=worker.indexOf("const r5Baseline = await r5GetQualifiedSnapshot(");
+    const fetchPage=worker.indexOf("const page = await fetchPage(sourceUrl, markerContract)");
+    const admission=worker.indexOf("const r5Admission = r5CatalogueAdmission(");
+    const write=worker.indexOf("discoveryTable.updateRecordsAsync(");
+    assert.ok(baseline>=0&&baseline<fetchPage&&fetchPage<admission&&admission<write);
+    assert.ok(worker.includes("r5SourceMarkerHits(direct, markerContract) < markerContract.minHits"));
+    assert.ok(worker.includes("&required_content_terms="));
+    assert.ok(worker.includes("&min_required_hits="));
+    assert.ok(worker.includes("return await fetchExternal(url, markerContract)"));
 });

@@ -43,10 +43,17 @@ def compare_verified(request: VerifiedCompareRequest) -> base.DiscoveryCompareRe
         request.existingCandidateInventory,
         complete=request.existingCandidateInventoryComplete,
         expected_count=request.existingCandidateExpectedCount,
+        allow_unkeyed=True,  # complete inventory; held new rows, keyed reuse permitted
     )
     # The older free-form source ID list cannot override the inspected inventory.
     if request.existingCandidateSourceIds and set(request.existingCandidateSourceIds) != existing_source_ids:
         raise ProgrammeGrainHold("LEGACY_SOURCE_ID_LIST_INVENTORY_MISMATCH")
+    # Any historical unkeyed Candidate could alias a fresh source key. Do not
+    # stage NEW Candidates until these are reconciled; do preserve exact reuse.
+    unkeyed_legacy_count = sum(
+        1 for record in request.existingCandidateInventory
+        if not str(record.get("sourceRecordId") or "").strip()
+    )
     expanded = []
     provenance = {}
     for source in request.sourceRows:
@@ -59,7 +66,7 @@ def compare_verified(request: VerifiedCompareRequest) -> base.DiscoveryCompareRe
         # must pass the independent read-only qualification contract.
         qualified = qualify(source_data, evidence,
                             approved_hosts=set(request.approvedEvidenceHosts),
-                            existing_parent_candidate_ids=existing_source_ids)
+                            existing_parent_candidate_ids=set())  # planner holds parent collisions per row
         for child in expand_verified_programmes(qualified):
             source_id = child["sourceRecordId"]
             if source_id in provenance:
@@ -70,7 +77,8 @@ def compare_verified(request: VerifiedCompareRequest) -> base.DiscoveryCompareRe
     # Fail closed before any comparisons. In particular, a legacy parent
     # Candidate must never silently become multiple new child Candidates.
     plans = candidate_action_plan(
-        list(provenance.values()), existing_source_ids
+        list(provenance.values()), existing_source_ids,
+        unresolved_legacy_count=unkeyed_legacy_count,
     )
     child_requests = base.DiscoveryCompareRequest(
         company=request.company, companyAliases=request.companyAliases,

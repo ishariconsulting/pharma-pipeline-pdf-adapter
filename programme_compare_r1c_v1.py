@@ -35,6 +35,8 @@ def compare_verified(request: VerifiedCompareRequest) -> base.DiscoveryCompareRe
     expanded = []
     provenance = {}
     for source in request.sourceRows:
+        if source.verifiedIndications is None:
+            raise ProgrammeGrainHold("VERIFIED_PROGRAMME_EVIDENCE_REQUIRED")
         for child in expand_verified_programmes(_dict(source)):
             source_id = child["sourceRecordId"]
             if source_id in provenance:

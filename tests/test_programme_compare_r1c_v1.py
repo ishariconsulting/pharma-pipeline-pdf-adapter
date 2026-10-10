@@ -96,6 +96,12 @@ class VerifiedComparatorTest(unittest.TestCase):
             ["REUSE_EXISTING_CANDIDATE", "REUSE_EXISTING_CANDIDATE"],
         )
 
+    def test_unverified_source_never_enters_new_candidate_staging(self):
+        r = request([OVARIAN, LUNG])
+        r.sourceRows[0].verifiedIndications = None
+        with self.assertRaisesRegex(ProgrammeGrainHold, "VERIFIED_PROGRAMME_EVIDENCE_REQUIRED"):
+            compare_verified(r)
+
     def test_legacy_parent_collision_holds(self):
         with self.assertRaisesRegex(ProgrammeGrainHold, "MIGRATION_REQUIRED"):
             compare_verified(request([OVARIAN, LUNG], ["sitecore-source-47"]))

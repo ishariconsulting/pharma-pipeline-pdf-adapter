@@ -16,6 +16,7 @@ def _clean(value: Any) -> str:
 def validate_inventory(
     records: Sequence[Mapping[str, Any]], *, complete: bool,
     expected_count: int | None,
+    allow_unkeyed: bool = False,
 ) -> set[str]:
     """Validate a scoped, *fully paginated* Candidate snapshot and collect raw IDs.
 
@@ -44,9 +45,11 @@ def validate_inventory(
             unresolved += 1
     # Distinct existing Candidates may share a legacy source parent; retain
     # every existing row without assuming that the parent is one programme.
-    # For a write-safe "new" decision all legacy unkeyed rows must first be
-    # reconciled, because source/asset aliases may obscure duplicates.
-    if unresolved:
+    # Default callers retain the strict fail-closed behaviour. Read-only R1C
+    # preview may admit a COMPLETE inventory with unkeyed historical Candidates,
+    # but its action planner MUST hold all new Candidate actions in that case.
+    # Exact keyed Candidate reuse can then be assessed independently.
+    if unresolved and not allow_unkeyed:
         raise ProgrammeGrainHold(
             f"LEGACY_CANDIDATE_SOURCE_KEYS_UNRESOLVED:{unresolved}"
         )

@@ -140,6 +140,42 @@ function brandKey(label) {
     return norm(canonicalBrand(label));
 }
 // R5_CATALOGUE_ADMISSION_START — isolated draft extension to the published worker.
+// Markers come ONLY from the separately vetted, source-scoped snapshot.
+// They help choose transport, but they never certify catalogue completeness.
+function r5MarkerContract(snapshot) {
+    if (!snapshot || snapshot.authoritative !== true || !Array.isArray(snapshot.products))
+        throw new Error("R5_CATALOGUE_INTEGRITY_HOLD:AUTHORITATIVE_SNAPSHOT_REQUIRED");
+    const unique = [];
+    const seen = new Set();
+    for (const row of snapshot.products) {
+        const brand = clean(typeof row === "string" ? row : row && row.brand);
+        const key = brand.toLowerCase();
+        if (!brand || brand.length < 3 || brand.length > 80 || brand.includes(",")) continue;
+        if (seen.has(key)) continue;
+        seen.add(key);
+        unique.push(brand);
+    }
+    if (unique.length < 3)
+        throw new Error("R5_CATALOGUE_INTEGRITY_HOLD:INSUFFICIENT_SOURCE_MARKERS");
+    // Distribute up to 12 markers across the declared source order, rather
+    // than relying only on the first products in the snapshot.
+    const count = Math.min(12, unique.length);
+    const markers = Array.from({length:count}, (_,i) =>
+        unique[Math.floor(i * (unique.length - 1) / (count - 1))]);
+    return {markers, minHits:3};
+}
+function r5SourceMarkerHits(page, contract) {
+    const content = [
+        clean(page.visibleText),
+        ...(page.headings || []).map(x => clean(x && x.text)),
+        ...(page.anchors || []).map(x => clean(x && (x.label || x.text)))
+    ].join(" ").toLowerCase();
+    return contract.markers.filter(marker => {
+        const escaped = marker.toLowerCase().replace(/[.*+?^${}()|[\]\\]/g, "\\// R5_CATALOGUE_ADMISSION_START — isolated draft extension to the published worker.
+");
+        return new RegExp("(^|\\W)" + escaped + "(?!\\w)").test(content);
+    }).length;
+}
 // It does NOT establish official source truth; it prevents unverified page
 // extraction from overwriting a previously reviewed source-level baseline.
 function r5CatalogueAdmission(snapshot, candidates, finalUrl, watchedUrl) {
@@ -488,13 +524,15 @@ await sourceWatchTable.updateRecordAsync(sw.id, {
     [swf.requested.id]: false
 });
 
-async function fetchExternal(url) {
+async function fetchExternal(url, markerContract) {
     const key = getSecret("adapterApiKey");
     if (!key) throw new Error("adapterApiKey secret is unavailable for external HTML retrieval.");
     try {
         await fetch(ADAPTER_BASE_URL + "/health", {method:"GET", headers:{"x-adapter-key":key,"Accept":"application/json"}});
     } catch (_) {}
-    const res = await fetch(ADAPTER_BASE_URL + "/fetch/routed-html?url=" + encodeURIComponent(url), {
+    const terms = "&required_content_terms=" + encodeURIComponent(markerContract.markers.join(","))
+        + "&min_required_hits=" + markerContract.minHits;
+    const res = await fetch(ADAPTER_BASE_URL + "/fetch/routed-html?url=" + encodeURIComponent(url) + terms, {
         method:"GET", headers:{"x-adapter-key":key,"Accept":"application/json"}
     });
     const bodyText = await res.text();
@@ -526,23 +564,26 @@ async function fetchDirect(url) {
         blocked:classifyBlocked(html,title,visibleText)
     };
 }
-async function fetchPage(url) {
-    if (retrievalMode === "EXTERNAL_HTTP") return await fetchExternal(url);
+async function fetchPage(url, markerContract) {
+    if (retrievalMode === "EXTERNAL_HTTP") return await fetchExternal(url, markerContract);
     if (retrievalMode === "BROWSER_REQUIRED") throw new Error("BROWSER_REQUIRED product catalogue cannot be processed by V1 worker.");
     if (retrievalMode === "STATIC_DOCUMENT") throw new Error("STATIC_DOCUMENT product catalogue requires a document adapter; V1 handles HTML only.");
     try {
         const direct = await fetchDirect(url);
-        const unusable = !direct.ok || !!direct.blocked || direct.visibleText.length < 700;
+        const unusable = !direct.ok || !!direct.blocked || direct.visibleText.length < 700
+            || r5SourceMarkerHits(direct, markerContract) < markerContract.minHits;
         if (!unusable) return direct;
     } catch (e) {
         const msg = clean(e && e.message || e);
         if (!/redirect|301|302|403|408|429|500|502|503|504|timeout|timed out|failed to fetch|network/i.test(msg)) throw e;
     }
-    return await fetchExternal(url);
+    return await fetchExternal(url, markerContract);
 }
 
 try {
-    const page = await fetchPage(sourceUrl);
+    const r5Baseline = await r5GetQualifiedSnapshot(sw, sourceWatchTable);
+    const markerContract = r5MarkerContract(r5Baseline);
+    const page = await fetchPage(sourceUrl, markerContract);
     if (!page.ok) throw new Error(`Catalogue retrieval HTTP ${page.status || "unknown"}.`);
     if (!page.visibleText || page.visibleText.length < 300) throw new Error("Catalogue page has insufficient usable content.");
 
@@ -560,7 +601,6 @@ try {
 
     // Validate SOURCE identity + trusted scope before any Marketed Product Discovery
     // or catalogue completeness audit writes. This is deliberately conservative.
-    const r5Baseline = await r5GetQualifiedSnapshot(sw, sourceWatchTable);
     const r5Admission = r5CatalogueAdmission(r5Baseline, candidates, page.finalUrl || sourceUrl, sourceUrl);
     const scope = r5Admission.scope;
     const fingerprint = fnv1a(candidates.map(c => `${c.key}|${c.molecule}|${c.url}`).join("\n"));

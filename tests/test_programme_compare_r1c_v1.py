@@ -34,6 +34,12 @@ LUNG = programme("recqTQTf5vXD7yKrn", "Non-small cell lung cancer")
 def request(ordered, existing=()):
     return VerifiedCompareRequest(
         company="Example Pharma", existingCandidateSourceIds=list(existing),
+        existingCandidateInventoryComplete=True,
+        existingCandidateExpectedCount=len(existing),
+        existingCandidateInventory=[
+            dict(discoveryCandidateId=f"existing-candidate-{i}", sourceRecordId=source_id)
+            for i, source_id in enumerate(existing)
+        ],
         approvedEvidenceHosts=["clinicaltrials.gov"],
         evidenceAttestations=[
             dict(sourceRecordId="sitecore-source-47", indication=p["indication"],
@@ -114,6 +120,27 @@ class VerifiedComparatorTest(unittest.TestCase):
         r = request([OVARIAN, LUNG])
         r.evidenceAttestations[0]["evidenceUrl"] = "https://clinicaltrials.gov.evil.example/"
         with self.assertRaises(ProgrammeGrainHold):
+            compare_verified(r)
+
+    def test_incomplete_candidate_inventory_holds_before_comparison(self):
+        r = request([OVARIAN])
+        r.existingCandidateInventoryComplete = False
+        with self.assertRaisesRegex(ProgrammeGrainHold, "COMPLETE_CANDIDATE_INVENTORY_REQUIRED"):
+            compare_verified(r)
+
+    def test_unkeyed_legacy_candidate_blocks_new_identity(self):
+        r = request([OVARIAN])
+        r.existingCandidateInventory = [
+            dict(discoveryCandidateId="gilead-old-source", sourceRecordId="")
+        ]
+        r.existingCandidateExpectedCount = 1
+        with self.assertRaisesRegex(ProgrammeGrainHold, "LEGACY_CANDIDATE_SOURCE_KEYS_UNRESOLVED"):
+            compare_verified(r)
+
+    def test_candidate_inventory_count_mismatch_fails_closed(self):
+        r = request([OVARIAN])
+        r.existingCandidateExpectedCount = 62
+        with self.assertRaisesRegex(ProgrammeGrainHold, "CANDIDATE_INVENTORY_COUNT_MISMATCH"):
             compare_verified(r)
 
     def test_live_gilead_candidate_requires_independent_attestation(self):

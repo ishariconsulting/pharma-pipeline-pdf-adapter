@@ -107,6 +107,129 @@ def compare_verified(request: VerifiedCompareRequest) -> base.DiscoveryCompareRe
     return result
 
 
+WORKER_PREVIEW_VERSION = "R1C_SHARED_WORKER_COMPATIBILITY_V1_READ_ONLY"
+
+
+def preview_verified_worker(request: VerifiedCompareRequest) -> Dict[str, Any]:
+    """Preflight one company/source-snapshot for a future shared Airtable caller.
+
+    Unlike the published Worker, this contract does not presume a 1:1
+    source-row to Candidate relationship. It preserves parent-level holds and
+    always prevents Candidate, Portfolio, Queue and Source Watch writes.
+    Evidence attestations are supplied by caller; this route is NOT an
+    independent source verifier or a production-ready Airtable integration.
+    """
+    if not request.sourceRows:
+        raise ProgrammeGrainHold("SOURCE_ROWS_REQUIRED")
+    known_source_ids = validate_inventory(
+        request.existingCandidateInventory,
+        complete=request.existingCandidateInventoryComplete,
+        expected_count=request.existingCandidateExpectedCount,
+        allow_unkeyed=True,
+    )
+    if (request.existingCandidateSourceIds
+            and set(request.existingCandidateSourceIds) != known_source_ids):
+        raise ProgrammeGrainHold("LEGACY_SOURCE_ID_LIST_INVENTORY_MISMATCH")
+
+    seen_parents: set[str] = set()
+    for row in request.sourceRows:
+        parent_id = str(row.sourceRecordId or "").strip()
+        if not parent_id or parent_id in seen_parents:
+            raise ProgrammeGrainHold("DUPLICATE_OR_MISSING_PARENT_SOURCE_ID")
+        seen_parents.add(parent_id)
+
+    parent_results: list[dict[str, Any]] = []
+    seen_children: set[str] = set()
+    for row in request.sourceRows:
+        parent_id = str(row.sourceRecordId).strip()
+        # The comparator's older one-to-one field is not used to gate here.
+        # Evaluate each independently attested source parent, then reconstruct
+        # a one-to-many, source-parent-keyed preview; none of it is writeable.
+        single_request = request.model_copy(update={"sourceRows": [row]})
+        try:
+            response = compare_verified(single_request)
+            if response.readOnly is not True:
+                raise ProgrammeGrainHold("COMPARATOR_READ_ONLY_CONTRACT_REQUIRED")
+            candidates = []
+            for child in response.candidates:
+                child_id = str(child.get("sourceRecordId") or "").strip()
+                if not child_id or child_id in seen_children:
+                    raise ProgrammeGrainHold("DUPLICATE_OR_MISSING_CHILD_SOURCE_ID")
+                # Child must retain the immutable parent provenance. A row
+                # that was not independently qualified is not a programme.
+                if child.get("sourceParentRecordId") != parent_id:
+                    raise ProgrammeGrainHold("CHILD_PARENT_PROVENANCE_REQUIRED")
+                if not child.get("programmeIdentityKey"):
+                    raise ProgrammeGrainHold("CHILD_PROGRAMME_IDENTITY_REQUIRED")
+                action = str(child.get("candidateStagingAction") or "")
+                if action not in {
+                    "REUSE_EXISTING_CANDIDATE",
+                    "STAGE_NEW_CANDIDATE_FOR_REVIEW",
+                    "HOLD_LEGACY_PARENT_CANDIDATE_MIGRATION",
+                    "HOLD_UNKEYED_LEGACY_CANDIDATE_REVIEW",
+                }:
+                    raise ProgrammeGrainHold("UNSUPPORTED_CANDIDATE_ACTION")
+                candidates.append({
+                    "sourceParentRecordId": parent_id,
+                    "sourceRecordId": child_id,
+                    "programmeIdentityKey": child["programmeIdentityKey"],
+                    "controlledIndicationId": child["controlledIndicationId"],
+                    "candidateStagingActionPreview": action,
+                    "sourceFamily": child.get("sourceFamily"),
+                    "discoveryCandidateId": child.get("discoveryCandidateId"),
+                    "comparatorSuggestedPortfolioIds": list(
+                        child.get("existingPortfolioRecordIds") or []
+                    ),
+                    "portfolioLinkAction": "HOLD_FOR_INDEPENDENT_VERIFICATION",
+                    "canWrite": False,
+                })
+            # Commit IDs only after complete parent validation, so malformed
+            # parent output cannot poison another independent parent preview.
+            seen_children.update(c["sourceRecordId"] for c in candidates)
+            parent_results.append({
+                "sourceParentRecordId": parent_id,
+                "result": "QUALIFIED_FOR_READ_ONLY_REVIEW",
+                "holdReason": None,
+                "candidateCount": len(candidates),
+                "candidates": candidates,
+            })
+        except ProgrammeGrainHold as error:
+            parent_results.append({
+                "sourceParentRecordId": parent_id,
+                "result": "HOLD",
+                "holdReason": str(error),
+                "candidateCount": 0,
+                "candidates": [],
+            })
+
+    return {
+        "version": WORKER_PREVIEW_VERSION,
+        "readOnly": True,
+        "productionWorkerIntegrated": False,
+        "sourceRowCount": len(request.sourceRows),
+        "verifiedProgrammePreviewCount": sum(
+            p["candidateCount"] for p in parent_results
+        ),
+        "parentHoldCount": sum(p["result"] == "HOLD" for p in parent_results),
+        "existingCandidateInventoryCount": len(request.existingCandidateInventory),
+        "existingCandidateInventoryComplete": True,
+        "portfolioMasterWrites": 0,
+        "candidateWrites": 0,
+        "queueWrites": 0,
+        "sourceWatchWrites": 0,
+        "parentResults": parent_results,
+    }
+
+
+@app.post("/compare/portfolio-discovery/verified-programmes/worker-preview")
+async def preview_verified_worker_route(
+    request: VerifiedCompareRequest,
+    x_adapter_key: Optional[str] = Header(default=None),
+) -> Dict[str, Any]:
+    _auth(x_adapter_key)
+    return preview_verified_worker(request)
+
+
 @app.post(
     "/compare/portfolio-discovery/verified-programmes",
     response_model=base.DiscoveryCompareResponse,

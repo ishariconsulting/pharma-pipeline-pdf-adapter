@@ -34,7 +34,7 @@ def browser(text):
         httpStatus=200, contentType="text/html", bodyBytes=len(text),
         visibleTextLength=len(text), visibleText=text,
         headings=[], anchors=[], transport="PLAYWRIGHT_CHROMIUM",
-        retrievalMode="BROWSER_REQUIRED", routingReason="TEST_BROWSER_FALLBACK",
+        retrievalMode="BROWSER_REQUIRED", routingReason="DIRECT_CONTENT_MARKERS_MISSING",
     )
 
 

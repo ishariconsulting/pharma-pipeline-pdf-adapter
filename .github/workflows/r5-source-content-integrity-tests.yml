@@ -1,0 +1,32 @@
+name: R5 catalogue source integrity (draft only)
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - 'routed_html_extension.py'
+      - 'tests/test_routed_html_content_integrity_v1.py'
+      - 'review/marketed_product_catalogue_worker_v1_3_guarded_DRAFT_ONLY.js'
+      - 'tests/r5_market_catalogue_worker_integrity.test.cjs'
+      - '.github/workflows/r5-source-content-integrity-tests.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  read-only-regression:
+    runs-on: ubuntu-latest
+    timeout-minutes: 12
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Install current adapter dependencies (no deployments)
+        run: python -m pip install --disable-pip-version-check -r requirements.txt
+      - name: Opt-in routed browser content guard regression
+        env:
+          ADAPTER_API_KEY: offline-test-only
+        run: python -m unittest discover -v -s tests -p 'test_routed_html_content_integrity_v1.py'
+      - name: Read-only existing worker catalogue admission regression
+        run: node --test tests/r5_market_catalogue_worker_integrity.test.cjs

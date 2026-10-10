@@ -90,10 +90,35 @@ class ProgrammeIdentityTests(unittest.TestCase):
                "indication": "Lung cancer; ovarian cancer"}
         self.assertEqual(expand_verified_programmes(raw), [raw])
 
-    def test_legacy_parent_candidate_requires_migration(self):
+    def test_legacy_parent_candidate_is_held_per_row(self):
         rows = expand_verified_programmes(source(OVARIAN, LUNG))
-        with self.assertRaisesRegex(ProgrammeGrainHold, "LEGACY_PARENT"):
-            candidate_action_plan(rows, {"source-card-47"})
+        plans = candidate_action_plan(rows, {"source-card-47"})
+        self.assertEqual(
+            [p["action"] for p in plans],
+            ["HOLD_LEGACY_PARENT_CANDIDATE_MIGRATION"] * 2,
+        )
+
+    def test_legacy_parent_hold_does_not_suppress_independent_keyed_reuse(self):
+        child = expand_verified_programmes(source(OVARIAN))[0]
+        unrelated = dict(child, sourceRecordId="independent-keyed-row",
+                         sourceParentRecordId="unrelated-parent")
+        plans = candidate_action_plan(
+            [child, unrelated], {"source-card-47", "independent-keyed-row"},
+        )
+        self.assertEqual(
+            [p["action"] for p in plans],
+            ["HOLD_LEGACY_PARENT_CANDIDATE_MIGRATION", "REUSE_EXISTING_CANDIDATE"],
+        )
+
+    def test_unkeyed_history_blocks_new_action_but_not_existing_reuse(self):
+        rows = expand_verified_programmes(source(OVARIAN, LUNG))
+        plans = candidate_action_plan(
+            rows, {rows[0]["sourceRecordId"]}, unresolved_legacy_count=2,
+        )
+        self.assertEqual(
+            [p["action"] for p in plans],
+            ["REUSE_EXISTING_CANDIDATE", "HOLD_UNKEYED_LEGACY_CANDIDATE_REVIEW"],
+        )
 
     def test_unverified_child_holds_entire_source(self):
         broken = dict(LUNG, verified=False)

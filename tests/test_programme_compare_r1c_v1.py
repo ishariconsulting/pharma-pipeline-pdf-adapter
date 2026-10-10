@@ -5,6 +5,9 @@ Run in repository environment:
 """
 import unittest
 
+# Use the same import order as the live Render service to avoid legacy import cycles.
+import service_entrypoint  # noqa: F401
+
 from shared_programme_grain_v1 import ProgrammeGrainHold
 from programme_compare_r1c_v1 import (
     VerifiedCompareRequest, VerifiedSourceRow, compare_verified,

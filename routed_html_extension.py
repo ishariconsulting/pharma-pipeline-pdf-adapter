@@ -20,9 +20,58 @@ from main import _auth, app
 from html_fetch_extension import HtmlFetchResponse, _fetch_public_html
 
 
-ROUTER_VERSION = "RETRIEVAL_ROUTER_V1.0"
+ROUTER_VERSION = "RETRIEVAL_ROUTER_V1.1_OPT_IN_CONTENT_INTEGRITY"
 MIN_USABLE_VISIBLE_TEXT = 800
 ROUTABLE_SOURCE_STATUSES = {403, 408, 429}
+MAX_CONTENT_MARKERS = 12
+
+
+def _content_contract(raw: Optional[str], requested_hits: int) -> tuple[list[str], int]:
+    """Opt-in positive content proof, not inferred from response length.
+
+    Callers supply stable markers from separately verified source evidence.
+    This is retrieval validation, NOT full catalogue-count certification.
+    """
+    if raw is None:
+        if requested_hits:
+            raise HTTPException(status_code=400, detail="Content markers required when minimum hits is specified")
+        return [], 0
+    markers = []
+    seen = set()
+    for item in raw.split(","):
+        value = " ".join(item.split())
+        if not 3 <= len(value) <= 80:
+            raise HTTPException(status_code=400, detail="Content marker length must be 3 to 80")
+        key = value.casefold()
+        if key in seen:
+            raise HTTPException(status_code=400, detail="Duplicate content markers are not permitted")
+        seen.add(key)
+        markers.append(value)
+    if len(markers) > MAX_CONTENT_MARKERS:
+        raise HTTPException(status_code=400, detail="Too many content markers")
+    needed = requested_hits or min(3, len(markers))
+    if needed > len(markers):
+        raise HTTPException(status_code=400, detail="Minimum content hits exceeds marker count")
+    return markers, needed
+
+
+def _matched_content_markers(payload: Dict[str, Any], markers: list[str]) -> int:
+    # Count evidence from received source content only, never the URL,
+    # configured markers, routing metadata or retained snapshots.
+    chunks = [str(payload.get("visibleText") or "")]
+    chunks.extend(str(x.get("text") or "") for x in payload.get("headings", []) if isinstance(x, dict))
+    chunks.extend(str(x.get("text") or "") for x in payload.get("anchors", []) if isinstance(x, dict))
+    source_content = " ".join(chunks).casefold()
+    return sum(
+        bool(re.search(r"(?<!\w)" + re.escape(marker.casefold()) + r"(?!\w)", source_content))
+        for marker in markers
+    )
+
+
+def _require_source_content(payload: Dict[str, Any], markers: list[str], needed: int) -> None:
+    if markers and _matched_content_markers(payload, markers) < needed:
+        # A long navigation page cannot refresh or supersede the source baseline.
+        raise HTTPException(status_code=502, detail="SOURCE_CONTENT_INTEGRITY_HOLD")
 
 
 class RoutedHtmlFetchResponse(BaseModel):
@@ -171,8 +220,11 @@ async def fetch_routed_html(
     url: str = Query(..., min_length=8),
     timeout_seconds: float = Query(default=35.0, ge=5.0, le=35.0),
     x_adapter_key: Optional[str] = Header(default=None),
+    required_content_terms: Optional[str] = Query(default=None, max_length=1024),
+    min_required_hits: int = Query(default=0, ge=0, le=MAX_CONTENT_MARKERS),
 ) -> RoutedHtmlFetchResponse:
     _auth(x_adapter_key)
+    markers, needed = _content_contract(required_content_terms, min_required_hits)
 
     try:
         direct = await _fetch_public_html(url, timeout_seconds=timeout_seconds)
@@ -187,16 +239,21 @@ async def fetch_routed_html(
             direct_status=source_status,
             direct_version=None,
         )
+        _require_source_content(payload, markers, needed)
         return RoutedHtmlFetchResponse(**payload)
 
-    if direct.visibleTextLength < MIN_USABLE_VISIBLE_TEXT:
+    direct_payload = _direct_payload(direct)
+    direct_markers_ok = not markers or _matched_content_markers(direct_payload, markers) >= needed
+    if direct.visibleTextLength < MIN_USABLE_VISIBLE_TEXT or not direct_markers_ok:
         payload = await _browser_payload(
             url=url,
             timeout_seconds=timeout_seconds,
-            reason="SPARSE_SERVER_HTML",
+            reason="SPARSE_SERVER_HTML" if direct.visibleTextLength < MIN_USABLE_VISIBLE_TEXT
+                   else "DIRECT_CONTENT_MARKERS_MISSING",
             direct_status=direct.httpStatus,
             direct_version=direct.version,
         )
+        _require_source_content(payload, markers, needed)
         return RoutedHtmlFetchResponse(**payload)
 
-    return RoutedHtmlFetchResponse(**_direct_payload(direct))
+    return RoutedHtmlFetchResponse(**direct_payload)

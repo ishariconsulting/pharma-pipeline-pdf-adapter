@@ -13,6 +13,7 @@ from pydantic import Field
 from main import _auth, app
 import portfolio_discovery_extension_v16  # noqa: F401 - installs existing V1.6 matching
 import portfolio_discovery_extension_v11 as base
+from shared_programme_evidence_qualification_v1 import qualify
 from shared_programme_grain_v1 import (
     ProgrammeGrainHold, expand_verified_programmes, candidate_action_plan,
 )
@@ -25,6 +26,8 @@ class VerifiedSourceRow(base.DiscoverySourceRow):
 class VerifiedCompareRequest(base.DiscoveryCompareRequest):
     sourceRows: List[VerifiedSourceRow]
     existingCandidateSourceIds: List[str] = Field(default_factory=list)
+    evidenceAttestations: List[Dict[str, Any]] = Field(default_factory=list)
+    approvedEvidenceHosts: List[str] = Field(default_factory=list)
 
 
 def _dict(model: Any) -> Dict[str, Any]:
@@ -35,9 +38,17 @@ def compare_verified(request: VerifiedCompareRequest) -> base.DiscoveryCompareRe
     expanded = []
     provenance = {}
     for source in request.sourceRows:
-        if source.verifiedIndications is None:
+        source_data = _dict(source)
+        parent = source_data["sourceRecordId"]
+        evidence = [a for a in request.evidenceAttestations if a.get("sourceRecordId") == parent]
+        if not evidence:
             raise ProgrammeGrainHold("VERIFIED_PROGRAMME_EVIDENCE_REQUIRED")
-        for child in expand_verified_programmes(_dict(source)):
+        # A supplied verifiedIndications flag is never sufficient: attestations
+        # must pass the independent read-only qualification contract.
+        qualified = qualify(source_data, evidence,
+                            approved_hosts=set(request.approvedEvidenceHosts),
+                            existing_parent_candidate_ids=set(request.existingCandidateSourceIds))
+        for child in expand_verified_programmes(qualified):
             source_id = child["sourceRecordId"]
             if source_id in provenance:
                 raise ProgrammeGrainHold("DUPLICATE_COMPARATOR_SOURCE_IDENTITY")

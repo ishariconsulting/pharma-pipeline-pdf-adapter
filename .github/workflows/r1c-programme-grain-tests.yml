@@ -5,6 +5,7 @@ on:
     paths:
       - 'shared_programme_grain_v1.py'
       - 'shared_programme_evidence_qualification_v1.py'
+      - 'shared_candidate_inventory_v1.py'
       - 'tests/test_shared_programme_evidence_qualification_v1.py'
       - 'programme_compare_r1c_v1.py'
       - 'service_entrypoint_r1c_canary.py'

@@ -106,12 +106,15 @@ def expand_verified_programmes(source_row: Mapping[str, Any]) -> list[dict[str, 
 def candidate_action_plan(
     rows: Sequence[Mapping[str, Any]],
     existing_source_ids: set[str],
+    *, unresolved_legacy_count: int = 0,
 ) -> list[dict[str, str]]:
     """Preview idempotent Candidate-only actions; Portfolio writes are absent.
 
     Do not revive, overwrite, or supersede existing parent-source Candidates:
     existing legacy parents must be reconciled explicitly before child creates.
     """
+    if unresolved_legacy_count < 0:
+        raise ProgrammeGrainHold("INVALID_UNKEYED_LEGACY_CANDIDATE_COUNT")
     seen: set[str] = set()
     planned: list[dict[str, str]] = []
     for row in rows:
@@ -120,19 +123,22 @@ def candidate_action_plan(
             raise ProgrammeGrainHold("MISSING_OR_DUPLICATE_SOURCE_IDENTITY")
         seen.add(source_id)
         parent_id = _clean(row.get("sourceParentRecordId"))
+        # Do not let a colliding historical parent suppress independent rows.
+        # A complete inventory with unkeyed legacy records prevents every NEW
+        # action, but exact keyed existing IDs remain safely reusable.
         if parent_id and parent_id != source_id and parent_id in existing_source_ids:
-            raise ProgrammeGrainHold("LEGACY_PARENT_CANDIDATE_MIGRATION_REQUIRED")
+            action = "HOLD_LEGACY_PARENT_CANDIDATE_MIGRATION"
+        elif source_id in existing_source_ids:
+            action = "REUSE_EXISTING_CANDIDATE"
+        elif unresolved_legacy_count:
+            action = "HOLD_UNKEYED_LEGACY_CANDIDATE_REVIEW"
+        elif row.get("programmeIdentityKey"):
+            action = "STAGE_NEW_CANDIDATE_FOR_REVIEW"
+        else:
+            action = "HOLD_UNVERIFIED_PROGRAMME_GRAIN"
         planned.append({
             "sourceRecordId": source_id,
             "sourceParentRecordId": parent_id,
-            "action": (
-                "REUSE_EXISTING_CANDIDATE"
-                if source_id in existing_source_ids
-                else (
-                    "STAGE_NEW_CANDIDATE_FOR_REVIEW"
-                    if row.get("programmeIdentityKey")
-                    else "HOLD_UNVERIFIED_PROGRAMME_GRAIN"
-                )
-            ),
+            "action": action,
         })
     return planned

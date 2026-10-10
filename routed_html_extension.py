@@ -63,7 +63,7 @@ def _matched_content_markers(payload: Dict[str, Any], markers: list[str]) -> int
     chunks.extend(str(x.get("text") or "") for x in payload.get("anchors", []) if isinstance(x, dict))
     source_content = " ".join(chunks).casefold()
     return sum(
-        bool(re.search(r"(?<!\\w)" + re.escape(marker.casefold()) + r"(?!\\w)", source_content))
+        bool(re.search(r"(?<!\w)" + re.escape(marker.casefold()) + r"(?!\w)", source_content))
         for marker in markers
     )
 

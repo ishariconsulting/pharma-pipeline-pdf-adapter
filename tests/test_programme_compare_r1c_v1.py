@@ -34,6 +34,14 @@ LUNG = programme("recqTQTf5vXD7yKrn", "Non-small cell lung cancer")
 def request(ordered, existing=()):
     return VerifiedCompareRequest(
         company="Example Pharma", existingCandidateSourceIds=list(existing),
+        approvedEvidenceHosts=["clinicaltrials.gov"],
+        evidenceAttestations=[
+            dict(sourceRecordId="sitecore-source-47", indication=p["indication"],
+                 controlledIndicationId=p["controlledIndicationId"],
+                 evidenceUrl=p["evidenceUrl"], treatmentSetting=p.get("treatmentSetting"),
+                 reviewed=True, scopeVerified=True, assetVerified=True)
+            for p in ordered
+        ],
         sourceRows=[VerifiedSourceRow(
             company="Example Pharma", sourceFamily="Company Pipeline",
             sourceRecordId="sitecore-source-47", asset="GS-8824 / TUB-040",
@@ -98,8 +106,14 @@ class VerifiedComparatorTest(unittest.TestCase):
 
     def test_unverified_source_never_enters_new_candidate_staging(self):
         r = request([OVARIAN, LUNG])
-        r.sourceRows[0].verifiedIndications = None
+        r.evidenceAttestations = []
         with self.assertRaisesRegex(ProgrammeGrainHold, "VERIFIED_PROGRAMME_EVIDENCE_REQUIRED"):
+            compare_verified(r)
+
+    def test_spoofed_evidence_host_is_held(self):
+        r = request([OVARIAN, LUNG])
+        r.evidenceAttestations[0]["evidenceUrl"] = "https://clinicaltrials.gov.evil.example/"
+        with self.assertRaises(ProgrammeGrainHold):
             compare_verified(r)
 
     def test_legacy_parent_collision_holds(self):

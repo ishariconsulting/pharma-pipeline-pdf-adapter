@@ -171,8 +171,7 @@ function r5SourceMarkerHits(page, contract) {
         ...(page.anchors || []).map(x => clean(x && (x.label || x.text)))
     ].join(" ").toLowerCase();
     return contract.markers.filter(marker => {
-        const escaped = marker.toLowerCase().replace(/[.*+?^${}()|[\]\\]/g, "\\// R5_CATALOGUE_ADMISSION_START — isolated draft extension to the published worker.
-");
+        const escaped = marker.toLowerCase().replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
         return new RegExp("(^|\\W)" + escaped + "(?!\\w)").test(content);
     }).length;
 }

@@ -128,14 +128,37 @@ class VerifiedComparatorTest(unittest.TestCase):
         with self.assertRaisesRegex(ProgrammeGrainHold, "COMPLETE_CANDIDATE_INVENTORY_REQUIRED"):
             compare_verified(r)
 
-    def test_unkeyed_legacy_candidate_blocks_new_identity(self):
+    def test_unkeyed_legacy_candidate_returns_hold_not_global_failure(self):
         r = request([OVARIAN])
         r.existingCandidateInventory = [
             dict(discoveryCandidateId="gilead-old-source", sourceRecordId="")
         ]
         r.existingCandidateExpectedCount = 1
-        with self.assertRaisesRegex(ProgrammeGrainHold, "LEGACY_CANDIDATE_SOURCE_KEYS_UNRESOLVED"):
-            compare_verified(r)
+        out = compare_verified(r)
+        self.assertTrue(out.readOnly)
+        self.assertEqual(
+            [c["candidateStagingAction"] for c in out.candidates],
+            ["HOLD_UNKEYED_LEGACY_CANDIDATE_REVIEW"],
+        )
+        self.assertTrue(all(not c["portfolioMasterWritesAllowed"]
+                            for c in out.candidates))
+
+    def test_mixed_unkeyed_history_reuses_only_exact_existing_candidate(self):
+        first = compare_verified(request([OVARIAN, LUNG]))
+        known = first.candidates[0]["sourceRecordId"]
+        r = request([OVARIAN, LUNG], [known])
+        r.existingCandidateInventory.append(dict(
+            discoveryCandidateId="historic-unkeyed", sourceRecordId="",
+        ))
+        r.existingCandidateExpectedCount = 2
+        out = compare_verified(r)
+        actions = {c["sourceRecordId"]: c["candidateStagingAction"]
+                   for c in out.candidates}
+        self.assertEqual(actions[known], "REUSE_EXISTING_CANDIDATE")
+        self.assertEqual(
+            [a for key, a in actions.items() if key != known],
+            ["HOLD_UNKEYED_LEGACY_CANDIDATE_REVIEW"],
+        )
 
     def test_candidate_inventory_count_mismatch_fails_closed(self):
         r = request([OVARIAN])
@@ -160,12 +183,21 @@ class VerifiedComparatorTest(unittest.TestCase):
         r.sourceRows[0].asset = "TRYNGOLZA (olezarsen)"
         for attestation in r.evidenceAttestations:
             attestation["sourceRecordId"] = "owned:1769806455"
-        with self.assertRaisesRegex(ProgrammeGrainHold, "LEGACY_PARENT_CANDIDATE_MIGRATION_REQUIRED"):
-            compare_verified(r)
+        out = compare_verified(r)
+        self.assertEqual(
+            [c["candidateStagingAction"] for c in out.candidates],
+            ["HOLD_LEGACY_PARENT_CANDIDATE_MIGRATION"] * 2,
+        )
 
-    def test_legacy_parent_collision_holds(self):
-        with self.assertRaisesRegex(ProgrammeGrainHold, "MIGRATION_REQUIRED"):
-            compare_verified(request([OVARIAN, LUNG], ["sitecore-source-47"]))
+    def test_legacy_parent_collision_holds_without_global_failure(self):
+        out = compare_verified(request([OVARIAN, LUNG], ["sitecore-source-47"]))
+        self.assertTrue(out.readOnly)
+        self.assertEqual(
+            [c["candidateStagingAction"] for c in out.candidates],
+            ["HOLD_LEGACY_PARENT_CANDIDATE_MIGRATION"] * 2,
+        )
+        self.assertTrue(all(not c["portfolioMasterWritesAllowed"]
+                            for c in out.candidates))
 
 
 if __name__ == "__main__":
